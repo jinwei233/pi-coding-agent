@@ -619,23 +619,25 @@ The marker lands on the Nth newest `You' or `Assistant' heading, where N is
 `pi-coding-agent-hot-tail-turn-count'.  If there are at most N headed turns,
 all content stays hot and the marker moves to `point-min'.  A count of 0
 makes the hot region empty by moving the marker to `point-max'."
-  (let ((headings nil)
-        (count pi-coding-agent-hot-tail-turn-count))
-    (save-excursion
-      (goto-char (point-min))
-      (while (re-search-forward pi-coding-agent--turn-heading-re nil t)
-        (let ((candidate (match-beginning 0)))
-          (save-excursion
-            (goto-char candidate)
-            (when (pi-coding-agent--at-turn-heading-p)
-              (push candidate headings))))))
-    (setq headings (nreverse headings))
+  (let ((remaining pi-coding-agent-hot-tail-turn-count)
+        (boundary nil))
+    (unless (zerop remaining)
+      (save-excursion
+        (goto-char (point-max))
+        (while (and (> remaining 0)
+                    (re-search-backward pi-coding-agent--turn-heading-re nil t))
+          (let ((candidate (match-beginning 0)))
+            (when (save-excursion
+                    (goto-char candidate)
+                    (pi-coding-agent--at-turn-heading-p))
+              (setq boundary candidate
+                    remaining (1- remaining)))))))
     (move-marker
      pi-coding-agent--hot-tail-start
      (cond
-      ((zerop count) (point-max))
-      ((<= (length headings) count) (point-min))
-      (t (nth (- (length headings) count) headings)))
+      ((zerop pi-coding-agent-hot-tail-turn-count) (point-max))
+      ((> remaining 0) (point-min))
+      (t boundary))
      (current-buffer))))
 
 (defun pi-coding-agent--in-hot-tail-p (pos)
@@ -1204,14 +1206,18 @@ interleave during streaming.")
 Used to rewrite thinking content in place after whitespace normalization.")
 
 (defvar-local pi-coding-agent--thinking-raw nil
-  "Accumulated raw thinking deltas for the current thinking block.
-Normalized and re-rendered incrementally to avoid excess whitespace.")
+  "Legacy raw thinking accumulator.
+Kept nil during streaming; raw content now lives in chunked state.")
 
-(defvar-local pi-coding-agent--thinking-prev-rendered nil
-  "Previously rendered blockquote text for the current thinking block.
-Used for incremental rendering: when the new rendered text extends the
-previous text, only the suffix is inserted instead of replacing the
-entire region.  Reset by `pi-coding-agent--reset-thinking-state'.")
+(defvar-local pi-coding-agent--thinking-raw-chunks nil
+  "Raw thinking delta strings in reverse arrival order.")
+
+(defvar-local pi-coding-agent--thinking-pending-chars nil
+  "Pending trailing whitespace characters in reverse order.
+Whitespace cannot be normalized until later content or thinking end arrives.")
+
+(defvar-local pi-coding-agent--thinking-stream-started nil
+  "Non-nil after the current thinking stream emits meaningful content.")
 
 (defvar-local pi-coding-agent--line-parse-state 'line-start
   "Parsing state for current line during streaming.

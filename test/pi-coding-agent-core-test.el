@@ -1370,6 +1370,62 @@ redisplay cycle instead of triggering N separate redraws."
           (should (eq captured-inhibit t)))
       (delete-process fake-proc))))
 
+(ert-deftest pi-coding-agent-test-process-filter-coalesces-adjacent-text-deltas ()
+  "One process read coalesces compatible adjacent text deltas."
+  (let ((events nil)
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat
+            "{\"type\":\"message_update\",\"message\":{\"role\":\"assistant\"},"
+            "\"assistantMessageEvent\":{\"type\":\"text_delta\","
+            "\"contentIndex\":0,\"delta\":\"Hello \"}}\n"
+            "{\"type\":\"message_update\",\"message\":{\"role\":\"assistant\"},"
+            "\"assistantMessageEvent\":{\"type\":\"text_delta\","
+            "\"contentIndex\":0,\"delta\":\"world\"}}\n"))
+          (should (= (length events) 1))
+          (should
+           (equal
+            (plist-get (plist-get (car events) :assistantMessageEvent) :delta)
+            "Hello world")))
+      (delete-process fake-proc))))
+
+(ert-deftest pi-coding-agent-test-process-filter-preserves-delta-boundaries ()
+  "Different indices and event types remain hard dispatch boundaries."
+  (let ((events nil)
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":"
+            "{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"a\"}}\n"
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":"
+            "{\"type\":\"text_delta\",\"contentIndex\":1,\"delta\":\"b\"}}\n"
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":"
+            "{\"type\":\"thinking_delta\",\"contentIndex\":1,\"delta\":\"c\"}}\n"
+            "{\"type\":\"agent_end\"}\n"
+            "{\"type\":\"message_update\",\"assistantMessageEvent\":"
+            "{\"type\":\"thinking_delta\",\"contentIndex\":1,\"delta\":\"d\"}}\n"))
+          (setq events (nreverse events))
+          (should (equal (mapcar (lambda (event) (plist-get event :type)) events)
+                         '("message_update" "message_update" "message_update"
+                           "agent_end" "message_update")))
+          (should
+           (equal
+            (mapcar (lambda (event)
+                      (plist-get (plist-get event :assistantMessageEvent) :delta))
+                    events)
+            '("a" "b" "c" nil "d"))))
+      (delete-process fake-proc))))
+
 (ert-deftest pi-coding-agent-test-process-filter-continues-after-callback-error ()
   "A failing response callback does not drop later complete lines."
   (let ((second-called nil)

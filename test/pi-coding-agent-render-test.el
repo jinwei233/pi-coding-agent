@@ -417,9 +417,8 @@ Models may send \\n\\n before thinking content too."
       (should (= before-tick (buffer-chars-modified-tick))))))
 
 (ert-deftest pi-coding-agent-test-thinking-incremental-appends-suffix-only ()
-  "Consecutive thinking deltas use the fast path: insert suffix, not full rewrite.
-After the first delta stabilizes, subsequent deltas that extend the
-rendered text should only insert the new suffix.  We verify by placing
+  "Consecutive thinking deltas insert suffixes without rewriting old text.
+We verify by placing
 a text property in the existing content — the fast path preserves it
 because it inserts at the end, while a full rewrite would lose it."
   (with-temp-buffer
@@ -427,7 +426,7 @@ because it inserts at the end, while a full rewrite would lose it."
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
     (pi-coding-agent--display-thinking-delta "First thought.")
-    (should pi-coding-agent--thinking-prev-rendered)
+    (should (= (length pi-coding-agent--thinking-raw-chunks) 1))
     ;; Place a marker property inside the rendered thinking region
     (let ((think-start (marker-position pi-coding-agent--thinking-start-marker))
           (inhibit-read-only t))
@@ -438,6 +437,48 @@ because it inserts at the end, while a full rewrite would lose it."
       (should (get-text-property think-start 'test-marker))
       ;; And the new content appears
       (should (string-match-p "Second thought" (buffer-string))))))
+
+(ert-deftest pi-coding-agent-test-thinking-deltas-normalize-only-on-end ()
+  "Streaming work does not re-normalize all accumulated thinking."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (let ((calls 0)
+          (original (symbol-function 'pi-coding-agent--thinking-normalize-text)))
+      (cl-letf (((symbol-function 'pi-coding-agent--thinking-normalize-text)
+                 (lambda (text)
+                   (setq calls (1+ calls))
+                   (funcall original text))))
+        (dotimes (_ 100)
+          (pi-coding-agent--display-thinking-delta "chunk "))
+        (should (= calls 0))
+        (should (= (length pi-coding-agent--thinking-raw-chunks) 100))
+        (pi-coding-agent--display-thinking-end "")
+        (should (= calls 1))))))
+
+(ert-deftest pi-coding-agent-test-thinking-end-authoritative-content-corrects-stream ()
+  "A non-empty thinking_end content value is authoritative."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (pi-coding-agent--display-thinking-delta "draft")
+    (pi-coding-agent--display-thinking-end "final")
+    (should (string-match-p "^> final" (buffer-string)))
+    (should-not (string-match-p "draft" (buffer-string)))))
+
+(ert-deftest pi-coding-agent-test-thinking-normalizes-whitespace-across-deltas ()
+  "Whitespace normalization is independent of arbitrary delta boundaries."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (dolist (delta '("\n" "\n  first" "\n" "\n" "\nsecond" "\n\n"))
+      (pi-coding-agent--display-thinking-delta delta))
+    (pi-coding-agent--display-thinking-end "")
+    (should (string-match-p "^>   first\n>\\s-*\n> second$"
+                            (string-trim-right (buffer-string))))))
 
 (ert-deftest pi-coding-agent-test-thinking-paragraph-spacing-no-runaway-blank-lines ()
   "Thinking paragraphs keep a single readable separator, not multiple blanks."
@@ -12278,11 +12319,14 @@ Commands with embedded newlines should not have any lines deleted."
     (pi-coding-agent--display-thinking-start)
     (let ((marker pi-coding-agent--thinking-marker)
           (start-marker pi-coding-agent--thinking-start-marker))
-      (should (stringp pi-coding-agent--thinking-raw))
+      (pi-coding-agent--display-thinking-delta "pending")
+      (should pi-coding-agent--thinking-raw-chunks)
       (pi-coding-agent--display-agent-end)
       (should-not pi-coding-agent--thinking-marker)
       (should-not pi-coding-agent--thinking-start-marker)
       (should-not pi-coding-agent--thinking-raw)
+      (should-not pi-coding-agent--thinking-raw-chunks)
+      (should-not pi-coding-agent--thinking-pending-chars)
       (should-not (marker-buffer marker))
       (should-not (marker-buffer start-marker)))))
 
@@ -12298,6 +12342,8 @@ Commands with embedded newlines should not have any lines deleted."
       (should-not pi-coding-agent--thinking-marker)
       (should-not pi-coding-agent--thinking-start-marker)
       (should-not pi-coding-agent--thinking-raw)
+      (should-not pi-coding-agent--thinking-raw-chunks)
+      (should-not pi-coding-agent--thinking-pending-chars)
       (should-not (marker-buffer marker))
       (should-not (marker-buffer start-marker)))))
 

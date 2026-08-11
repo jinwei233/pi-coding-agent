@@ -1384,6 +1384,41 @@ Buffer is read-only with `inhibit-read-only' used for insertion.
       (goto-char (marker-position pi-coding-agent--hot-tail-start))
       (should (looking-at "You · 10:05")))))
 
+(ert-deftest pi-coding-agent-test-hot-tail-boundary-stops-after-recent-headings ()
+  "Cold historical headings are not validated after the boundary is found."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (dotimes (index 100)
+        (insert (format "You · %03d\n===========\nQuestion\n\n" index)))
+      (insert "Assistant\n=========\nAnswer\n"))
+    (let ((pi-coding-agent-hot-tail-turn-count 3)
+          (checks 0)
+          (original (symbol-function 'pi-coding-agent--at-turn-heading-p)))
+      (cl-letf (((symbol-function 'pi-coding-agent--at-turn-heading-p)
+                 (lambda ()
+                   (setq checks (1+ checks))
+                   (funcall original))))
+        (pi-coding-agent--update-hot-tail-boundary))
+      (should (= checks 3))
+      (goto-char (marker-position pi-coding-agent--hot-tail-start))
+      (should (looking-at "You · 098")))))
+
+(ert-deftest pi-coding-agent-test-hot-tail-boundary-zero-skips-heading-scan ()
+  "A zero-sized hot tail moves to point-max without scanning headings."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert "You\n===\nQuestion\n"))
+    (let ((pi-coding-agent-hot-tail-turn-count 0)
+          (checks 0))
+      (cl-letf (((symbol-function 'pi-coding-agent--at-turn-heading-p)
+                 (lambda () (setq checks (1+ checks)) t)))
+        (pi-coding-agent--update-hot-tail-boundary))
+      (should (= checks 0))
+      (should (= (marker-position pi-coding-agent--hot-tail-start)
+                 (point-max))))))
+
 (ert-deftest pi-coding-agent-test-in-hot-tail-p-respects-boundary ()
   "Positions before the hot-tail marker are cold; marker and later are hot."
   (with-temp-buffer

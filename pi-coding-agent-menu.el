@@ -491,6 +491,9 @@ Call this when starting a new session to ensure no stale state persists."
         pi-coding-agent--thinking-marker nil
         pi-coding-agent--thinking-start-marker nil
         pi-coding-agent--thinking-raw nil
+        pi-coding-agent--thinking-raw-chunks nil
+        pi-coding-agent--thinking-pending-chars nil
+        pi-coding-agent--thinking-stream-started nil
         pi-coding-agent--line-parse-state 'line-start
         pi-coding-agent--pending-tool-overlay nil
         pi-coding-agent--tool-block-order-counter 0

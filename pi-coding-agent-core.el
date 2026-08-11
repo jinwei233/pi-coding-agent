@@ -501,23 +501,77 @@ Returns nil on timeout."
 
 ;;;; Process Management
 
+(defun pi-coding-agent--mergeable-delta-events-p (left right)
+  "Return non-nil when adjacent LEFT and RIGHT events may be coalesced."
+  (let* ((left-update (plist-get left :assistantMessageEvent))
+         (right-update (plist-get right :assistantMessageEvent))
+         (left-type (plist-get left-update :type))
+         (right-type (plist-get right-update :type))
+         (left-message (plist-get left :message))
+         (right-message (plist-get right :message)))
+    (and (equal (plist-get left :type) "message_update")
+         (equal (plist-get right :type) "message_update")
+         (member left-type '("text_delta" "thinking_delta"))
+         (equal left-type right-type)
+         (stringp (plist-get left-update :delta))
+         (stringp (plist-get right-update :delta))
+         (equal (plist-get left-update :contentIndex)
+                (plist-get right-update :contentIndex))
+         (equal (plist-get left-message :role)
+                (plist-get right-message :role))
+         (equal (plist-get left-message :timestamp)
+                (plist-get right-message :timestamp)))))
+
+(defun pi-coding-agent--merge-delta-events (left right)
+  "Merge adjacent compatible delta events LEFT and RIGHT.
+RIGHT supplies the latest authoritative message snapshot."
+  (let* ((merged (copy-sequence right))
+         (update (copy-sequence (plist-get right :assistantMessageEvent))))
+    (setq update
+          (plist-put
+           update :delta
+           (concat
+            (plist-get (plist-get left :assistantMessageEvent) :delta)
+            (plist-get update :delta))))
+    (plist-put merged :assistantMessageEvent update)))
+
+(defun pi-coding-agent--dispatch-process-json (proc json)
+  "Dispatch parsed JSON from PROC without dropping later filter records."
+  (condition-case err
+      (pi-coding-agent--dispatch-response proc json)
+    (error
+     (message "pi-coding-agent: error dispatching process response: %s"
+              (error-message-string err)))))
+
 (defun pi-coding-agent--process-filter (proc output)
   "Handle OUTPUT from pi PROC.
-Accumulates output and dispatches complete JSON lines."
+Accumulates output and dispatches complete JSON lines.
+Compatible adjacent text or thinking deltas delivered in one process read are
+coalesced before dispatch; every other record remains an ordering boundary."
   (let* ((inhibit-redisplay t)
          (partial (process-get proc 'pi-coding-agent-partial-output-chunks))
          (result (pi-coding-agent--accumulate-line-chunks partial output))
-         (lines (car result)))
+         (lines (car result))
+         pending)
     (process-put proc 'pi-coding-agent-partial-output-chunks (cdr result))
-    (dolist (line lines)
-      (if (equal line pi-coding-agent--remote-ready-marker)
-          (pi-coding-agent--mark-process-ready proc)
-        (when-let* ((json (pi-coding-agent--parse-json-line line)))
-          (condition-case err
-              (pi-coding-agent--dispatch-response proc json)
-            (error
-             (message "pi-coding-agent: error dispatching process response: %s"
-                      (error-message-string err)))))))))
+    (cl-labels ((flush-pending ()
+                  (when pending
+                    (pi-coding-agent--dispatch-process-json proc pending)
+                    (setq pending nil))))
+      (dolist (line lines)
+        (if (equal line pi-coding-agent--remote-ready-marker)
+            (progn
+              (flush-pending)
+              (pi-coding-agent--mark-process-ready proc))
+          (if-let* ((json (pi-coding-agent--parse-json-line line)))
+              (if (and pending
+                       (pi-coding-agent--mergeable-delta-events-p pending json))
+                  (setq pending
+                        (pi-coding-agent--merge-delta-events pending json))
+                (flush-pending)
+                (setq pending json))
+            (flush-pending))))
+      (flush-pending))))
 
 (defun pi-coding-agent--process-sentinel (proc event)
   "Handle process state change EVENT for PROC."

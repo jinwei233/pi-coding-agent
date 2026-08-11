@@ -427,41 +427,56 @@ non-empty."
             (set-marker pi-coding-agent--thinking-marker (point))))
         (not (string-empty-p text))))))
 
-(defun pi-coding-agent--render-thinking-content ()
-  "Render normalized accumulated thinking content in place.
-Returns non-nil when meaningful content remains after normalization."
-  (when (and (markerp pi-coding-agent--thinking-start-marker)
-             (markerp pi-coding-agent--thinking-marker)
-             (marker-position pi-coding-agent--thinking-start-marker)
-             (marker-position pi-coding-agent--thinking-marker))
-    (let* ((start (marker-position pi-coding-agent--thinking-start-marker))
-           (end (marker-position pi-coding-agent--thinking-marker))
-           (normalized (pi-coding-agent--thinking-normalize-text
-                        pi-coding-agent--thinking-raw))
-           (rendered (pi-coding-agent--thinking-blockquote-text normalized))
-           (prev pi-coding-agent--thinking-prev-rendered))
-      (when (<= start end)
-        (cond
-         ;; Fast path: new rendered text extends previous — just append suffix.
-         ((and prev
-               (not (string-empty-p prev))
-               (string-prefix-p prev rendered))
-          (let ((suffix (substring rendered (length prev))))
-            (unless (string-empty-p suffix)
-              (goto-char end)
-              (insert suffix)
-              (set-marker pi-coding-agent--thinking-marker (point)))))
-         ;; Slow path: full rewrite; skip if buffer already matches.
-         (t
-          (let ((existing (buffer-substring-no-properties start end)))
-            (unless (equal existing rendered)
-              (goto-char start)
-              (delete-region start end)
-              (insert rendered)
-              (set-marker pi-coding-agent--thinking-marker (point))))))
-        (setq pi-coding-agent--thinking-prev-rendered rendered))
-      (and (<= start end)
-           (not (string-empty-p normalized))))))
+(defun pi-coding-agent--thinking-pending-string ()
+  "Materialize and clear pending thinking whitespace."
+  (prog1
+      (if pi-coding-agent--thinking-pending-chars
+          (concat (vconcat
+                   (nreverse pi-coding-agent--thinking-pending-chars)))
+        "")
+    (setq pi-coding-agent--thinking-pending-chars nil)))
+
+(defun pi-coding-agent--thinking-normalize-internal-space (space)
+  "Normalize pending internal thinking SPACE before new content."
+  (let ((newline-count (cl-count ?\n space)))
+    (if (<= newline-count 2)
+        space
+      (let ((first (string-match "\n" space))
+            (last (cl-position ?\n space :from-end t)))
+        (concat (substring space 0 first)
+                "\n\n"
+                (substring space (1+ last)))))))
+
+(defun pi-coding-agent--thinking-stream-transform-delta (delta)
+  "Return the normalized blockquote fragment produced by thinking DELTA.
+Only DELTA and bounded whitespace state are processed; earlier thinking text is
+never rescanned."
+  (let (pieces)
+    (dolist (char (string-to-list delta))
+      (if (memq char '(?\s ?\t ?\n))
+          (push char pi-coding-agent--thinking-pending-chars)
+        (let ((space (pi-coding-agent--thinking-pending-string)))
+          (unless pi-coding-agent--thinking-stream-started
+            ;; Complete leading blank lines are boundary whitespace.  Keep
+            ;; indentation on the first meaningful line.
+            (when-let* ((last-newline
+                         (cl-position ?\n space :from-end t)))
+              (setq space (substring space (1+ last-newline))))
+            (setq pi-coding-agent--thinking-stream-started t))
+          (unless (string-empty-p space)
+            (push (pi-coding-agent--thinking-normalize-internal-space space)
+                  pieces))
+          (push (char-to-string char) pieces))))
+    ;; The thinking block already owns its initial "> " prefix.  Only line
+    ;; breaks introduced by this fragment need a new blockquote prefix.
+    (replace-regexp-in-string
+     "\n" "\n> " (mapconcat #'identity (nreverse pieces) "") t t)))
+
+(defun pi-coding-agent--thinking-stream-raw-content ()
+  "Return streamed raw thinking content with one linear materialization."
+  (mapconcat #'identity
+             (nreverse pi-coding-agent--thinking-raw-chunks)
+             ""))
 
 (defun pi-coding-agent--ensure-blank-line-separator ()
   "Ensure exactly one blank line separator at point.
@@ -498,7 +513,9 @@ separated from preceding content."
   (setq pi-coding-agent--thinking-marker nil
         pi-coding-agent--thinking-start-marker nil
         pi-coding-agent--thinking-raw nil
-        pi-coding-agent--thinking-prev-rendered nil))
+        pi-coding-agent--thinking-raw-chunks nil
+        pi-coding-agent--thinking-pending-chars nil
+        pi-coding-agent--thinking-stream-started nil))
 
 (defmacro pi-coding-agent--with-window-rewrite-preservation (&rest body)
   "Execute BODY and keep chat windows useful after a large rewrite.
@@ -533,7 +550,6 @@ clamped so the window remains filled when possible."
           ;; Keep insertion-type nil so inserts at this exact point happen
           ;; after the marker (we then advance it explicitly per delta).
           (pi-coding-agent--reset-thinking-state)
-          (setq pi-coding-agent--thinking-raw "")
           (let ((start (point)))
             (insert "> ")
             (setq pi-coding-agent--thinking-start-marker
@@ -549,12 +565,17 @@ Normalizes boundary and paragraph whitespace while streaming."
           (inhibit-read-only t))
       (if (and pi-coding-agent--thinking-start-marker
                pi-coding-agent--thinking-marker)
-          (progn
-            (setq pi-coding-agent--thinking-raw
-                  (concat (or pi-coding-agent--thinking-raw "") delta))
+          (let ((fragment
+                 (progn
+                   (push delta pi-coding-agent--thinking-raw-chunks)
+                   (pi-coding-agent--thinking-stream-transform-delta delta))))
+            (unless (string-empty-p fragment)
             (pi-coding-agent--with-scroll-preservation
               (save-excursion
-                (pi-coding-agent--render-thinking-content))))
+                  (goto-char
+                   (marker-position pi-coding-agent--thinking-marker))
+                  (insert fragment)
+                  (set-marker pi-coding-agent--thinking-marker (point))))))
         ;; Fallback for malformed event streams that skip thinking_start.
         (let ((transformed (replace-regexp-in-string "\n" "\n> " delta)))
           (pi-coding-agent--with-scroll-preservation
@@ -564,9 +585,9 @@ Normalizes boundary and paragraph whitespace while streaming."
               (when pi-coding-agent--thinking-marker
                 (set-marker pi-coding-agent--thinking-marker (point))))))))))
 
-(defun pi-coding-agent--display-thinking-end (_content)
+(defun pi-coding-agent--display-thinking-end (content)
   "End thinking block (blockquote).
-CONTENT is ignored - we use what was already streamed."
+Non-empty string CONTENT is authoritative; otherwise streamed chunks are used."
   (when pi-coding-agent--streaming-marker
     (let* ((buffer (current-buffer))
            (saved-windows (pi-coding-agent--capture-window-rewrite-states))
@@ -583,11 +604,16 @@ CONTENT is ignored - we use what was already streamed."
                 (save-excursion
                   (if (and pi-coding-agent--thinking-start-marker
                            pi-coding-agent--thinking-marker)
-                      (when (pi-coding-agent--replace-thinking-region
-                             (pi-coding-agent--completed-thinking-rendered-text
-                              pi-coding-agent--thinking-raw))
+                      (let ((raw
+                             (if (and (stringp content)
+                                      (not (string-empty-p content)))
+                                 content
+                               (pi-coding-agent--thinking-stream-raw-content))))
+                        (when (pi-coding-agent--replace-thinking-region
+                               (pi-coding-agent--completed-thinking-rendered-text
+                                raw))
                         (goto-char (pi-coding-agent--thinking-insert-position))
-                        (pi-coding-agent--ensure-blank-line-separator))
+                          (pi-coding-agent--ensure-blank-line-separator)))
                     ;; Fallback for malformed event streams that skip thinking_start.
                     (goto-char (pi-coding-agent--thinking-insert-position))
                     (pi-coding-agent--ensure-blank-line-separator))
