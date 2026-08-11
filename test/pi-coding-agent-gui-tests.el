@@ -157,7 +157,10 @@
       (should (> line-before 1))
       (pi-coding-agent-gui-test-send "Use the fake read tool")
       (should (= line-before (pi-coding-agent-gui-test-top-line-number)))
-      (should (pi-coding-agent-gui-test-chat-contains "fake tool output")))))
+      (should (pi-coding-agent-gui-test-chat-contains
+               "read /tmp/fake-tool.txt"))
+      (should-not (pi-coding-agent-gui-test-chat-contains
+                   "fake tool output")))))
 
 (ert-deftest pi-coding-agent-gui-test-scroll-auto-when-at-end ()
   "Test auto-scroll when user is at end across deterministic fake turns.
@@ -389,12 +392,22 @@ logical block and should not start following later streamed output."
 ;;;; Content Tests
 
 (ert-deftest pi-coding-agent-gui-test-content-tool-output-shown ()
-  "Test that fake-backed tool output appears in chat and in the tool block."
+  "Test that tool output is summarized, then recoverable through TAB."
   (pi-coding-agent-gui-test-with-fresh-session
     (:backend fake :fake-scenario "tool-read")
     (pi-coding-agent-gui-test-send "Use the fake read tool")
     (should (pi-coding-agent-gui-test-chat-contains "read /tmp/fake-tool.txt"))
-    (should (pi-coding-agent-gui-test-chat-text-in-tool-block-p "fake tool output"))
+    (should (pi-coding-agent-gui-test-chat-text-in-tool-block-p
+             "2 lines · TAB details"))
+    (should-not (pi-coding-agent-gui-test-chat-contains "fake tool output"))
+    (with-current-buffer (plist-get pi-coding-agent-gui-test--session
+                                    :chat-buffer)
+      (goto-char (point-min))
+      (search-forward "TAB details")
+      (pi-coding-agent--toggle-tool-output
+       (button-at (match-beginning 0))))
+    (should (pi-coding-agent-gui-test-chat-text-in-tool-block-p
+             "fake tool output"))
     (should (pi-coding-agent-gui-test-chat-contains "Tool finished"))))
 
 (ert-deftest pi-coding-agent-gui-test-tool-overlay-bounded ()
@@ -406,7 +419,7 @@ rear-advance overlay before assistant text continues after the tool block."
     (pi-coding-agent-gui-test-send "Use the fake read tool")
     (with-current-buffer (plist-get pi-coding-agent-gui-test--session :chat-buffer)
       (goto-char (point-min))
-      (search-forward "fake tool output")
+      (search-forward "2 lines · TAB details")
       (let* ((tool-pos (match-beginning 0))
              (tool-overlay (seq-find
                             (lambda (ov) (overlay-get ov 'pi-coding-agent-tool-block))

@@ -513,6 +513,9 @@ Call this when starting a new session to ensure no stale state persists."
   (pi-coding-agent--set-streaming-marker nil)
   (when pi-coding-agent--tool-args-cache
     (clrhash pi-coding-agent--tool-args-cache))
+  (when pi-coding-agent--transient-tool-pairs
+    (clrhash pi-coding-agent--transient-tool-pairs))
+  (pi-coding-agent--cleanup-tool-detail-buffers)
   (when pi-coding-agent--live-tool-blocks
     (clrhash pi-coding-agent--live-tool-blocks)))
 

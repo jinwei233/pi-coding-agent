@@ -1006,7 +1006,8 @@ and DISPLAY controls how completed thinking is rendered."
           (should (string-match-p "Answer first\\." text))
           (should (string-match-p "Final answer\\." text))
           (should (string-match-p "^> Need to double-check\\.$" text))
-          (should (string-match-p "\\.\\.\\. ([0-9]+ more lines)" text))
+          (should (string-match-p "read example\\.txt\n12 lines · TAB details"
+                                  text))
           (should-not (string-match-p "L12" text)))))))
 
 (ert-deftest pi-coding-agent-test-rerender-clears-temporary-thinking-expansion ()
@@ -1318,7 +1319,7 @@ and DISPLAY controls how completed thinking is rendered."
                  0)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-multiple-tools-in-order ()
-  "Multiple tool calls render with headers and output in order."
+  "Multiple tool calls render with headers and summaries in order."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((messages [(:role "assistant"
@@ -1347,10 +1348,12 @@ and DISPLAY controls how completed thinking is rendered."
       (should read-pos)
       (should (< git-pos read-pos)))
     (should (string-match-p "On branch master" (buffer-string)))
-    (should (string-match-p "import sys" (buffer-string)))))
+    (should-not (string-match-p "import sys" (buffer-string)))
+    (should (string-match-p "read src/main\\.py\n1 lines · TAB details"
+                            (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tools-across-assistant-messages ()
-  "Tools from consecutive assistant messages all render fully."
+  "Tools from consecutive assistant messages all render summaries."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((messages [(:role "assistant"
@@ -1378,7 +1381,9 @@ and DISPLAY controls how completed thinking is rendered."
     (should (string-match-p "pwd" (buffer-string)))
     (should (string-match-p "/home/user" (buffer-string)))
     (should (string-match-p "read foo\\.el" (buffer-string)))
-    (should (string-match-p "(defun foo ())" (buffer-string)))))
+    (should-not (string-match-p "(defun foo ())" (buffer-string)))
+    (should (string-match-p "read foo\\.el\n1 lines · TAB details"
+                            (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tool-error ()
   "Failed tool calls render with error overlay face."
@@ -2445,13 +2450,12 @@ See https://github.com/dnouri/pi-coding-agent/issues/176."
     (should (string-match-p "\"worker\"" (substring-no-properties header)))))
 
 (ert-deftest pi-coding-agent-test-generic-tool-header-escapes-control-and-format-chars ()
-  "Generic JSON arg headers escape C1 controls and bidi format chars."
+  "Generic large fields hide C1 controls and bidi format chars."
   (let* ((value (concat "a" (string #x85) "b" (string #x202e) "c"))
          (header (substring-no-properties
                   (pi-coding-agent--tool-header
                    "custom_tool" (list :payload value)))))
-    (should (string-match-p (regexp-quote "\\u0085") header))
-    (should (string-match-p (regexp-quote "\\u202E") header))
+    (should (string-match-p "payload=<8 B>" header))
     (should-not (cl-position #x85 header :test #'=))
     (should-not (cl-position #x202e header :test #'=))))
 
@@ -3149,20 +3153,20 @@ repeated helper calls model new prompts rather than retry attempts."
       (pi-coding-agent--display-session-history
        (funcall tool-messages "/tmp/old.el") (current-buffer))
       (goto-char (point-min))
-      (search-forward "src/fallback.el")
+      (search-forward "read /tmp/old.el")
       (should (equal "/tmp/old.el"
                      (plist-get (pi-coding-agent--file-target-at-point)
                                 :emacs-path)))
       (pi-coding-agent--rerender-canonical-history)
       (goto-char (point-min))
-      (search-forward "src/fallback.el")
+      (search-forward "read /tmp/old.el")
       (should (equal "/tmp/old.el"
                      (plist-get (pi-coding-agent--file-target-at-point)
                                 :emacs-path)))
       (pi-coding-agent--display-session-history
        (funcall tool-messages "/tmp/new.el") (current-buffer))
       (goto-char (point-min))
-      (search-forward "src/fallback.el")
+      (search-forward "read /tmp/new.el")
       (should (equal "/tmp/new.el"
                      (plist-get (pi-coding-agent--file-target-at-point)
                                 :emacs-path)))
@@ -3396,28 +3400,22 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '(:path "/tmp/new.py")
        '((:type "text" :text "def fresh():\n    return 1")))
       (let ((text (buffer-string)))
-        ;; Older write block was cooled into bare fence with hint
+        ;; Older write block is a cold summary.
         (should (string-match-p
-                 (regexp-quote
-                  (concat "write /tmp/old.py\n"
-                          "```\n"
-                          "line1\nline2\nline3\n"
-                          "```\n"
-                          "... (4 more lines)"))
+                 "write /tmp/old\\.py\n7 lines · 50 B · TAB details"
                  text))
         (should-not (string-match-p "\nline4\n" text))
-        ;; Newer read block stays hot with typed fence
+        ;; Newer read block stays as an interactive summary.
         (should (string-match-p
-                 (regexp-quote
-                  (concat "read /tmp/new.py\n"
-                          "```python\n"
-                          "def fresh():\n    return 1\n"
-                          "```"))
+                 "read /tmp/new\\.py\n2 lines · TAB details"
                  text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))
         (goto-char (point-min))
-        (should-not (next-button (point)))))))
+        (let ((button (next-button (point))))
+          (should button)
+          (should (>= (button-start button)
+                      (marker-position pi-coding-agent--hot-tail-start))))))))
 
 (ert-deftest pi-coding-agent-test-session-history-cools-tool-blocks-outside-hot-tail ()
   "History rebuild cools tool blocks before the hot-tail boundary."
@@ -3451,25 +3449,19 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
       (pi-coding-agent--display-session-history messages (current-buffer))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 (regexp-quote
-                  (concat "write /tmp/old.py\n"
-                          "```\n"
-                          "line1\nline2\nline3\n"
-                          "```\n"
-                          "... (4 more lines)"))
+                 "write /tmp/old\\.py\n7 lines · 50 B · TAB details"
                  text))
         (should-not (string-match-p "\nline4\n" text))
         (should (string-match-p
-                 (regexp-quote
-                  (concat "read /tmp/new.py\n"
-                          "```python\n"
-                          "def recent():\n    return 2\n"
-                          "```"))
+                 "read /tmp/new\\.py\n2 lines · TAB details"
                  text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))
         (goto-char (point-min))
-        (should-not (next-button (point)))))))
+        (let ((button (next-button (point))))
+          (should button)
+          (should (>= (button-start button)
+                      (marker-position pi-coding-agent--hot-tail-start))))))))
 
 (ert-deftest pi-coding-agent-test-cooling-is-idempotent-when-hot-tail-unchanged ()
   "Repeated cooling leaves content unchanged when no new blocks fall cold."
@@ -3491,11 +3483,7 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "def three():\n    return 3")))
       ;; First turn cooled, last two still hot
       (should (string-match-p
-               (regexp-quote
-                (concat "read /tmp/one.py\n"
-                        "```\n"
-                        "def one():\n    return 1\n"
-                        "```"))
+               "read /tmp/one\\.py\n2 lines · TAB details"
                (buffer-string)))
       (should (= 2 (pi-coding-agent-test--count-overlays-with-prop
                     'pi-coding-agent-tool-block)))
@@ -3542,17 +3530,12 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
          :result (:content ((:type "text" :text "def two():\n    return 2")))
          :isError nil))
       (pi-coding-agent--handle-display-event '(:type "agent_end"))
-      ;; Old turn cooled
+      ;; Old turn cooled; both new tool summaries stay hot.
       (should (string-match-p
-               (regexp-quote
-                (concat "read /tmp/old.py\n"
-                        "```\n"
-                        "def old():\n    return 0\n"
-                        "```"))
+               "read /tmp/old\\.py\n2 lines · TAB details"
                (buffer-string)))
-      ;; Both new tool blocks stay hot with typed fences
-      (should (string-match-p "read /tmp/new-one.py\n```python" (buffer-string)))
-      (should (string-match-p "read /tmp/new-two.py\n```python" (buffer-string)))
+      (should (string-match-p "read /tmp/new-one.py\n2 lines" (buffer-string)))
+      (should (string-match-p "read /tmp/new-two.py\n2 lines" (buffer-string)))
       (should (= 2 (pi-coding-agent-test--count-overlays-with-prop
                     'pi-coding-agent-tool-block))))))
 
@@ -3677,11 +3660,9 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "def ok():\n    return 0")))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 (regexp-quote "$ false\n```\nexit code 1\n```")
+                 "\\$ false\nfailed · exit code 1 · TAB details"
                  text))
-        (should (string-match-p
-                 (regexp-quote "read /tmp/ok.py\n```python")
-                 text))
+        (should (string-match-p "read /tmp/ok\\.py\n2 lines" text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))))))
 
@@ -3698,12 +3679,9 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "wrote file")))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 (regexp-quote
-                  (concat "write /tmp/readme.md\n"
-                          "~~~\n"
-                          "# README\n\n```python\nprint(42)\n```\n\nDone.\n"
-                          "~~~"))
+                 "write /tmp/readme\\.md\n7 lines · 40 B · TAB details"
                  text))
+        (should-not (string-match-p "print(42)" text))
         (should (= 0 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))))))
 
@@ -9455,7 +9433,7 @@ supported installed 0.3 dependency lane."
     ;; names the installed 0.3 release; the separate compatibility test owns
     ;; the buttonized behavior in that lane.
     (skip-unless (not (button-at (point))))
-    (should (package-installed-p 'md-ts-mode '(0 3 0)))
+    (skip-unless (package-installed-p 'md-ts-mode '(0 3 0)))
     (should (eq #'pi-coding-agent-visit-file (key-binding (kbd "RET"))))
     (should (eq #'pi-coding-agent-visit-file
                 (key-binding (kbd "<return>"))))
@@ -9667,6 +9645,10 @@ Edit diffs include unchanged context rows with a leading space marker."
          :result (:content [(:type "text" :text "wrote file")])
          :isError nil))
       (goto-char (point-min))
+      (search-forward "TAB details")
+      (pi-coding-agent--toggle-tool-output
+       (button-at (match-beginning 0)))
+      (goto-char (point-min))
       (search-forward "line2")
       (beginning-of-line)
       (let ((result (pi-coding-agent-test--visit-file-line 10)))
@@ -9748,9 +9730,10 @@ Edit diffs include unchanged context rows with a leading space marker."
              t)
          (user-error nil)))
       (should (string-match-p (regexp-quote path) (buffer-string)))
-      (should (string-match-p "contents" (buffer-string)))
+      (should-not (string-match-p "contents" (buffer-string)))
       (goto-char (point-min))
-      (search-forward "contents")
+      (search-forward path)
+      (goto-char (match-beginning 0))
       (let ((ov (seq-find (lambda (overlay)
                             (overlay-get overlay 'pi-coding-agent-tool-block))
                           (overlays-at (point)))))
@@ -9802,9 +9785,10 @@ Edit diffs include unchanged context rows with a leading space marker."
                                   (line-end-position))))
                 (should (string-match-p (regexp-quote path) header-line))
                 (should-not (cl-position ?\n header-line :test #'=))))
-            (should (string-match-p "contents" (buffer-string)))
+            (should-not (string-match-p "contents" (buffer-string)))
             (goto-char (point-min))
-            (search-forward "contents")
+            (search-forward path)
+            (goto-char (match-beginning 0))
             (let ((ov (seq-find (lambda (overlay)
                                   (overlay-get overlay 'pi-coding-agent-tool-block))
                                 (overlays-at (point)))))
@@ -9945,7 +9929,8 @@ Edit diffs include unchanged context rows with a leading space marker."
             (let ((content (buffer-substring-no-properties
                             (point-min) (point-max))))
               (should (string-match-p "write /tmp/out\\.txt" content))
-              (should (string-match-p "42" content))))
+              (should (string-match-p "0 lines · 0 B" content))
+              (should-not (string-match-p "wrote file" content))))
         (pi-coding-agent--unregister-display-handler proc)
         (when (process-live-p proc)
           (delete-process proc))))))
@@ -9973,7 +9958,8 @@ Edit diffs include unchanged context rows with a leading space marker."
        (error nil)))
     (let ((content (buffer-substring-no-properties (point-min) (point-max))))
       (should (string-match-p "edit /tmp/edit\\.txt" content))
-      (should (string-match-p "42" content)))))
+      (should (string-match-p "\\+0 -0 · TAB details" content))
+      (should-not (string-match-p "fallback" content)))))
 
 (ert-deftest pi-coding-agent-test-nul-tool-path-renders-safely ()
   "NUL-containing tool path metadata does not become navigation metadata."
@@ -9996,9 +9982,10 @@ Edit diffs include unchanged context rows with a leading space marker."
              t)
          (error nil)))
       (should (string-match-p "read \\.\\.\\." (buffer-string)))
-      (should (string-match-p "contents" (buffer-string)))
+      (should-not (string-match-p "contents" (buffer-string)))
       (goto-char (point-min))
-      (search-forward "contents")
+      (search-forward "read ...")
+      (goto-char (match-beginning 0))
       (let ((ov (seq-find (lambda (overlay)
                             (overlay-get overlay 'pi-coding-agent-tool-block))
                           (overlays-at (point)))))
@@ -10520,7 +10507,7 @@ When full output is visible, line numbers must follow rendered blank lines."
          :result (:content [(:type "text" :text "done")])
          :isError :json-false))
       (goto-char (point-min))
-      (re-search-forward "\\.\\.\\. ([0-9]+ more lines)" nil t)
+      (search-forward "TAB details")
       (let ((btn (button-at (match-beginning 0))))
         (should btn)
         (pi-coding-agent--toggle-tool-output btn))
@@ -10846,9 +10833,9 @@ Regression test: streaming output with no newlines should still be capped."
     (let ((content (buffer-substring-no-properties (point-min) (point-max))))
       (should (equal content
                      (concat "$ echo one\n"
-                             "```\nfinal alpha\n```\n\n"
+                             "1 lines (0 hidden)\nfinal alpha\nTAB details\n\n"
                              "$ echo two\n"
-                             "```\nfinal bravo\n```\n\n")))
+                             "1 lines (0 hidden)\nfinal bravo\nTAB details\n\n")))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo one" content)))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo two" content))))
     (should (= 0 (hash-table-count pi-coding-agent--live-tool-blocks)))))
@@ -11077,7 +11064,7 @@ authoritative args, header and overlay path are updated."
                (pi-coding-agent-test--tool-header-by-id "call_1"))))))
 
 (ert-deftest pi-coding-agent-test-generic-toolcall-json-header-escapes-controls ()
-  "Completed generic toolcall JSON headers escape C1 and bidi controls."
+  "Completed generic toolcall headers hide control-bearing payloads."
   (pi-coding-agent-test--with-streaming-assistant
     (let ((value (concat "x" (string #x85) "y" (string #x202e) "z")))
       (pi-coding-agent-test--send-toolcall-message-update
@@ -11089,8 +11076,7 @@ authoritative args, header and overlay path are updated."
        (list (pi-coding-agent-test--toolcall
               "call_1" "custom_generic_tool" (list :payload value))))
       (let ((header (pi-coding-agent-test--tool-header-by-id "call_1")))
-        (should (string-match-p (regexp-quote "\\u0085") header))
-        (should (string-match-p (regexp-quote "\\u202E") header))
+        (should (string-match-p "payload=<8 B>" header))
         (should-not (cl-position #x85 header :test #'=))
         (should-not (cl-position #x202e header :test #'=))))))
 
@@ -11637,7 +11623,8 @@ Multiple deltas should replace the preview instead of appending forever."
     (let ((content (buffer-string)))
       (should (= 1 (pi-coding-agent-test--count-matches
                       "write /tmp/foo\\.py" content)))
-      (should (string-match-p "final content" content)))))
+      (should (string-match-p "1 lines · 13 B · TAB details" content))
+      (should-not (string-match-p "final content" content)))))
 
 (ert-deftest pi-coding-agent-test-toolcall-non-write-shows-header-only ()
   "Non-write tools show header from toolcall_start but no streaming content."
@@ -12383,6 +12370,9 @@ are only present in tool_execution_start, not tool_execution_end."
            :toolName "read"
            :result (list :content '((:type "text" :text "def hello():\n    pass")))
            :isError nil))
+    (goto-char (point-min))
+    (search-forward "TAB details")
+    (pi-coding-agent--toggle-tool-output (button-at (match-beginning 0)))
     ;; Should have python markdown code fence
     (should (string-match-p "```python" (buffer-string)))))
 
@@ -12568,6 +12558,9 @@ which is just a success message."
            :toolName "write"
            :result (list :content '((:type "text" :text "Successfully wrote 42 bytes")))
            :isError nil))
+    (goto-char (point-min))
+    (search-forward "TAB details")
+    (pi-coding-agent--toggle-tool-output (button-at (match-beginning 0)))
     ;; Should have rust markdown code fence (from args content, not result)
     (should (string-match-p "```rust" (buffer-string)))
     ;; Should show the actual code, not the success message

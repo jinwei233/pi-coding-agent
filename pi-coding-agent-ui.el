@@ -852,6 +852,10 @@ This is a read-only buffer showing the conversation history."
               #'pi-coding-agent--filter-buffer-substring)
   (setq-local pi-coding-agent--thinking-display pi-coding-agent-thinking-display)
   (setq-local pi-coding-agent--tool-args-cache (make-hash-table :test 'equal))
+  (setq-local pi-coding-agent--transient-tool-pairs
+              (make-hash-table :test 'equal))
+  (setq-local pi-coding-agent--tool-detail-buffers
+              (make-hash-table :test 'equal))
   (setq-local pi-coding-agent--live-tool-blocks (make-hash-table :test 'equal))
   (setq-local pi-coding-agent--tool-block-order-counter 0)
   (setq-local pi-coding-agent--thinking-block-order-counter 0)
@@ -1302,6 +1306,15 @@ Used to replace raw markdown with rendered Org on message completion.")
   "Hash table mapping toolCallId to authoritative execution args.
 Needed because `tool_execution_end' events do not include args.  This is
 per-turn state and is cleared on turn end, history rebuild, and session reset.")
+
+(defvar-local pi-coding-agent--transient-tool-pairs nil
+  "Hash table mapping completed live toolCallIds to call/result pairs.
+Entries bridge `tool_execution_end' to the next canonical message refresh.")
+
+(defvar-local pi-coding-agent--tool-detail-buffers nil
+  "Hash table mapping toolCallIds to read-only detail buffers.
+The registry contains buffer identities only; complete payloads remain in
+canonical messages or the bounded transient pair index.")
 
 (defvar-local pi-coding-agent--live-tool-blocks nil
   "Hash table mapping toolCallId to live tool block records.

@@ -927,7 +927,15 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
               (should (string-match-p "Answer first\\." text))
               (should (string-match-p "> Need to double-check\\." text))
               (should (string-match-p "read foo\\.el" text))
-              (should (string-match-p "(defun foo ())" text))))
+              (should (string-match-p "1 lines · TAB details" text))
+              (should-not (string-match-p "(defun foo ())" text)))
+            (let ((detail (pi-coding-agent--open-tool-detail-buffer "tc1")))
+              (unwind-protect
+                  (with-current-buffer detail
+                    (should (string-match-p "(defun foo ())"
+                                            (buffer-string))))
+                (when (buffer-live-p detail)
+                  (kill-buffer detail)))))
           (should (member "get_messages" rpc-calls)))
       (when (and new-proc (process-live-p new-proc))
         (delete-process new-proc))

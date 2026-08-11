@@ -65,6 +65,100 @@
     (pi-coding-agent-large-output-bench--result
      'history size nil elapsed rendered-size)))
 
+(defun pi-coding-agent-large-output-bench--button-count ()
+  "Return the number of buttons in the current buffer."
+  (let ((position (point-min))
+        (count 0)
+        button)
+    (while (setq button (next-button position))
+      (setq count (1+ count)
+            position (max (1+ (button-start button))
+                          (button-end button))))
+    count))
+
+(defun pi-coding-agent-large-output-bench--tool-history (kind size)
+  "Benchmark summary-first history replay for tool KIND and payload SIZE."
+  (let* ((payload (pi-coding-agent-large-output-bench--payload size))
+         (name (symbol-name kind))
+         (args (pcase kind
+                 ('read '(:path "/tmp/large.txt" :offset 20))
+                 ('edit '(:path "/tmp/large.txt"))
+                 ('write (list :path "/tmp/large.txt" :content payload))
+                 ('bash '(:command "large-command"))))
+         (details (and (eq kind 'edit) (list :diff payload)))
+         (messages
+          (vector
+           (list :role "assistant"
+                 :content
+                 (vector (list :type "toolCall" :id "tool-1"
+                               :name name :arguments args)))
+           (list :role "toolResult" :toolCallId "tool-1" :toolName name
+                 :content (vector (list :type "text" :text payload))
+                 :details details :isError :json-false)))
+         elapsed
+         metrics)
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (garbage-collect)
+      (setq elapsed
+            (benchmark-run
+              1
+              (pi-coding-agent--display-session-history
+               messages (current-buffer))))
+      (setq metrics
+            (list :kind (intern (format "tool-%s" name))
+                  :bytes size
+                  :seconds (nth 0 elapsed)
+                  :gc-count (nth 1 elapsed)
+                  :gc-seconds (nth 2 elapsed)
+                  :buffer-bytes (buffer-size)
+                  :overlays (length (overlays-in (point-min) (point-max)))
+                  :buttons (pi-coding-agent-large-output-bench--button-count))))
+    (prin1 metrics)
+    (terpri)
+    metrics))
+
+(defun pi-coding-agent-large-output-bench--tool-live (kind size)
+  "Benchmark summary-first live completion for tool KIND and payload SIZE."
+  (let* ((payload (pi-coding-agent-large-output-bench--payload size))
+         (name (symbol-name kind))
+         (args (pcase kind
+                 ('read '(:path "/tmp/large.txt" :offset 20))
+                 ('edit '(:path "/tmp/large.txt"))
+                 ('write (list :path "/tmp/large.txt" :content payload))
+                 ('bash '(:command "large-command"))))
+         (details (and (eq kind 'edit) (list :diff payload)))
+         elapsed
+         metrics)
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--handle-display-event
+       (list :type "tool_execution_start" :toolCallId "tool-1"
+             :toolName name :args args))
+      (garbage-collect)
+      (setq elapsed
+            (benchmark-run
+              1
+              (pi-coding-agent--handle-display-event
+               (list :type "tool_execution_end" :toolCallId "tool-1"
+                     :toolName name
+                     :result
+                     (list :content (vector (list :type "text" :text payload))
+                           :details details)
+                     :isError nil))))
+      (setq metrics
+            (list :kind (intern (format "tool-live-%s" name))
+                  :bytes size
+                  :seconds (nth 0 elapsed)
+                  :gc-count (nth 1 elapsed)
+                  :gc-seconds (nth 2 elapsed)
+                  :buffer-bytes (buffer-size)
+                  :overlays (length (overlays-in (point-min) (point-max)))
+                  :buttons (pi-coding-agent-large-output-bench--button-count))))
+    (prin1 metrics)
+    (terpri)
+    metrics))
+
 (defun pi-coding-agent-large-output-bench--stream (kind size delta-size)
   "Benchmark streaming KIND to SIZE bytes in DELTA-SIZE chunks."
   (let ((remaining size)
@@ -99,6 +193,9 @@
   "Run the synthetic large-output benchmark matrix."
   (dolist (size pi-coding-agent-large-output-bench--sizes)
     (pi-coding-agent-large-output-bench--history size))
+  (dolist (kind '(read edit write bash))
+    (pi-coding-agent-large-output-bench--tool-history kind (* 1024 1024))
+    (pi-coding-agent-large-output-bench--tool-live kind (* 1024 1024)))
   (dolist (size pi-coding-agent-large-output-bench--sizes)
     (dolist (delta-size pi-coding-agent-large-output-bench--delta-sizes)
       (pi-coding-agent-large-output-bench--stream 'text size delta-size)

@@ -681,6 +681,9 @@ follow-up as a fresh prompt.")
         (clrhash pi-coding-agent--tool-args-cache))
       ;; Abort means "stop everything" — discard queued follow-ups too
       (when pi-coding-agent--aborted
+        (when pi-coding-agent--transient-tool-pairs
+          (clrhash pi-coding-agent--transient-tool-pairs))
+        (pi-coding-agent--cleanup-tool-detail-buffers)
         (pi-coding-agent--with-scroll-preservation
           (save-excursion
             (goto-char (point-max))
@@ -840,6 +843,9 @@ Status transitions are handled by `pi-coding-agent--update-state-from-event'."
 (defun pi-coding-agent--display-retry-start (event)
   "Display retry notice from auto_retry_start EVENT.
 Shows attempt number, delay, and raw error message."
+  (when pi-coding-agent--transient-tool-pairs
+    (clrhash pi-coding-agent--transient-tool-pairs))
+  (pi-coding-agent--cleanup-tool-detail-buffers)
   (let* ((attempt (plist-get event :attempt))
          (max-attempts (plist-get event :maxAttempts))
          (delay-ms (plist-get event :delayMs))
@@ -1113,6 +1119,7 @@ Note: This runs from `kill-buffer-hook', which executes AFTER the kill
 decision is made.  For proper cancellation support, use `pi-coding-agent-quit'
 which asks upfront before any buffers are touched."
   (when (derived-mode-p 'pi-coding-agent-chat-mode)
+    (pi-coding-agent--cleanup-tool-detail-buffers)
     (pi-coding-agent--cancel-followup-drain-timer)
     (pi-coding-agent--invalidate-prompt-start-wait)
     (pi-coding-agent--set-activity-phase "idle" 'teardown t)
@@ -1321,13 +1328,27 @@ Updates buffer-local state and renders display updates."
     ("tool_execution_end"
      (pi-coding-agent--set-activity-phase "thinking")
      (let* ((tool-call-id (plist-get event :toolCallId))
+            (tool-name (plist-get event :toolName))
             (result (plist-get event :result))
             (block (pi-coding-agent--tool-block-get tool-call-id))
             ;; Retrieve cached args since tool_execution_end doesn't include args
             (args (when (and tool-call-id pi-coding-agent--tool-args-cache)
                     (prog1 (gethash tool-call-id pi-coding-agent--tool-args-cache)
                       (remhash tool-call-id pi-coding-agent--tool-args-cache)))))
-       (pi-coding-agent--display-tool-end (plist-get event :toolName)
+       (when (and tool-call-id pi-coding-agent--transient-tool-pairs)
+         (puthash
+          tool-call-id
+          (list :tool-call
+                (list :type "toolCall" :id tool-call-id
+                      :name tool-name :arguments args)
+                :tool-result
+                (append (list :role "toolResult"
+                              :toolCallId tool-call-id
+                              :toolName tool-name
+                              :isError (plist-get event :isError))
+                        result))
+          pi-coding-agent--transient-tool-pairs))
+       (pi-coding-agent--display-tool-end tool-name
                                           args
                                           (plist-get result :content)
                                           (plist-get result :details)
@@ -1348,7 +1369,18 @@ Updates buffer-local state and renders display updates."
      (pi-coding-agent--handle-compaction-end-event event))
     ("agent_end"
      (pi-coding-agent--set-canonical-messages
-      (plist-get pi-coding-agent--state :messages))
+      (or (plist-get event :messages)
+          (plist-get pi-coding-agent--state :messages)))
+     (when (and (vectorp pi-coding-agent--canonical-messages)
+                pi-coding-agent--transient-tool-pairs)
+       (let ((all-promoted t))
+         (maphash
+          (lambda (tool-call-id _pair)
+            (unless (pi-coding-agent--canonical-tool-pair tool-call-id)
+              (setq all-promoted nil)))
+          pi-coding-agent--transient-tool-pairs)
+         (when all-promoted
+           (clrhash pi-coding-agent--transient-tool-pairs))))
      (pi-coding-agent--display-agent-end)
      (pi-coding-agent--update-hot-tail-boundary)
      (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail))
@@ -1461,6 +1493,9 @@ left alone."
         pi-coding-agent--thinking-block-order-counter 0)
   (when pi-coding-agent--tool-args-cache
     (clrhash pi-coding-agent--tool-args-cache))
+  (when pi-coding-agent--transient-tool-pairs
+    (clrhash pi-coding-agent--transient-tool-pairs))
+  (pi-coding-agent--cleanup-tool-detail-buffers)
   (when pi-coding-agent--live-tool-blocks
     (clrhash pi-coding-agent--live-tool-blocks)))
 
@@ -1647,6 +1682,219 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
          (or (null content) (consp (car content))))
     (cl-remove-if-not #'consp content))
    (t nil)))
+
+(defconst pi-coding-agent--tool-inline-detail-byte-limit (* 64 1024)
+  "Largest tool detail that may be expanded inline in a hot block.")
+
+(defconst pi-coding-agent--tool-summary-tail-lines 5
+  "Number of trailing output lines retained in a completed tool summary.")
+
+(defconst pi-coding-agent--tool-summary-tail-bytes 2048
+  "Maximum bytes retained for a completed tool output tail.")
+
+(defun pi-coding-agent--tool-text-line-count (text)
+  "Return the physical line count of TEXT without splitting it."
+  (if (or (not (stringp text)) (string-empty-p text))
+      0
+    (let ((count 1)
+          (position 0))
+      (while (string-match "\n" text position)
+        (setq count (1+ count)
+              position (match-end 0)))
+      (when (and (> count 1) (string-suffix-p "\n" text))
+        (setq count (1- count)))
+      count)))
+
+(defun pi-coding-agent--tool-byte-label (text)
+  "Return a compact byte-size label for TEXT."
+  (let ((bytes (if (stringp text) (string-bytes text) 0)))
+    (if (< bytes 1024)
+        (format "%d B" bytes)
+      (format "%.1f KiB" (/ bytes 1024.0)))))
+
+(defun pi-coding-agent--tool-diff-counts (diff)
+  "Return (ADDED . REMOVED) line counts for DIFF."
+  (let ((added 0)
+        (removed 0)
+        (position 0))
+    (when (stringp diff)
+      (while (< position (length diff))
+        (pcase (aref diff position)
+          (?+ (setq added (1+ added)))
+          (?- (setq removed (1+ removed))))
+        (setq position
+              (if (string-match "\n" diff position)
+                  (match-end 0)
+                (length diff)))))
+    (cons added removed)))
+
+(defun pi-coding-agent--tool-summary-tail (text)
+  "Return a bounded trailing summary of TEXT."
+  (let* ((text (or text ""))
+         (tail (car (pi-coding-agent--get-tail-lines
+                     text pi-coding-agent--tool-summary-tail-lines)))
+         (bytes (string-bytes tail)))
+    (if (<= bytes pi-coding-agent--tool-summary-tail-bytes)
+        tail
+      (let* ((start (max 0 (- (length tail)
+                              pi-coding-agent--tool-summary-tail-bytes)))
+             (bounded (substring tail start)))
+        (concat "..." bounded)))))
+
+(defun pi-coding-agent--tool-result-text (content)
+  "Extract raw text from vector or list tool result CONTENT."
+  (mapconcat
+   (lambda (block)
+     (when (equal (plist-get block :type) "text")
+       (pi-coding-agent--render-safe-string (plist-get block :text))))
+   (pi-coding-agent--content-block-list content)
+   "\n"))
+
+(defun pi-coding-agent--tool-generic-summary (data)
+  "Return a fixed conservative one-line summary for generic DATA."
+  (let ((scalar-keys '(:path :query :command :url :status))
+        (large-keys '(:content :body :payload :data))
+        (parts nil))
+    (dolist (key scalar-keys)
+      (when-let* ((value (pi-coding-agent--tool-arg-get data key))
+                  ((or (stringp value) (numberp value) (symbolp value))))
+        (let* ((text (pi-coding-agent--render-safe-string value))
+               (shown (if (> (string-bytes text) 120)
+                          (concat (substring text 0 (min 117 (length text))) "...")
+                        text)))
+          (push (format "%s=%s" (substring (symbol-name key) 1) shown)
+                parts))))
+    (dolist (key large-keys)
+      (when (pi-coding-agent--tool-arg-member data key)
+        (let ((value (pi-coding-agent--tool-arg-get data key)))
+          (push (format "%s=<%s>"
+                        (substring (symbol-name key) 1)
+                        (cond
+                         ((stringp value) (pi-coding-agent--tool-byte-label value))
+                         ((vectorp value) (format "%d items" (length value)))
+                         ((listp value) (format "%d fields" (/ (length value) 2)))
+                         (t "hidden")))
+                parts))))
+    (cond
+     ((null data) "")
+     (parts
+        (string-join (nreverse parts) " ")
+      )
+     (t
+      (format "%d fields"
+              (if (listp data) (/ (length data) 2) 0))))))
+
+(defun pi-coding-agent--canonical-tool-pair (tool-call-id)
+  "Return canonical call/result pair for TOOL-CALL-ID, or nil."
+  (let ((messages pi-coding-agent--canonical-messages)
+        tool-call
+        tool-result)
+    (when (vectorp messages)
+      (dotimes (index (length messages))
+        (let ((message (aref messages index)))
+          (if (equal (plist-get message :role) "toolResult")
+              (when (equal (plist-get message :toolCallId) tool-call-id)
+                (setq tool-result message))
+            (when (vectorp (plist-get message :content))
+              (dolist (block (append (plist-get message :content) nil))
+                (when (and (equal (plist-get block :type) "toolCall")
+                           (equal (plist-get block :id) tool-call-id))
+                  (setq tool-call block)))))))
+      (when (or tool-call tool-result)
+        (list :tool-call tool-call :tool-result tool-result)))))
+
+(defun pi-coding-agent--resolve-tool-detail-pair (tool-call-id)
+  "Resolve TOOL-CALL-ID to a canonical or transient call/result pair."
+  (or (pi-coding-agent--canonical-tool-pair tool-call-id)
+      (and pi-coding-agent--transient-tool-pairs
+           (gethash tool-call-id pi-coding-agent--transient-tool-pairs))))
+
+(defun pi-coding-agent--tool-detail-text (pair)
+  "Return complete display text recovered from tool PAIR."
+  (let* ((tool-call (plist-get pair :tool-call))
+         (result (plist-get pair :tool-result))
+         (name (or (plist-get tool-call :name)
+                   (plist-get result :toolName)))
+         (args (plist-get tool-call :arguments))
+         (raw (pi-coding-agent--tool-result-text
+               (plist-get result :content)))
+         (details (plist-get result :details)))
+    (pcase name
+      ("write" (or (pi-coding-agent--tool-arg-get args :content) raw))
+      ("edit" (or (pi-coding-agent--tool-arg-get details :diff) raw))
+      ((or "read" "bash") raw)
+      (_
+       (if-let* ((json (pi-coding-agent--pretty-print-json details)))
+           (if (string-empty-p raw) json (concat raw "\n\nDetails\n" json))
+         raw)))))
+
+(define-derived-mode pi-coding-agent-tool-detail-mode special-mode "Pi-Detail"
+  "Major mode for a lazily rendered Pi tool detail."
+  (setq-local buffer-read-only t)
+  (define-key pi-coding-agent-tool-detail-mode-map
+              (kbd "q") #'pi-coding-agent--quit-tool-detail-buffer))
+
+(defun pi-coding-agent--quit-tool-detail-buffer ()
+  "Kill the current tool detail buffer and close its window."
+  (interactive)
+  (quit-window t))
+
+(defun pi-coding-agent--detail-buffer-unregister ()
+  "Remove the current detail buffer from its owning chat registry."
+  (let ((owner (and (boundp 'pi-coding-agent--detail-owner)
+                    pi-coding-agent--detail-owner))
+        (tool-call-id (and (boundp 'pi-coding-agent--detail-tool-call-id)
+                           pi-coding-agent--detail-tool-call-id)))
+    (when (buffer-live-p owner)
+      (with-current-buffer owner
+      (when pi-coding-agent--tool-detail-buffers
+          (remhash tool-call-id
+                   pi-coding-agent--tool-detail-buffers))))))
+
+(defun pi-coding-agent--cleanup-tool-detail-buffers ()
+  "Kill and unregister every detail buffer owned by the current chat."
+  (when pi-coding-agent--tool-detail-buffers
+    (let (buffers)
+      (maphash (lambda (_id buffer) (push buffer buffers))
+               pi-coding-agent--tool-detail-buffers)
+      (clrhash pi-coding-agent--tool-detail-buffers)
+      (dolist (buffer buffers)
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(defun pi-coding-agent--open-tool-detail-buffer (tool-call-id)
+  "Open or refresh the read-only detail buffer for TOOL-CALL-ID."
+  (let* ((pair (pi-coding-agent--resolve-tool-detail-pair tool-call-id))
+         (detail (and pair (pi-coding-agent--tool-detail-text pair))))
+    (unless pair
+      (user-error "Tool detail unavailable for %s: pair not found" tool-call-id))
+    (let* ((owner (current-buffer))
+           (existing (and pi-coding-agent--tool-detail-buffers
+                          (gethash tool-call-id
+                                   pi-coding-agent--tool-detail-buffers)))
+           (buffer
+            (if (buffer-live-p existing)
+                existing
+              (generate-new-buffer
+               (format "*Pi tool detail %s:%s*"
+                       (substring (md5 (format "%S"
+                                              (list pi-coding-agent--canonical-session-directory
+                                                    pi-coding-agent--canonical-session-name)))
+                                  0 8)
+                       tool-call-id)))))
+      (puthash tool-call-id buffer pi-coding-agent--tool-detail-buffers)
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (insert (or detail ""))
+          (goto-char (point-min))
+          (pi-coding-agent-tool-detail-mode)
+          (setq-local pi-coding-agent--detail-owner owner)
+          (setq-local pi-coding-agent--detail-tool-call-id tool-call-id)
+          (add-hook 'kill-buffer-hook
+                    #'pi-coding-agent--detail-buffer-unregister nil t)))
+      (display-buffer buffer)
+      buffer)))
 
 (defun pi-coding-agent--unicode-escape-char (char)
   "Return a display escape for Unicode CHAR."
@@ -1920,23 +2168,39 @@ Uses `font-lock-face' to survive tree-sitter refontification."
        (let ((name (propertize tool-name 'font-lock-face 'pi-coding-agent-tool-name)))
          (if (eq preview-state 'streaming)
              name
-           (let* ((json-pretty (condition-case nil
-                                   (when-let* ((json (pi-coding-agent--pretty-print-json args)))
-                                     (pi-coding-agent--escape-control-chars-for-display
-                                      json t))
-                                 (error nil)))
-                  (json-compact (when json-pretty
-                                  (mapconcat #'string-trim
-                                             (split-string json-pretty "\n") " ")))
-                  (json (cond
-                         ((null json-pretty) nil)
-                         ((<= (+ (length tool-name) 1 (length json-compact))
-                              fill-column)
-                          json-compact)
-                         (t json-pretty))))
-             (if json
-                 (concat name (propertize (concat " " json) 'font-lock-face 'pi-coding-agent-tool-command))
-               name))))))))
+           (let* ((large-field-p
+                   (seq-some
+                    (lambda (key)
+                      (pi-coding-agent--tool-arg-member args key))
+                    '(:content :body :payload :data)))
+                  (json-pretty
+                   (and (not large-field-p)
+                        (condition-case nil
+                            (when-let* ((json
+                                        (pi-coding-agent--pretty-print-json args)))
+                              (pi-coding-agent--escape-control-chars-for-display
+                               json t))
+                          (error nil))))
+                  (json-compact
+                   (when json-pretty
+                     (mapconcat #'string-trim
+                                (split-string json-pretty "\n") " ")))
+                  (json
+                   (cond
+                    ((null json-pretty) nil)
+                    ((<= (+ (length tool-name) 1 (length json-compact))
+                         fill-column)
+                     json-compact)
+                    (t json-pretty)))
+                  (summary (and (not json)
+                                (pi-coding-agent--tool-generic-summary args)))
+                  (display (or json summary)))
+             (if (or (null display) (string-empty-p display))
+                 name
+               (concat name
+                       (propertize (concat " " display)
+                                   'font-lock-face
+                                   'pi-coding-agent-tool-command))))))))))
 
 (defun pi-coding-agent--display-tool-start
     (tool-name args &optional tool-call-id order preview-state path-metadata-policy)
@@ -2211,7 +2475,7 @@ Returns markdown string for syntax highlighting."
   (let ((fence (pi-coding-agent--markdown-fence-delimiter content)))
     (format "%s%s\n%s\n%s" fence (or lang "") content fence)))
 
-(defun pi-coding-agent--display-tool-end
+(defun pi-coding-agent--display-tool-end-legacy
     (tool-name args content details is-error &optional block)
   "Display result for TOOL-NAME and finalize BLOCK.
 ARGS contains tool arguments, CONTENT is a list of content blocks.
@@ -2308,6 +2572,207 @@ if none exists, render the result at point without a live overlay."
                is-edit-diff))
             (insert "\n")))))))
 
+(defun pi-coding-agent--tool-summary-record
+    (tool-call-id tool-name args content details is-error)
+  "Build a lightweight summary record for one completed tool."
+  (let* ((raw (pi-coding-agent--tool-result-text content))
+         (error-p (eq is-error t))
+         (lines (pi-coding-agent--tool-text-line-count raw))
+         (path (pi-coding-agent--tool-path-string
+                (pi-coding-agent--tool-arg-path args)))
+         (detail-locator (list :tool-call-id tool-call-id))
+         summary)
+    (setq summary
+          (if error-p
+              (if (<= (string-bytes raw) pi-coding-agent--tool-summary-tail-bytes)
+                  (format "failed · %s · TAB details" raw)
+                (format "failed · %d lines (%d hidden)\n%s\nTAB details"
+                        lines
+                        (max 0 (- lines pi-coding-agent--tool-summary-tail-lines))
+                        (pi-coding-agent--tool-summary-tail raw)))
+            (pcase tool-name
+              ("edit"
+               (let* ((diff (pi-coding-agent--tool-arg-get details :diff))
+                      (counts (pi-coding-agent--tool-diff-counts diff)))
+                 (format "+%d -%d · TAB details" (car counts) (cdr counts))))
+              ("write"
+               (let ((written (or (pi-coding-agent--tool-arg-get args :content)
+                                  "")))
+                 (format "%d lines · %s · TAB details"
+                         (pi-coding-agent--tool-text-line-count written)
+                         (pi-coding-agent--tool-byte-label written))))
+              ("read"
+               (let* ((offset (pi-coding-agent--tool-arg-get args :offset))
+                      (end (and offset (> lines 0) (+ offset lines -1))))
+                 (format "%s%d lines · TAB details"
+                         (if offset
+                             (format "L%d-L%d · " offset (or end offset))
+                           "")
+                         lines)))
+              ("bash"
+               (format "%d lines (%d hidden)\n%s\nTAB details"
+                       lines
+                       (max 0 (- lines pi-coding-agent--tool-summary-tail-lines))
+                       (pi-coding-agent--tool-summary-tail raw)))
+              (_
+               (let ((args-summary (pi-coding-agent--tool-generic-summary args))
+                     (details-summary
+                      (pi-coding-agent--tool-generic-summary details)))
+                 (string-join
+                  (delq nil
+                        (list (unless (string-empty-p args-summary) args-summary)
+                              (unless (string-empty-p details-summary)
+                                (concat "result " details-summary))
+                              "TAB details"))
+                  " · "))))))
+    (list :tool-call-id tool-call-id
+          :tool-name tool-name
+          :error error-p
+          :path path
+          :offset (pi-coding-agent--tool-arg-get args :offset)
+          :line-count lines
+          :summary summary
+          :detail-locator detail-locator)))
+
+(defun pi-coding-agent--insert-tool-summary (record)
+  "Insert the visible lightweight summary for RECORD."
+  (let* ((summary (plist-get record :summary))
+         (tool-call-id (plist-get record :tool-call-id))
+         (tab-start (or (string-match "TAB details" summary)
+                        (length summary))))
+    (insert (substring summary 0 tab-start))
+    (insert-text-button
+     (if (< tab-start (length summary)) "TAB details" "[details]")
+     'action #'pi-coding-agent--toggle-tool-summary
+     'follow-link t
+     'pi-coding-agent-tool-toggle t
+     'pi-coding-agent-tool-call-id tool-call-id
+     'pi-coding-agent-summary summary
+     'pi-coding-agent-expanded nil)
+    (when (< (+ tab-start (length "TAB details")) (length summary))
+      (insert (substring summary (+ tab-start (length "TAB details")))))
+    (insert "\n")))
+
+(defun pi-coding-agent--render-tool-detail-inline
+    (block tool-call-id summary)
+  "Render TOOL-CALL-ID detail inline in BLOCK, retaining SUMMARY for collapse."
+  (let* ((pair (pi-coding-agent--resolve-tool-detail-pair tool-call-id))
+         (detail (and pair (pi-coding-agent--tool-detail-text pair)))
+         (tool-call (plist-get pair :tool-call))
+         (name (or (plist-get tool-call :name)
+                   (plist-get (plist-get pair :tool-result) :toolName)))
+         (args (plist-get tool-call :arguments))
+         (lang (pi-coding-agent--path-to-language
+                (pi-coding-agent--tool-path-string
+                 (pi-coding-agent--tool-arg-path args))))
+         (edit-p (equal name "edit"))
+         (header-end (pi-coding-agent--tool-block-header-end block))
+         (end-marker (pi-coding-agent--tool-block-end-marker block))
+         (inhibit-read-only t))
+    (unless pair
+      (user-error "Tool detail unavailable for %s: pair not found" tool-call-id))
+    (save-excursion
+      (goto-char (marker-position header-end))
+      (delete-region (point) (marker-position end-marker))
+      (pi-coding-agent--insert-rendered-tool-content detail lang edit-p)
+      (insert-text-button
+       "[-]"
+       'action #'pi-coding-agent--toggle-tool-summary
+       'follow-link t
+       'pi-coding-agent-tool-toggle t
+       'pi-coding-agent-tool-call-id tool-call-id
+       'pi-coding-agent-summary summary
+       'pi-coding-agent-expanded t)
+      (insert "\n")
+      (set-marker end-marker (point))
+      (pi-coding-agent--tool-block-refresh-overlay block)
+      (overlay-put (pi-coding-agent--tool-block-overlay block)
+                   'pi-coding-agent-tool-detail-expanded t))))
+
+(defun pi-coding-agent--toggle-tool-summary (button)
+  "Expand, collapse, or open the lazily resolved detail for BUTTON."
+  (let* ((tool-call-id (button-get button 'pi-coding-agent-tool-call-id))
+         (summary (button-get button 'pi-coding-agent-summary))
+         (expanded (button-get button 'pi-coding-agent-expanded))
+         (overlay (seq-find
+                   (lambda (candidate)
+                     (overlay-get candidate 'pi-coding-agent-tool-block))
+                   (overlays-at (button-start button))))
+         (block (and overlay
+                     (pi-coding-agent--tool-block-from-overlay overlay))))
+    (unless tool-call-id
+      (user-error "Tool detail unavailable: missing toolCallId"))
+    (if expanded
+        (let ((header-end (pi-coding-agent--tool-block-header-end block))
+              (end-marker (pi-coding-agent--tool-block-end-marker block))
+              (inhibit-read-only t))
+          (save-excursion
+            (goto-char (marker-position header-end))
+            (delete-region (point) (marker-position end-marker))
+            (pi-coding-agent--insert-tool-summary
+             (list :tool-call-id tool-call-id :summary summary))
+            (set-marker end-marker (point))
+            (pi-coding-agent--tool-block-refresh-overlay block)
+            (overlay-put overlay 'pi-coding-agent-tool-detail-expanded nil)))
+      (let* ((pair (pi-coding-agent--resolve-tool-detail-pair tool-call-id))
+             (detail (and pair (pi-coding-agent--tool-detail-text pair))))
+        (unless pair
+          (user-error "Tool detail unavailable for %s: pair not found"
+                      tool-call-id))
+        (if (> (string-bytes detail)
+               pi-coding-agent--tool-inline-detail-byte-limit)
+            (pi-coding-agent--open-tool-detail-buffer tool-call-id)
+          (pi-coding-agent--render-tool-detail-inline
+           block tool-call-id summary))))))
+
+(defun pi-coding-agent--display-tool-end-summary
+    (tool-name args content details is-error &optional block)
+  "Finalize BLOCK with a summary-first completed tool presentation."
+  (let* ((block (or block (pi-coding-agent--current-tool-block)))
+         (tool-call-id (and block
+                            (pi-coding-agent--tool-block-tool-call-id block)))
+         (record (pi-coding-agent--tool-summary-record
+                  tool-call-id tool-name args content details is-error))
+         (inhibit-read-only t))
+    (pi-coding-agent--with-scroll-preservation
+      (save-excursion
+        (if block
+            (let ((header-end (pi-coding-agent--tool-block-header-end block))
+                  (end-marker (pi-coding-agent--tool-block-end-marker block)))
+              (goto-char (marker-position header-end))
+              (delete-region (point) (marker-position end-marker))
+              (pi-coding-agent--insert-tool-summary record)
+              (set-marker end-marker (point))
+              (when (equal tool-name "read")
+                (pi-coding-agent--tool-block-set-offset
+                 block (pi-coding-agent--tool-arg-get args :offset)))
+              (pi-coding-agent--tool-block-refresh-overlay block)
+              (overlay-put (pi-coding-agent--tool-block-overlay block)
+                           'pi-coding-agent-tool-summary record)
+              (pi-coding-agent--tool-overlay-finalize
+               (if (eq is-error t)
+                   'pi-coding-agent-tool-block-error
+                 'pi-coding-agent-tool-block)
+               block))
+          (goto-char (point-max))
+          (pi-coding-agent--insert-tool-summary record))
+        (when (eobp)
+          (insert "\n"))))))
+
+(defun pi-coding-agent--display-tool-end
+    (tool-name args content details is-error &optional block)
+  "Finalize one tool result using summary-first rendering when locatable.
+Legacy direct helper calls without a toolCallId retain the complete renderer;
+real live and history tools always carry an id and use the summary renderer."
+  (let* ((block (or block (pi-coding-agent--current-tool-block)))
+         (tool-call-id (and block
+                            (pi-coding-agent--tool-block-tool-call-id block))))
+    (if tool-call-id
+        (pi-coding-agent--display-tool-end-summary
+         tool-name args content details is-error block)
+      (pi-coding-agent--display-tool-end-legacy
+       tool-name args content details is-error block))))
+
 (defun pi-coding-agent--ranges-excluding-property (start end prop)
   "Return contiguous ranges in START..END where PROP is nil."
   (let ((pos start)
@@ -2333,7 +2798,7 @@ Stops after the first font-lock error to avoid repeated failures."
            (message "pi-coding-agent: toggle fontification failed: %S" err))
          (throw 'pi-coding-agent--font-lock-failed nil))))))
 
-(defun pi-coding-agent--toggle-tool-output (button)
+(defun pi-coding-agent--toggle-tool-output-legacy (button)
   "Toggle between preview and full content for BUTTON.
 Preserves window scroll position during the toggle."
   (let* ((inhibit-read-only t)
@@ -2392,6 +2857,12 @@ Preserves window scroll position during the toggle."
                   ;; Window was inside tool content - show from block start
                   (set-window-start win block-start t)
                   (set-window-point win block-start))))))))))
+
+(defun pi-coding-agent--toggle-tool-output (button)
+  "Toggle legacy output or a summary-first BUTTON."
+  (if (button-get button 'pi-coding-agent-tool-call-id)
+      (pi-coding-agent--toggle-tool-summary button)
+    (pi-coding-agent--toggle-tool-output-legacy button)))
 
 (defun pi-coding-agent--replace-thinking-block-region (start end rendered)
   "Replace completed-thinking text in START..END with RENDERED.
@@ -2541,7 +3012,7 @@ Returns (START . END) if inside a tool block, nil otherwise."
     (let ((found nil))
       (while (and (not found) (< (point) end))
         (let ((btn (button-at (point))))
-          (if (and btn (button-get btn 'pi-coding-agent-full-content))
+          (if (and btn (button-get btn 'pi-coding-agent-tool-toggle))
               (setq found btn)
             (forward-char 1))))
       found)))
@@ -2557,7 +3028,9 @@ command falls back to `outline-cycle' for turn folding."
           (if-let* ((btn (pi-coding-agent--find-toggle-button-in-region
                           (car bounds) (cdr bounds))))
               (progn
-                (pi-coding-agent--toggle-tool-output btn)
+                (if (button-get btn 'pi-coding-agent-tool-call-id)
+                    (pi-coding-agent--toggle-tool-summary btn)
+                  (pi-coding-agent--toggle-tool-output btn))
                 ;; Try to restore position, clamped to new block bounds.
                 ;; Use (1- end) because overlays-at uses half-open [start, end),
                 ;; so clamping to exactly end would place cursor outside the
@@ -2566,8 +3039,13 @@ command falls back to `outline-cycle' for turn folding."
                   (goto-char (min original-pos (1- (cdr new-bounds))))))
             ;; No button found - short output, use outline-cycle
             (outline-cycle))
-        ;; Not in a tool block
-        (outline-cycle)))))
+        (if-let* ((cold-block (pi-coding-agent--cold-tool-block-at-point))
+                  (tool-call-id
+                   (plist-get (plist-get cold-block :metadata)
+                              :tool-call-id)))
+            (pi-coding-agent--open-tool-detail-buffer tool-call-id)
+          ;; Not in a tool block
+          (outline-cycle))))))
 
 ;;;; Tool Block Cooling
 ;;
@@ -2639,11 +3117,16 @@ when the visible body is a mapped preview.  The result deliberately excludes
 buttons, full content, markers, and absolute buffer positions."
   (let ((record (pi-coding-agent--tool-block-from-overlay overlay)))
     (list :order (and record (pi-coding-agent--tool-block-order record))
+          :tool-call-id
+          (and record (pi-coding-agent--tool-block-tool-call-id record))
           :tool-name (overlay-get overlay 'pi-coding-agent-tool-name)
           :path (overlay-get overlay 'pi-coding-agent-tool-path)
           :raw-path (overlay-get overlay 'pi-coding-agent-tool-raw-path)
           :path-error (overlay-get overlay 'pi-coding-agent-tool-path-error)
           :offset (overlay-get overlay 'pi-coding-agent-tool-offset)
+          :summary (plist-get
+                    (overlay-get overlay 'pi-coding-agent-tool-summary)
+                    :summary)
           ;; Only collapsed previews need the small visible-line map.
           :line-map (and collapsed
                          (overlay-get overlay 'pi-coding-agent-line-map))
@@ -2654,23 +3137,29 @@ buttons, full content, markers, and absolute buffer positions."
 The result carries its visible body, lightweight target metadata and, for a
 currently collapsed block, its hidden count.  Expanded blocks return no hidden
 count because cold history must stay preview-only."
-  (when-let* ((visible-body (pi-coding-agent--tool-overlay-visible-body overlay))
-              (header-end (marker-position
+  (when-let* ((header-end (marker-position
                            (overlay-get overlay 'pi-coding-agent-header-end))))
-    (let* ((button (pi-coding-agent--find-toggle-button-in-region
+    (let* ((summary-record
+            (overlay-get overlay 'pi-coding-agent-tool-summary))
+           (visible-body
+            (or (plist-get summary-record :summary)
+                (pi-coding-agent--tool-overlay-visible-body overlay)))
+           (button (pi-coding-agent--find-toggle-button-in-region
                     header-end (overlay-end overlay)))
            (collapsed (and button
                            (not (button-get button
                                             'pi-coding-agent-expanded))))
            (hidden-count (and collapsed
                               (button-get button 'hidden-count))))
-      (list :visible-body visible-body
+      (when visible-body
+        (list :visible-body visible-body
             :target-metadata
             (pi-coding-agent--cold-tool-target-metadata
              overlay header-end collapsed)
-            :hidden-count (and (integerp hidden-count)
-                               (> hidden-count 0)
-                               hidden-count)))))
+              :summary-p (and summary-record t)
+              :hidden-count (and (integerp hidden-count)
+                                 (> hidden-count 0)
+                                 hidden-count))))))
 
 (defun pi-coding-agent--cool-tool-overlay (overlay)
   "Rewrite completed tool OVERLAY into its cold plain-history form.
@@ -2684,12 +3173,16 @@ diff annotations."
       (let* ((inhibit-read-only t)
              (hidden-count (plist-get metadata :hidden-count))
              (target-metadata (plist-get metadata :target-metadata))
-             (cold-body (concat
-                         (pi-coding-agent--wrap-in-src-block visible-body nil)
-                         "\n"
-                         (when hidden-count
-                           (concat (pi-coding-agent--tool-hidden-line-label hidden-count)
-                                   "\n"))))
+             (summary-p (plist-get metadata :summary-p))
+             (cold-body
+              (if summary-p
+                  (concat visible-body "\n")
+                (concat
+                 (pi-coding-agent--wrap-in-src-block visible-body nil)
+                 "\n"
+                 (when hidden-count
+                   (concat (pi-coding-agent--tool-hidden-line-label hidden-count)
+                           "\n")))))
              (ov-start (overlay-start overlay))
              (ov-end (overlay-end overlay)))
         (remove-overlays ov-start ov-end 'pi-coding-agent-diff-overlay t)
@@ -2864,14 +3357,17 @@ Any chat restriction is restored exactly after the authoritative lookup."
   (save-restriction
     (widen)
     (let ((line-map (overlay-get overlay 'pi-coding-agent-line-map))
-          (header-end (overlay-get overlay 'pi-coding-agent-header-end)))
-      (pi-coding-agent--tool-line-from-metadata
-       (overlay-get overlay 'pi-coding-agent-tool-name)
-       (overlay-get overlay 'pi-coding-agent-tool-offset)
-       line-map
-       header-end
-       (and line-map header-end
-            (pi-coding-agent--tool-overlay-collapsed-p overlay))))))
+          (header-end (overlay-get overlay 'pi-coding-agent-header-end))
+          (tool-name (overlay-get overlay 'pi-coding-agent-tool-name))
+          (offset (overlay-get overlay 'pi-coding-agent-tool-offset)))
+      (if (and (overlay-get overlay 'pi-coding-agent-tool-summary)
+               (not (overlay-get overlay
+                                 'pi-coding-agent-tool-detail-expanded)))
+          (if (equal tool-name "read") (or offset 1) 1)
+        (pi-coding-agent--tool-line-from-metadata
+         tool-name offset line-map header-end
+         (and line-map header-end
+              (pi-coding-agent--tool-overlay-collapsed-p overlay)))))))
 
 (cl-defun pi-coding-agent--make-file-target
     (source raw emacs-path &key line column range bounds fragment label)
@@ -4693,10 +5189,14 @@ Return nil outside a cold tool.  Any chat restriction is restored exactly."
            (header-end (and (integerp header-length)
                             (+ (car bounds) header-length)))
            (line-map (plist-get metadata :line-map)))
-      (pi-coding-agent--tool-line-from-metadata
-       (plist-get metadata :tool-name)
-       (plist-get metadata :offset)
-       line-map header-end line-map))))
+      (if (plist-get metadata :summary)
+          (if (equal (plist-get metadata :tool-name) "read")
+              (or (plist-get metadata :offset) 1)
+            1)
+        (pi-coding-agent--tool-line-from-metadata
+         (plist-get metadata :tool-name)
+         (plist-get metadata :offset)
+         line-map header-end line-map)))))
 
 (defun pi-coding-agent--cold-tool-file-target (cold-block)
   "Return the authoritative file target for COLD-BLOCK, or nil."
@@ -5342,8 +5842,9 @@ Display-only table decoration is applied after deferred history insertion."
 TOOL-CALL is a content block plist with :type \"toolCall\", :id, :name,
 and :arguments.  RESULT is the matching toolResult message, or nil."
   (let ((tool-name (plist-get tool-call :name))
-        (args (plist-get tool-call :arguments)))
-    (pi-coding-agent--display-tool-start tool-name args)
+        (args (plist-get tool-call :arguments))
+        (tool-call-id (plist-get tool-call :id)))
+    (pi-coding-agent--display-tool-start tool-name args tool-call-id)
     (if result
         (pi-coding-agent--display-tool-end
          tool-name args
