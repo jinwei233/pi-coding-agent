@@ -115,26 +115,27 @@
     (unwind-protect
         (save-window-excursion
           (switch-to-buffer buffer)
-          (pi-coding-agent-chat-mode)
-          (pi-coding-agent--display-agent-start)
-          (when (eq kind 'thinking)
-            (pi-coding-agent--display-thinking-start))
-          (garbage-collect)
-          (setq elapsed
-                (benchmark-run
-                  1
-                  (while (> remaining 0)
-                    (let ((delta (if (< remaining delta-size)
-                                     (substring chunk 0 remaining)
-                                   chunk)))
-                      (if (eq kind 'thinking)
-                          (pi-coding-agent--display-thinking-delta delta)
-                        (pi-coding-agent--display-message-delta delta))
-                      (setq remaining (- remaining (length delta)))
-                      (redisplay t)))
-                  (when (eq kind 'thinking)
-                    (pi-coding-agent--display-thinking-end ""))
-                  (redisplay t)))
+          (let ((pi-coding-agent-thinking-display 'visible))
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--display-agent-start)
+            (when (eq kind 'thinking)
+              (pi-coding-agent--display-thinking-start))
+            (garbage-collect)
+            (setq elapsed
+                  (benchmark-run
+                    1
+                    (while (> remaining 0)
+                      (let ((delta (if (< remaining delta-size)
+                                       (substring chunk 0 remaining)
+                                     chunk)))
+                        (if (eq kind 'thinking)
+                            (pi-coding-agent--display-thinking-delta delta)
+                          (pi-coding-agent--display-message-delta delta))
+                        (setq remaining (- remaining (length delta)))
+                        (redisplay t)))
+                    (when (eq kind 'thinking)
+                      (pi-coding-agent--display-thinking-end ""))
+                    (redisplay t))))
           (setq rendered-size (buffer-size)))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))
