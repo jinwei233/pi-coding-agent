@@ -257,6 +257,51 @@ Returns (PREFIX . BARE), where PREFIX is everything before the first `|'."
             (substring line pipe-index))
     (cons "" line)))
 
+(defun pi-coding-agent--split-table-row (line)
+  "Split table LINE into cells, keeping pipes inside code spans literal.
+This mirrors `markdown-table-wrap--split-table-row' for normal rows, but
+does not treat `|' inside inline backtick code spans as column separators."
+  (let* ((trimmed (string-trim line))
+         (len (length trimmed))
+         (pos 0)
+         (code-run 0)
+         (cells nil)
+         (current nil))
+    (while (< pos len)
+      (let ((ch (aref trimmed pos)))
+        (cond
+         ((and (= ch ?|)
+               (zerop code-run)
+               (or (zerop pos)
+                   (/= (aref trimmed (1- pos)) ?\\)))
+          (push (string-trim (apply #'string (nreverse current))) cells)
+          (setq current nil)
+          (setq pos (1+ pos)))
+         ((and (= ch ?`)
+               (or (zerop pos)
+                   (/= (aref trimmed (1- pos)) ?\\)))
+          (let ((run-start pos))
+            (while (and (< pos len)
+                        (= (aref trimmed pos) ?`))
+              (push ?` current)
+              (setq pos (1+ pos)))
+            (let ((run-len (- pos run-start)))
+              (cond
+               ((zerop code-run)
+                (setq code-run run-len))
+               ((= code-run run-len)
+                (setq code-run 0))))))
+         (t
+          (push ch current)
+          (setq pos (1+ pos))))))
+    (push (string-trim (apply #'string (nreverse current))) cells)
+    (setq cells (nreverse cells))
+    (when (and cells (string-empty-p (car cells)))
+      (setq cells (cdr cells)))
+    (when (and cells (string-empty-p (car (last cells))))
+      (setq cells (butlast cells)))
+    cells))
+
 ;;;; Visible-String Extraction
 
 (defun pi-coding-agent--visible-string-buffer ()
@@ -412,7 +457,7 @@ used by `pi-coding-agent--render-table-row-lines'."
                ((string-suffix-p ":" trimmed) 'right)
                ((string-prefix-p ":" trimmed) 'left)
                (t nil))))
-          (markdown-table-wrap--split-table-row (string-trim separator-line))))
+          (pi-coding-agent--split-table-row (string-trim separator-line))))
 
 ;;;; Display Groups
 
@@ -432,11 +477,11 @@ Plain tables (no prefix) take a fast path that skips prefix splitting."
          (prefix-width (if no-prefix 0
                          (apply #'max 0 (mapcar #'string-width prefixes)))))
     (when (>= (length bare-lines) 2)
-      (let* ((headers (markdown-table-wrap--split-table-row
+      (let* ((headers (pi-coding-agent--split-table-row
                        (string-trim (car bare-lines))))
              (aligns (pi-coding-agent--table-alignments (cadr bare-lines)))
              (rows (mapcar (lambda (line)
-                             (markdown-table-wrap--split-table-row
+                             (pi-coding-agent--split-table-row
                               (string-trim line)))
                            (nthcdr 2 bare-lines)))
              (visible-cache

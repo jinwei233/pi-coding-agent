@@ -409,6 +409,37 @@ so visible text still needs consistent alignment across all display lines."
       (let ((widths (mapcar #'string-width (nreverse all-lines))))
         (should (= (length (delete-dups (copy-sequence widths))) 1))))))
 
+(ert-deftest pi-coding-agent-test-split-table-row-keeps-code-pipe-in-cell ()
+  "Inline code pipes are cell content, not table separators."
+  (should (equal (pi-coding-agent--split-table-row
+                  "| mode | action | |\n")
+                 '("mode" "action" "")))
+  (should (equal (pi-coding-agent--split-table-row
+                  "| live | `recovery-outcome=full-live|owned-management-live` | |\n")
+                 '("live"
+                   "`recovery-outcome=full-live|owned-management-live`"
+                   ""))))
+
+(ert-deftest pi-coding-agent-test-decorate-table-keeps-code-pipe-column-count ()
+  "Decorated tables keep empty trailing columns when a code cell contains `|'."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((pi-coding-agent-prettify-tables t)
+          (inhibit-read-only t))
+      (insert "| mode | action | |\n")
+      (insert "|------|--------|-|\n")
+      (insert "| live | `recovery-outcome=full-live|owned-management-live` | |\n"))
+    (font-lock-ensure)
+    (pi-coding-agent--decorate-tables-in-region (point-min) (point-max) 120)
+    (let* ((displays (pi-coding-agent-test--table-overlay-displays-in-region
+                      (point-min) (point-max)))
+           (data-line (string-trim-right (nth 2 displays) "\n+")))
+      (should (string-match-p
+               "recovery-outcome=full-live|owned-management-live"
+               data-line))
+      ;; Three rendered columns have four box-drawing vertical delimiters.
+      (should (= (cl-count ?│ data-line) 4)))))
+
 (ert-deftest pi-coding-agent-test-zero-width-column-keeps-separator-aligned ()
   "A zero-width column occupies the same width in rows and separators."
   (dolist (pretty '(t nil))
