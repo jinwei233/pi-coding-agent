@@ -58,6 +58,8 @@
 (declare-function pi-coding-agent-visit-file "pi-coding-agent-render")
 (declare-function pi-coding-agent--dispatch-button "pi-coding-agent-render")
 (declare-function pi-coding-agent--cleanup-on-kill "pi-coding-agent-render")
+(declare-function pi-coding-agent-answer-pending-question
+                  "pi-coding-agent-render")
 (declare-function pi-coding-agent--restore-tool-properties "pi-coding-agent-render")
 (declare-function pi-coding-agent--maybe-refresh-hot-tail-tables "pi-coding-agent-table")
 (declare-function pi-coding-agent--jit-decorate-tables "pi-coding-agent-table")
@@ -153,6 +155,14 @@ reapply or clean up buffer-local UI.
 This is an abnormal hook.  Functions should be idempotent because
 pi-coding-agent may call them again with the same OLD-PHASE and
 NEW-PHASE when session buffers are relinked or reset."
+  :type 'hook
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-pending-dialog-functions nil
+  "Functions called after a chat buffer's pending dialog queue changes.
+Each function receives CHAT-BUFFER and COUNT.  Dialogs are runtime-only RPC
+requests; consumers should use this hook to refresh derived UI, not persist
+the requests."
   :type 'hook
   :group 'pi-coding-agent)
 
@@ -529,6 +539,8 @@ Return nil when PATH is not a string."
     (define-key map (kbd "C-c C-m") #'pi-coding-agent-select-model)
     (define-key map (kbd "C-c C-t") #'pi-coding-agent-cycle-thinking)
     (define-key map (kbd "C-c C-y") #'pi-coding-agent-copy-last-message)
+    (define-key map (kbd "C-c C-a")
+                #'pi-coding-agent-answer-pending-question)
     (define-key map (kbd "n") #'pi-coding-agent-next-message)
     (define-key map (kbd "p") #'pi-coding-agent-previous-message)
     (define-key map (kbd "f") #'pi-coding-agent-fork-at-point)
@@ -1455,6 +1467,22 @@ Keys are extension identifiers (strings), values are status text.")
 
 (defvar-local pi-coding-agent--unsupported-extension-ui-methods-warned nil
   "Unsupported extension UI method names already warned for this pi session.")
+
+(defvar-local pi-coding-agent--pending-extension-ui-dialogs nil
+  "FIFO list of extension UI dialog envelopes awaiting an explicit answer.
+Each envelope is a plist containing :event and the owning :process.")
+
+(defun pi-coding-agent-pending-dialog-count (&optional chat-buffer)
+  "Return the number of pending extension dialogs in CHAT-BUFFER.
+When CHAT-BUFFER is nil, inspect the current buffer."
+  (with-current-buffer (or chat-buffer (current-buffer))
+    (length pi-coding-agent--pending-extension-ui-dialogs)))
+
+(defun pi-coding-agent--notify-pending-dialog-change ()
+  "Notify consumers about the current chat buffer's pending dialog count."
+  (run-hook-with-args 'pi-coding-agent-pending-dialog-functions
+                      (current-buffer)
+                      (pi-coding-agent-pending-dialog-count)))
 
 (defun pi-coding-agent--record-unsupported-extension-ui-warning (method)
   "Record an unsupported extension UI warning for METHOD.

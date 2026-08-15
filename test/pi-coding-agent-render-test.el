@@ -167,7 +167,10 @@ as the top-level structure."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--append-to-chat "Some response")
+    (setq pi-coding-agent--pending-extension-ui-dialogs
+          '((:event (:id "stale") :process nil)))
     (pi-coding-agent--display-agent-end)
+    (should (zerop (pi-coding-agent-pending-dialog-count)))
     (should (string-suffix-p "response\n" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-spacing-blank-line-after-user-header ()
@@ -2029,7 +2032,7 @@ since we don't display them locally. Let pi's message_start handle it."
         (should (string-match-p "Extension loaded successfully" message-shown))))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-confirm-yes ()
-  "extension_ui_request confirm method uses yes-or-no-p and sends response."
+  "Queued confirm uses yes-or-no-p when explicitly answered."
   (let ((response-sent nil))
     (cl-letf (((symbol-function 'yes-or-no-p)
                (lambda (_prompt) t))
@@ -2044,14 +2047,17 @@ since we don't display them locally. Let pi's message_start handle it."
              :id "req-2"
              :method "confirm"
              :title "Delete file?"
-             :message "This cannot be undone")))
+             :message "This cannot be undone"))
+          (should-not response-sent)
+          (should (= 1 (pi-coding-agent-pending-dialog-count)))
+          (pi-coding-agent-answer-pending-question))
         (should response-sent)
         (should (equal (plist-get response-sent :type) "extension_ui_response"))
         (should (equal (plist-get response-sent :id) "req-2"))
         (should (eq (plist-get response-sent :confirmed) t))))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-confirm-no ()
-  "extension_ui_request confirm method sends confirmed:false when user declines."
+  "Queued confirm sends confirmed:false when explicitly declined."
   (let ((response-sent nil))
     (cl-letf (((symbol-function 'yes-or-no-p)
                (lambda (_prompt) nil))
@@ -2066,13 +2072,15 @@ since we don't display them locally. Let pi's message_start handle it."
              :id "req-3"
              :method "confirm"
              :title "Delete?"
-             :message "Are you sure?")))
+             :message "Are you sure?"))
+          (should-not response-sent)
+          (pi-coding-agent-answer-pending-question))
         (should response-sent)
         ;; :json-false is the correct encoding for JSON false in json-encode
         (should (eq (plist-get response-sent :confirmed) :json-false))))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-select ()
-  "extension_ui_request select method uses completing-read and sends response."
+  "Queued select uses completing-read when explicitly answered."
   (let ((response-sent nil))
     (cl-letf (((symbol-function 'completing-read)
                (lambda (_prompt options &rest _args)
@@ -2088,14 +2096,16 @@ since we don't display them locally. Let pi's message_start handle it."
              :id "req-4"
              :method "select"
              :title "Pick one:"
-             :options ["Option A" "Option B" "Option C"])))
+             :options ["Option A" "Option B" "Option C"]))
+          (should-not response-sent)
+          (pi-coding-agent-answer-pending-question))
         (should response-sent)
         (should (equal (plist-get response-sent :type) "extension_ui_response"))
         (should (equal (plist-get response-sent :id) "req-4"))
         (should (equal (plist-get response-sent :value) "Option A"))))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-input ()
-  "extension_ui_request input method uses read-string and sends response."
+  "Queued input uses read-string when explicitly answered."
   (let ((response-sent nil))
     (cl-letf (((symbol-function 'read-string)
                (lambda (&rest _args) "user input"))
@@ -2110,11 +2120,85 @@ since we don't display them locally. Let pi's message_start handle it."
              :id "req-5"
              :method "input"
              :title "Enter name:"
-             :placeholder "John Doe")))
+             :placeholder "John Doe"))
+          (should-not response-sent)
+          (pi-coding-agent-answer-pending-question))
         (should response-sent)
         (should (equal (plist-get response-sent :type) "extension_ui_response"))
         (should (equal (plist-get response-sent :id) "req-5"))
         (should (equal (plist-get response-sent :value) "user input"))))))
+
+(ert-deftest pi-coding-agent-test-extension-ui-dialogs-queue-fifo ()
+  "Dialog events queue without prompting and resolve in FIFO order."
+  (let (prompts responses)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (prompt options &rest _args)
+                 (push prompt prompts)
+                 (car options)))
+              ((symbol-function 'pi-coding-agent--send-extension-ui-response)
+               (lambda (_proc response) (push response responses))))
+      (with-temp-buffer
+        (pi-coding-agent-chat-mode)
+        (let ((pi-coding-agent--process t))
+          (dolist (event
+                   '((:type "extension_ui_request" :id "first"
+                      :method "select" :title "First" :options ["A"])
+                     (:type "extension_ui_request" :id "second"
+                      :method "select" :title "Second" :options ["B"])))
+            (pi-coding-agent--handle-extension-ui-request event))
+          (should (null prompts))
+          (should (= 2 (pi-coding-agent-pending-dialog-count)))
+          (pi-coding-agent-answer-pending-question)
+          (pi-coding-agent-answer-pending-question)
+          (should (equal (mapcar (lambda (response)
+                                   (plist-get response :id))
+                                 (nreverse responses))
+                         '("first" "second")))
+          (should (zerop (pi-coding-agent-pending-dialog-count))))))))
+
+(ert-deftest pi-coding-agent-test-extension-ui-dialog-cancel-always-responds ()
+  "Quitting a pending prompt sends cancelled and consumes the request."
+  (let (response-sent)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) (signal 'quit nil)))
+              ((symbol-function 'pi-coding-agent--send-extension-ui-response)
+               (lambda (_proc response) (setq response-sent response))))
+      (with-temp-buffer
+        (pi-coding-agent-chat-mode)
+        (let ((pi-coding-agent--process t))
+          (pi-coding-agent--handle-extension-ui-request
+           '(:type "extension_ui_request" :id "cancel-me"
+             :method "select" :title "Choose" :options ["A"]))
+          (pi-coding-agent-answer-pending-question)
+          (should (eq (plist-get response-sent :cancelled) t))
+          (should (zerop (pi-coding-agent-pending-dialog-count))))))))
+
+(ert-deftest pi-coding-agent-test-extension-ui-dialog-deduplicates-id ()
+  "A repeated RPC dialog ID is retained only once."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((pi-coding-agent--process t)
+          (event '(:type "extension_ui_request" :id "same"
+                   :method "input" :title "Value")))
+      (pi-coding-agent--handle-extension-ui-request event)
+      (pi-coding-agent--handle-extension-ui-request event)
+      (should (= 1 (pi-coding-agent-pending-dialog-count))))))
+
+(ert-deftest pi-coding-agent-test-extension-ui-dialog-change-hook-and-cleanup ()
+  "Queue changes notify consumers and process cleanup drops owned requests."
+  (let (counts)
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (let ((pi-coding-agent--process t)
+            (pi-coding-agent-pending-dialog-functions
+             (list (lambda (_chat count) (push count counts)))))
+        (pi-coding-agent--handle-extension-ui-request
+         '(:type "extension_ui_request" :id "pending"
+           :method "input" :title "Value"))
+        (should (equal counts '(1)))
+        (pi-coding-agent--clear-pending-extension-ui-dialogs t)
+        (should (equal counts '(0 1)))
+        (should (zerop (pi-coding-agent-pending-dialog-count)))))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-set-editor-text ()
   "extension_ui_request set_editor_text inserts text into input buffer."

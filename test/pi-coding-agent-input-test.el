@@ -3528,6 +3528,8 @@ Pi handles command expansion on the server side."
                   pi-coding-agent--local-user-message "pending echo"
                   pi-coding-agent--pre-compaction-status 'streaming
                   pi-coding-agent--followup-queue '("restore after error")
+                  pi-coding-agent--pending-extension-ui-dialogs
+                  (list (list :event '(:id "pending") :process proc))
                   pi-coding-agent--prompt-start-generation 11)
             (cl-letf (((symbol-function
                         'pi-coding-agent--display-process-exit-error)
@@ -3548,6 +3550,7 @@ Pi handles command expansion on the server side."
               (should (null pi-coding-agent--local-user-message))
               (should (null pi-coding-agent--pre-compaction-status))
               (should (null pi-coding-agent--followup-queue))
+              (should (null pi-coding-agent--pending-extension-ui-dialogs))
               (should (> pi-coding-agent--prompt-start-generation 11))
               (should (>= mode-line-updates 2))))
           (with-current-buffer input-buf

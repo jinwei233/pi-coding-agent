@@ -77,6 +77,8 @@
           pi-coding-agent--extension-status '(("ext1" . "status"))
           pi-coding-agent--working-message "Reading README..."
           pi-coding-agent--unsupported-extension-ui-methods-warned '("setWidget")
+          pi-coding-agent--pending-extension-ui-dialogs
+          '((:event (:id "question") :process process))
           pi-coding-agent--message-start-marker (point-marker)
           pi-coding-agent--streaming-marker (point-marker)
           pi-coding-agent--thinking-marker (point-marker)
@@ -104,6 +106,7 @@
     (should (null pi-coding-agent--extension-status))
     (should (null pi-coding-agent--working-message))
     (should (null pi-coding-agent--unsupported-extension-ui-methods-warned))
+    (should (null pi-coding-agent--pending-extension-ui-dialogs))
     (should (null pi-coding-agent--message-start-marker))
     (should (null pi-coding-agent--streaming-marker))
     (should (null pi-coding-agent--thinking-marker))

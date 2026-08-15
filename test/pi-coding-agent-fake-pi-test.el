@@ -303,6 +303,16 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
          (pi-coding-agent-test-wait-until
           (lambda ()
             (with-current-buffer chat-buf
+              (= 1 (pi-coding-agent-pending-dialog-count))))
+          pi-coding-agent-fake-pi-test--timeout
+          0.01
+          (plist-get session :process)))
+        (with-current-buffer chat-buf
+          (pi-coding-agent-answer-pending-question))
+        (should
+         (pi-coding-agent-test-wait-until
+          (lambda ()
+            (with-current-buffer chat-buf
               (string-match-p "CONFIRMED" (buffer-string))))
           pi-coding-agent-fake-pi-test--timeout
           0.01

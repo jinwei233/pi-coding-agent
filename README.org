@@ -591,7 +591,11 @@ The =pi-coding-agent= Emacs frontend has basic support for Pi
 extensions.  Extension commands show up in slash completion and the
 transient menu, extension tools run normally, and extensions can use
 notifications, confirm/select/input prompts, prefill the input buffer,
-and show status text.
+and show status text.  Dialog requests are queued per chat instead of
+opening minibuffer UI from the process filter.  Use =C-c C-a= in the
+chat buffer, or call =pi-coding-agent-answer-pending-question=, to
+answer the oldest request.  Cancelling the prompt sends an explicit
+cancelled response.
 
 Rich TUI-specific extension UI is not supported in Emacs yet: custom
 widgets, custom editor components, custom headers/footers, and other

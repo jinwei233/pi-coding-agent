@@ -455,6 +455,17 @@ rear-advance overlay before assistant text continues after the tool block."
     (:backend fake :fake-scenario "extension-confirm")
     (cl-letf (((symbol-function 'yes-or-no-p) (lambda (_prompt) t)))
       (pi-coding-agent-gui-test-send "/test-confirm")
+      (should
+       (pi-coding-agent-test-wait-until
+        (lambda ()
+          (= 1 (pi-coding-agent-pending-dialog-count
+                (plist-get pi-coding-agent-gui-test--session
+                           :chat-buffer))))
+        2 0.01
+        (plist-get pi-coding-agent-gui-test--session :process)))
+      (with-current-buffer
+          (plist-get pi-coding-agent-gui-test--session :chat-buffer)
+        (pi-coding-agent-answer-pending-question))
       (should (pi-coding-agent-gui-test-chat-contains "CONFIRMED")))))
 
 ;;;; Tool Toggle Tests

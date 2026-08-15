@@ -44,6 +44,7 @@
 (require 'pi-coding-agent-ui)
 (require 'pi-coding-agent-table)
 (require 'cl-lib)
+(require 'seq)
 (require 'ansi-color)
 
 ;; Forward references for functions in other modules
@@ -673,6 +674,7 @@ follow-up as a fresh prompt.")
   ;; Reset per-turn state for clean next turn.
   (setq pi-coding-agent--local-user-message nil)
   (setq pi-coding-agent--in-thinking-block nil)
+  (pi-coding-agent--clear-pending-extension-ui-dialogs)
   (pi-coding-agent--reset-thinking-state)
   (let ((was-aborted pi-coding-agent--aborted))
     (let ((inhibit-read-only t))
@@ -972,44 +974,109 @@ Include optional STDERR in a text fence and optional DETAIL before it."
                (_ ""))
              msg)))
 
-(defun pi-coding-agent--extension-ui-confirm (event proc)
-  "Handle confirm method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (msg (plist-get event :message))
-         ;; Don't add colon if title already ends with one
-         (separator (if (string-suffix-p ":" title) " " ": "))
-         (prompt (format "%s%s%s " title separator msg))
-         (confirmed (yes-or-no-p prompt)))
-    (when proc
-      (pi-coding-agent--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :confirmed (if confirmed t :json-false))))))
+(defconst pi-coding-agent--extension-ui-dialog-methods
+  '("confirm" "select" "input")
+  "Extension UI methods queued until the user explicitly answers.")
 
-(defun pi-coding-agent--extension-ui-select (event proc)
-  "Handle select method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (options (append (plist-get event :options) nil))
-         (selected (completing-read (concat title " ") options nil t)))
-    (when proc
-      (pi-coding-agent--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value selected)))))
+(defun pi-coding-agent--pending-dialog-id-p (id)
+  "Return non-nil when pending dialog ID is already queued."
+  (seq-some
+   (lambda (envelope)
+     (equal id (plist-get (plist-get envelope :event) :id)))
+   pi-coding-agent--pending-extension-ui-dialogs))
 
-(defun pi-coding-agent--extension-ui-input (event proc)
-  "Handle input method from EVENT, responding via PROC."
-  (let* ((id (plist-get event :id))
-         (title (plist-get event :title))
-         (placeholder (plist-get event :placeholder))
-         (value (read-string (concat title " ") placeholder)))
-    (when proc
-      (pi-coding-agent--send-extension-ui-response proc
-                     (list :type "extension_ui_response"
-                           :id id
-                           :value value)))))
+(defun pi-coding-agent--enqueue-extension-ui-dialog (event process)
+  "Queue dialog EVENT owned by PROCESS unless its ID is already pending."
+  (let ((id (plist-get event :id)))
+    (unless (pi-coding-agent--pending-dialog-id-p id)
+      (setq pi-coding-agent--pending-extension-ui-dialogs
+            (append pi-coding-agent--pending-extension-ui-dialogs
+                    (list (list :event event :process process))))
+      (pi-coding-agent--notify-pending-dialog-change)
+      t)))
+
+(defun pi-coding-agent--clear-pending-extension-ui-dialogs
+    (&optional process)
+  "Clear pending dialogs, optionally only those owned by PROCESS."
+  (let ((before (length pi-coding-agent--pending-extension-ui-dialogs)))
+    (setq pi-coding-agent--pending-extension-ui-dialogs
+          (if process
+              (seq-remove
+               (lambda (envelope)
+                 (eq process (plist-get envelope :process)))
+               pi-coding-agent--pending-extension-ui-dialogs)
+            nil))
+    (unless (= before (length pi-coding-agent--pending-extension-ui-dialogs))
+      (pi-coding-agent--notify-pending-dialog-change)
+      t)))
+
+(defun pi-coding-agent--extension-ui-dialog-response (event)
+  "Prompt for dialog EVENT and return its RPC response payload."
+  (let ((id (plist-get event :id))
+        (method (plist-get event :method))
+        (title (or (plist-get event :title) "Pi question")))
+    (condition-case nil
+        (pcase method
+          ("confirm"
+           (let* ((msg (or (plist-get event :message) ""))
+                  (separator (if (or (string-empty-p msg)
+                                     (string-suffix-p ":" title))
+                                 " "
+                               ": "))
+                  (question-text
+                   (string-remove-suffix
+                    "?"
+                    (string-trim (format "%s%s%s" title separator msg))))
+                  (confirmed
+                   (yes-or-no-p (format "%s? " question-text))))
+             (list :type "extension_ui_response"
+                   :id id
+                   :confirmed (if confirmed t :json-false))))
+          ("select"
+           (let ((selected
+                  (completing-read
+                   (concat title " ")
+                   (append (plist-get event :options) nil)
+                   nil t)))
+             (list :type "extension_ui_response" :id id :value selected)))
+          ("input"
+           (let ((value
+                  (read-string
+                   (concat title " ")
+                   (plist-get event :placeholder))))
+             (list :type "extension_ui_response" :id id :value value)))
+          (_
+           (list :type "extension_ui_response" :id id :cancelled t)))
+      (quit
+       (list :type "extension_ui_response" :id id :cancelled t)))))
+
+(defun pi-coding-agent--extension-ui-process-current-p (process)
+  "Return non-nil when PROCESS still owns the current chat session."
+  (and process
+       (or (not (processp process))
+           (and (process-live-p process)
+                (eq process pi-coding-agent--process)))))
+
+(defun pi-coding-agent-answer-pending-question ()
+  "Answer the oldest pending extension dialog for the current Pi session.
+Cancelling minibuffer input sends a matching cancelled response so the
+extension cannot remain blocked."
+  (interactive)
+  (let ((chat-buffer (pi-coding-agent--get-chat-buffer)))
+    (unless (buffer-live-p chat-buffer)
+      (user-error "Pi: No chat session available"))
+    (with-current-buffer chat-buffer
+      (unless pi-coding-agent--pending-extension-ui-dialogs
+        (user-error "Pi: No pending question"))
+      (let* ((envelope (pop pi-coding-agent--pending-extension-ui-dialogs))
+             (event (plist-get envelope :event))
+             (process (plist-get envelope :process))
+             (response (pi-coding-agent--extension-ui-dialog-response event)))
+        (pi-coding-agent--notify-pending-dialog-change)
+        (if (pi-coding-agent--extension-ui-process-current-p process)
+            (pi-coding-agent--send-extension-ui-response process response)
+          (message "Pi: Question expired because its process exited"))
+        response))))
 
 (defun pi-coding-agent--extension-ui-set-editor-text (event)
   "Handle set_editor_text method from EVENT."
@@ -1082,9 +1149,10 @@ Dispatches to appropriate handler based on method."
         (proc pi-coding-agent--process))
     (pcase method
       ("notify"         (pi-coding-agent--extension-ui-notify event))
-      ("confirm"        (pi-coding-agent--extension-ui-confirm event proc))
-      ("select"         (pi-coding-agent--extension-ui-select event proc))
-      ("input"          (pi-coding-agent--extension-ui-input event proc))
+      ((pred (lambda (candidate)
+               (member candidate
+                       pi-coding-agent--extension-ui-dialog-methods)))
+       (pi-coding-agent--enqueue-extension-ui-dialog event proc))
       ("set_editor_text" (pi-coding-agent--extension-ui-set-editor-text event))
       ("setStatus"      (pi-coding-agent--extension-ui-set-status event))
       ("setWorkingMessage" (pi-coding-agent--extension-ui-set-working-message event))
@@ -1195,6 +1263,7 @@ which asks upfront before any buffers are touched."
              (plist-get response :stderr)
              (plist-get response :exitCode))
             (process-put process 'pi-coding-agent-exit-error-rendered t))
+        (pi-coding-agent--clear-pending-extension-ui-dialogs process)
         (pi-coding-agent--set-process nil)
         (pi-coding-agent--set-activity-phase "idle")
         (setq pi-coding-agent--local-user-message nil)
