@@ -277,6 +277,26 @@ falls back to a generic line-count label."
   :type 'boolean
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-model-allowlist nil
+  "Provider/model pairs exposed by the interactive model selector.
+The selector still obtains complete model definitions and availability from
+Pi's `get_available_models' RPC.  This option only limits which runtime models
+are offered.  Nil exposes every runtime model."
+  :type '(repeat (cons (string :tag "Provider")
+                       (string :tag "Model ID")))
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-price-currency 'usd
+  "Currency used to display Pi's USD-denominated model and session costs."
+  :type '(choice (const :tag "US dollars" usd)
+                 (const :tag "Chinese yuan" cny))
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-usd-to-cny-rate 7.2
+  "USD-to-CNY rate used when `pi-coding-agent-price-currency' is `cny'."
+  :type 'number
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-prettify-tables t
   "Whether display-only markdown tables use prettier visible separators.
 When non-nil, table overlays replace raw markdown pipes and separator rows
@@ -1842,6 +1862,15 @@ turn markers as H1 while LLM ATX headings are leveled down to H2+."
       "\\([0-9]\\)\\([0-9]\\{3\\}\\)\\([0-9]\\{3\\}\\)\\([^0-9]\\|$\\)"
       "\\1,\\2,\\3\\4" str))))
 
+(defun pi-coding-agent--format-cost (usd &optional precision)
+  "Format USD cost in the configured currency with optional PRECISION."
+  (let* ((cny (eq pi-coding-agent-price-currency 'cny))
+         (value (if cny (* usd pi-coding-agent-usd-to-cny-rate) usd))
+         (digits (or precision 2))
+         (amount (format (format "%%.%df" digits) value)))
+    (concat (if cny "≈¥" "$")
+            (replace-regexp-in-string "\\.?0+\\'" "" amount))))
+
 (defun pi-coding-agent--truncate-string (str max-len)
   "Truncate STR to MAX-LEN chars, adding ellipsis if needed."
   (if (and str (> (length str) max-len))
@@ -2155,6 +2184,21 @@ Removes common prefixes like \"Claude \" and suffixes like \" (latest)\"."
     (replace-regexp-in-string " (latest)$" "")
     (replace-regexp-in-string "^claude-" "")))
 
+(defun pi-coding-agent--model-reference (model)
+  "Return MODEL's (PROVIDER . ID) reference, or nil."
+  (when (listp model)
+    (let ((provider (plist-get model :provider))
+          (model-id (plist-get model :id)))
+      (when (and (stringp provider) (stringp model-id))
+        (cons provider model-id)))))
+
+(defun pi-coding-agent--model-allowlisted-p (model)
+  "Return non-nil when MODEL is in `pi-coding-agent-model-allowlist'."
+  (or (null pi-coding-agent-model-allowlist)
+      (and (member (pi-coding-agent--model-reference model)
+                   pi-coding-agent-model-allowlist)
+           t)))
+
 ;;; Header-Line Formatting
 
 (defvar pi-coding-agent--header-model-map
@@ -2203,7 +2247,7 @@ Returns nil if STATS is nil."
            (context-window (or (and ctx (plist-get ctx :contextWindow)) 0)))
       (concat
        " │"
-       (format " $%.2f" cost)
+       (concat " session " (pi-coding-agent--format-cost cost 2))
        (pi-coding-agent--header-format-context percent context-window)))))
 
 (defun pi-coding-agent--header-escape-text (text)
@@ -2230,7 +2274,8 @@ Returns extension statuses joined with \" · \", or empty string."
                ext-status
                " · ")))
 
-(defun pi-coding-agent--header-format-identity (model-short thinking activity-phase-str)
+(defun pi-coding-agent--header-format-identity
+    (model-short thinking activity-phase-str)
   "Format identity group from MODEL-SHORT, THINKING, and ACTIVITY-PHASE-STR."
   (concat
    (propertize model-short
@@ -2305,7 +2350,8 @@ Accesses state from the linked chat buffer."
           (propertize (format "%-8s" activity-phase)
                       'face 'pi-coding-agent-activity-phase)))
     (concat
-     (pi-coding-agent--header-format-identity model-short thinking activity-phase-str)
+     (pi-coding-agent--header-format-identity
+      model-short thinking activity-phase-str)
      (pi-coding-agent--header-format-stats stats)
      (pi-coding-agent--header-format-context-group session-name)
      (pi-coding-agent--header-format-extension-group ext-status working-message))))

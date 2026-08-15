@@ -99,6 +99,7 @@ test: .deps-stamp
 		-l pi-coding-agent-table-test \
 		-l pi-coding-agent-input-test \
 		-l pi-coding-agent-menu-test \
+		-l pi-coding-agent-model-switching-test \
 		-l pi-coding-agent-build-test \
 		-l pi-coding-agent-fake-pi-test \
 		-l pi-coding-agent-gui-test-utils-test \

@@ -45,6 +45,9 @@
 (require 'pi-coding-agent-render)
 (require 'transient)
 
+(declare-function helm "helm" (&rest plist))
+(declare-function helm-make-source "helm-source" (name class &rest args))
+
 (defconst pi-coding-agent--minimum-transient-version "0.9.0"
   "Minimum supported transient version.")
 
@@ -901,70 +904,215 @@ The name is displayed in the resume picker and header-line."
                 (message "Pi: Failed to set session name: %s"
                          (or (plist-get response :error) "unknown error")))))))))
 
+(defun pi-coding-agent--ensure-model-switch-idle (chat-buf)
+  "Signal a user error unless CHAT-BUF is idle for model switching."
+  (unless (and (buffer-live-p chat-buf)
+               (not (pi-coding-agent--session-busy-p chat-buf)))
+    (user-error "Pi: Wait for the current response to finish before switching models")))
+
+(defun pi-coding-agent--available-switch-models (proc)
+  "Return allowlisted runtime models discovered from PROC."
+  (let ((response (pi-coding-agent--rpc-sync
+                   proc '(:type "get_available_models") 5)))
+    (unless response
+      (user-error "Pi: Timed out fetching available models"))
+    (unless (or (eq (plist-get response :success) t)
+                (not (plist-member response :success)))
+      (user-error "Pi: Failed to fetch available models: %s"
+                  (or (plist-get response :error) "unknown error")))
+    (let ((models (plist-get (plist-get response :data) :models)))
+      (seq-filter #'pi-coding-agent--model-allowlisted-p
+                  (if (vectorp models) (append models nil) models)))))
+
+(defun pi-coding-agent--model-price-label (model)
+  "Return compact input/cache/output price text for MODEL, or nil."
+  (when-let* ((cost (plist-get model :cost))
+              (input (plist-get cost :input))
+              (cache-read (plist-get cost :cacheRead))
+              (output (plist-get cost :output))
+              ((numberp input))
+              ((numberp cache-read))
+              ((numberp output)))
+    (format "%s/M miss · %s/M cache · %s/M out"
+            (pi-coding-agent--format-cost
+             input (if (eq pi-coding-agent-price-currency 'cny) 2 3))
+            (pi-coding-agent--format-cost
+             cache-read (if (eq pi-coding-agent-price-currency 'cny) 2 4))
+            (pi-coding-agent--format-cost
+             output (if (eq pi-coding-agent-price-currency 'cny) 2 3)))))
+
+(defun pi-coding-agent--model-candidate-fields (model current-model)
+  "Return display fields for MODEL relative to CURRENT-MODEL."
+  (let* ((name (or (plist-get model :name) (plist-get model :id) "unknown"))
+         (provider (or (plist-get model :provider) "?"))
+         (model-id (or (plist-get model :id) "?"))
+         (current (equal (pi-coding-agent--model-reference model)
+                         (pi-coding-agent--model-reference current-model)))
+         (cost (plist-get model :cost))
+         (input (and cost (plist-get cost :input)))
+         (cache-read (and cost (plist-get cost :cacheRead)))
+         (output (and cost (plist-get cost :output)))
+         (precision (if (eq pi-coding-agent-price-currency 'cny) 2 3)))
+    (list (if current "*" " ")
+          (pi-coding-agent--shorten-model-name name)
+          (format "[%s/%s]" provider model-id)
+          (if (numberp input)
+              (format "%s/M miss"
+                      (pi-coding-agent--format-cost input precision))
+            "")
+          (if (numberp cache-read)
+              (format "%s/M cache"
+                      (pi-coding-agent--format-cost
+                       cache-read
+                       (if (eq pi-coding-agent-price-currency 'cny) 2 4)))
+            "")
+          (if (numberp output)
+              (format "%s/M out"
+                      (pi-coding-agent--format-cost output precision))
+            ""))))
+
+(defun pi-coding-agent--pad-model-column (value width)
+  "Pad VALUE with spaces to display WIDTH columns."
+  (concat value (make-string (max 0 (- width (string-width value))) ?\s)))
+
+(defun pi-coding-agent--model-candidate-label
+    (model current-model &optional widths)
+  "Return Helm display label for MODEL relative to CURRENT-MODEL.
+When WIDTHS is non-nil, align each field to the corresponding display width."
+  (let ((fields (pi-coding-agent--model-candidate-fields
+                 model current-model)))
+    (string-join
+     (if widths
+         (cl-mapcar #'pi-coding-agent--pad-model-column fields widths)
+       fields)
+     "  ")))
+
+(defun pi-coding-agent--model-candidates (models current-model)
+  "Return Helm candidates for MODELS relative to CURRENT-MODEL."
+  (let* ((rows (mapcar (lambda (model)
+                         (pi-coding-agent--model-candidate-fields
+                          model current-model))
+                       models))
+         (widths
+          (when rows
+            (apply #'cl-mapcar
+                   (lambda (&rest values)
+                     (apply #'max (mapcar #'string-width values)))
+                   rows))))
+    (cl-mapcar
+     (lambda (model fields)
+       (cons
+        (string-join
+         (cl-mapcar #'pi-coding-agent--pad-model-column fields widths)
+         "  ")
+        model))
+     models rows)))
+
+(defun pi-coding-agent--switch-model
+    (proc chat-buf model persist-default)
+  "Switch CHAT-BUF through PROC to MODEL.
+When PERSIST-DEFAULT is non-nil, also set MODEL as Pi's new-session default."
+  (pi-coding-agent--ensure-model-switch-idle chat-buf)
+  (let ((provider (plist-get model :provider))
+        (model-id (plist-get model :id))
+        (model-name (or (plist-get model :name)
+                        (plist-get model :id))))
+    (pi-coding-agent--rpc-async
+     proc
+     (list :type "set_model"
+           :provider provider
+           :modelId model-id
+           :persistDefault (if persist-default t :json-false))
+     (lambda (response)
+       (if (and (eq (plist-get response :success) t)
+                (buffer-live-p chat-buf))
+           (progn
+             (with-current-buffer chat-buf
+               (pi-coding-agent--update-state-from-response response)
+               (force-mode-line-update t))
+             (message (if persist-default
+                          "Pi: Switched to %s and set it as the new-session default"
+                        "Pi: Switched current session to %s")
+                      model-name))
+         (message "Pi: Failed to switch model: %s"
+                  (or (plist-get response :error) "unknown error")))))))
+
+(defun pi-coding-agent--show-model-completion
+    (proc chat-buf candidates current-model initial-input)
+  "Show `completing-read' fallback for CANDIDATES.
+PROC, CHAT-BUF, CURRENT-MODEL, and INITIAL-INPUT describe the active selector."
+  (let* ((labels (mapcar #'car candidates))
+         (completion-ignore-case t)
+         (completion-styles '(basic flex))
+         (prompt (format "Model (current: %s): "
+                         (or (plist-get current-model :name) "unknown")))
+         (choice
+          (if initial-input
+              (let ((matches (completion-all-completions
+                              initial-input labels nil
+                              (length initial-input))))
+                (when (consp matches)
+                  (setcdr (last matches) nil))
+                (cond
+                 ((= (length matches) 1) (car matches))
+                 ((null matches)
+                  (message "Pi: No model matching \"%s\"" initial-input)
+                  nil)
+                 (t (completing-read prompt labels nil t initial-input))))
+            (completing-read prompt labels nil t))))
+    (when-let* ((model (cdr (assoc choice candidates))))
+      (pi-coding-agent--switch-model proc chat-buf model nil))))
+
+(defun pi-coding-agent--show-model-helm
+    (proc chat-buf candidates initial-input)
+  "Show Helm model selector for CANDIDATES.
+PROC and CHAT-BUF identify the session.  INITIAL-INPUT seeds Helm filtering."
+  (let ((source
+         (helm-make-source
+          "Pi models" 'helm-source-sync
+          :candidates candidates
+          :action
+          (list
+           (cons "Switch current Session"
+                 (lambda (model)
+                   (pi-coding-agent--switch-model
+                    proc chat-buf model nil)))
+           (cons "Switch Session and set new-session default"
+                 (lambda (model)
+                   (pi-coding-agent--switch-model
+                    proc chat-buf model t))))
+          :must-match t)))
+    (helm :sources source
+          :buffer "*helm Pi models*"
+          :prompt "Model: "
+          :input initial-input)))
+
+;;;###autoload
 (defun pi-coding-agent-select-model (&optional initial-input)
-  "Select a model interactively.
-Optional INITIAL-INPUT pre-fills the completion prompt for filtering."
+  "Select an allowlisted runtime model.
+Helm's default action switches only the current Session; its secondary action
+also updates Pi's default for new Sessions.  Optional INITIAL-INPUT pre-fills
+the selector."
   (interactive)
   (let ((proc (pi-coding-agent--get-process))
         (chat-buf (pi-coding-agent--get-chat-buffer)))
     (unless proc
       (user-error "No pi process running"))
-    (let* ((state (pi-coding-agent--menu-state))
-           (response (pi-coding-agent--rpc-sync proc '(:type "get_available_models") 5))
-           (data (plist-get response :data))
-           (models (plist-get data :models))
-           (current-name (plist-get (plist-get state :model) :name))
-           (current-provider (plist-get (plist-get state :model) :provider))
-           (current-short (and current-name
-                               (pi-coding-agent--shorten-model-name current-name)))
-           (current-display (and current-short current-provider
-                                (format "%s [%s]" current-short current-provider)))
-           ;; Build alist of (display-string . model-plist) for selection
-           ;; Display includes provider for clarity
-           (model-alist (mapcar (lambda (m)
-                                  (let ((short (pi-coding-agent--shorten-model-name
-                                               (plist-get m :name)))
-                                        (prov (plist-get m :provider)))
-                                    (cons (format "%s [%s]" short (or prov "?"))
-                                          m)))
-                                models))
-           (names (mapcar #'car model-alist))
-           (choice (let ((completion-ignore-case t)
-                         (completion-styles '(basic flex)))
-                     (if initial-input
-                         ;; Try auto-selecting on unique match
-                         (let ((matches (completion-all-completions
-                                         initial-input names nil
-                                         (length initial-input))))
-                           (when (consp matches)
-                             (setcdr (last matches) nil))
-                           (cond
-                            ((= (length matches) 1) (car matches))
-                            ((null matches)
-                             (message "Pi: No model matching \"%s\"" initial-input)
-                             nil)
-                            (t (completing-read
-                                (format "Model (current: %s): "
-                                        (or current-display "unknown"))
-                                names nil t initial-input))))
-                       (completing-read
-                        (format "Model (current: %s): "
-                                (or current-display "unknown"))
-                        names nil t)))))
-      (when (and choice (not (equal choice current-display)))
-        (let* ((selected-model (cdr (assoc choice model-alist)))
-               (model-id (plist-get selected-model :id))
-               (provider (plist-get selected-model :provider)))
-          (pi-coding-agent--rpc-async proc (list :type "set_model"
-                                    :provider provider
-                                    :modelId model-id)
-                         (lambda (resp)
-                           (when (and (eq (plist-get resp :success) t)
-                                      (buffer-live-p chat-buf))
-                             (with-current-buffer chat-buf
-                               (pi-coding-agent--update-state-from-response resp)
-                               (force-mode-line-update))
-                             (message "Pi: Model set to %s" choice)))))))))
+    (pi-coding-agent--ensure-model-switch-idle chat-buf)
+    (let* ((current-model (plist-get (pi-coding-agent--menu-state) :model))
+           (models (pi-coding-agent--available-switch-models proc))
+           (candidates (pi-coding-agent--model-candidates
+                        models current-model)))
+      (unless candidates
+        (user-error "Pi: No allowlisted models are currently available"))
+      (if (and (called-interactively-p 'interactive)
+               (require 'helm nil t)
+               (fboundp 'helm)
+               (fboundp 'helm-make-source))
+          (pi-coding-agent--show-model-helm
+           proc chat-buf candidates initial-input)
+        (pi-coding-agent--show-model-completion
+         proc chat-buf candidates current-model initial-input)))))
 
 (defun pi-coding-agent--thinking-level-effective-value (level model)
   "Return LEVEL's provider value for MODEL.
@@ -1115,13 +1263,14 @@ across restarts."
          (cost (or (plist-get stats :cost) 0))
          (messages (or (plist-get stats :userMessages) 0))
          (tools (or (plist-get stats :toolCalls) 0)))
-    (format "Tokens: %s in / %s out (%s total) | Cache: R%s / W%s | Cost: $%.2f | Messages: %d | Tools: %d"
+    (format "Tokens: %s in / %s out (%s total) | Cache: R%s / W%s | Session estimate: %s | Messages: %d | Tools: %d"
             (pi-coding-agent--format-number input)
             (pi-coding-agent--format-number output)
             (pi-coding-agent--format-number total)
             (pi-coding-agent--format-number cache-read)
             (pi-coding-agent--format-number cache-write)
-            cost messages tools)))
+            (pi-coding-agent--format-cost cost 2)
+            messages tools)))
 
 (defun pi-coding-agent-session-stats ()
   "Display session statistics in the echo area."
