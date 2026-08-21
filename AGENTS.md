@@ -173,6 +173,30 @@ package-lint + all unit tests, ~12s). Install with `make install-hooks`.
 
 To skip for WIP commits: `git commit --no-verify`
 
+## Multi-machine Delivery
+
+Changes consumed by the parent Emacs configuration are not complete when they
+only work from this local checkout or from hot-loaded `.elc` files.  By default,
+finish every `pi-coding-agent` change with this delivery sequence:
+
+1. Commit the package implementation and its tests in this repository.
+2. Land the verified commit on `jinwei233/pi-coding-agent` `master` and push it.
+   Temporary feature branches may be used during development, but the parent
+   configuration must not depend on a branch that may later be deleted.
+3. In the parent Emacs repository, keep the Straight recipe on
+   `jinwei233/pi-coding-agent` branch `master`.
+4. Update `straight/versions/default.el` so the `pi-coding-agent` lock points to
+   the exact pushed `master` commit.
+5. Verify the locked commit exists on GitHub with `git ls-remote`, then compile
+   the package and run the relevant unit and GUI tests.
+6. Commit the parent recipe/lock update separately.  Do not include unrelated
+   parent-worktree changes.
+
+When cleaning fork branches, check the parent recipe before deletion.  Never
+delete a branch still referenced by `lisp/init-custom.el`.  A successful local
+rebuild or live Emacs reload is verification only; it does not replace pushing
+the package commit and updating the parent lock for other machines.
+
 ## Tmux Testing (Spike Scripts)
 
 For reproducing visual bugs or testing interactive behavior, write a spike
