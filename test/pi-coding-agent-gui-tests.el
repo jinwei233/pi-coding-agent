@@ -129,6 +129,82 @@
 
 ;;;; Scroll Preservation Tests
 
+(ert-deftest pi-coding-agent-gui-test-streaming-reanchors-on-first-overflow ()
+  "A block reanchors once, resumes following, and leaves input untouched."
+  (let ((buffer (generate-new-buffer " *pi-stream-anchor-gui*"))
+        (input-buffer (generate-new-buffer " *pi-stream-anchor-input*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((window (selected-window))
+                 (input-window (split-window window -4 'below)))
+            (set-window-buffer window buffer)
+            (set-window-buffer input-window input-buffer)
+            (with-current-buffer input-buffer
+              (insert "Input draft\nsecond line\n"))
+            (set-window-start input-window (point-min))
+            (set-window-point input-window (point-min))
+            (let ((input-start (window-start input-window))
+                  (input-point (window-point input-window)))
+              (with-current-buffer buffer
+		(pi-coding-agent-chat-mode)
+		(setq-local pi-coding-agent-streaming-scroll-context-lines 2)
+		(let ((inhibit-read-only t))
+                  (dotimes (index (+ 5 (window-body-height window)))
+                    (insert (format "Earlier line %02d\n" index))))
+		(set-window-point window (point-max))
+		(with-selected-window window
+                  (goto-char (point-max))
+                  (recenter -1))
+		(setq pi-coding-agent--status 'streaming)
+		(pi-coding-agent--display-agent-start)
+		(let ((generation pi-coding-agent--streaming-scroll-generation)
+                      (limit (+ 10 (window-body-height window)))
+                      (index 0))
+                  (while (and (< index limit)
+                              (not (equal
+                                    (window-parameter
+                                     window
+                                     'pi-coding-agent-streaming-scroll-generation)
+                                    generation)))
+                    (pi-coding-agent--display-message-delta
+                     (format "Reply line %02d\n" index))
+                    (redisplay t)
+                    (setq index (1+ index)))
+                  (should (equal
+                           (window-parameter
+                            window 'pi-coding-agent-streaming-scroll-generation)
+                           generation))
+                  (let ((anchored-start (window-start window)))
+                    (should
+                     (= (count-screen-lines
+			 anchored-start
+			 (marker-position
+                          pi-coding-agent--streaming-scroll-anchor-marker)
+			 nil window)
+			2))
+                    (dotimes (tail-index (+ 5 (window-body-height window)))
+                      (pi-coding-agent--display-message-delta
+                       (format "Later line %02d\n" tail-index))
+                      (redisplay t))
+                    (should (> (window-start window) anchored-start))
+                    (should (pi-coding-agent--window-following-p window))
+                    (goto-char pi-coding-agent--streaming-scroll-anchor-marker)
+                    (set-window-start window (point) t)
+                    (set-window-point window (point))
+                    (redisplay t)
+                    (let ((reader-start (window-start window)))
+                      (pi-coding-agent--display-message-delta
+                       "Delta after manual scroll\n")
+                      (redisplay t)
+                      (should (= (window-start window) reader-start))))
+                  (should (= (window-start input-window) input-start))
+                  (should (= (window-point input-window) input-point)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (buffer-live-p input-buffer)
+        (kill-buffer input-buffer)))))
+
 (ert-deftest pi-coding-agent-gui-test-scroll-preserved-streaming ()
   "Test scroll position is preserved while a fake stream updates below."
   (pi-coding-agent-gui-test-with-fresh-session

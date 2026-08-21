@@ -478,6 +478,7 @@ file base name appended."
 Call this when starting a new session to ensure no stale state persists."
   (dolist (marker (list pi-coding-agent--message-start-marker
                         pi-coding-agent--streaming-marker
+                        pi-coding-agent--streaming-scroll-anchor-marker
                         pi-coding-agent--thinking-marker
                         pi-coding-agent--thinking-start-marker))
     (when (markerp marker)
@@ -514,6 +515,7 @@ Call this when starting a new session to ensure no stale state persists."
   (pi-coding-agent--set-canonical-messages nil)
   (pi-coding-agent--set-message-start-marker nil)
   (pi-coding-agent--set-streaming-marker nil)
+  (pi-coding-agent--clear-streaming-scroll-anchor)
   (when pi-coding-agent--tool-args-cache
     (clrhash pi-coding-agent--tool-args-cache))
   (when pi-coding-agent--transient-tool-pairs

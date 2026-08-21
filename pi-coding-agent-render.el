@@ -112,6 +112,7 @@ Note: status is set to `streaming' by the event handler."
   (pi-coding-agent--set-aborted nil)  ; Reset abort flag for new turn
   ;; Only show header if not already shown for this prompt.
   (unless pi-coding-agent--assistant-header-shown
+    (pi-coding-agent--begin-streaming-scroll-anchor)
     (pi-coding-agent--append-to-chat
      (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n"))
     (setq pi-coding-agent--assistant-header-shown t))
@@ -1260,6 +1261,7 @@ Updates buffer-local state and renders display updates."
                 pi-coding-agent--in-code-block nil
                 pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
+            (pi-coding-agent--begin-streaming-scroll-anchor)
             (pi-coding-agent--append-to-chat
              (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n"))
             (setq pi-coding-agent--assistant-header-shown t))
@@ -1269,7 +1271,8 @@ Updates buffer-local state and renders display updates."
      (when-let* ((msg-event (plist-get event :assistantMessageEvent))
                  (event-type (plist-get msg-event :type)))
        (pcase event-type
-         ("text_start") ; No-op: text block started, nothing to render
+         ("text_start"
+          (pi-coding-agent--begin-streaming-scroll-anchor))
          ("text_delta"
           (pi-coding-agent--set-activity-phase "replying")
           (pi-coding-agent--display-message-delta (plist-get msg-event :delta)))
@@ -1279,6 +1282,7 @@ Updates buffer-local state and renders display updates."
           (pi-coding-agent--maybe-decorate-streaming-table)
           (setq pi-coding-agent--streaming-table-candidate nil))
          ("thinking_start"
+          (pi-coding-agent--begin-streaming-scroll-anchor)
           (pi-coding-agent--display-thinking-start))
          ("thinking_delta"
           (pi-coding-agent--display-thinking-delta (plist-get msg-event :delta)))

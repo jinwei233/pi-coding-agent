@@ -135,6 +135,18 @@ total window height, e.g. 0.3 means 30% for input."
                  (float :tag "Fraction (0.0–1.0)"))
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-streaming-scroll-context-lines nil
+  "Visual lines to retain before a streamed assistant reply when reanchoring.
+When this is a non-negative integer, a window following output reanchors once
+per visible streaming block when the block first overflows the viewport, then
+continues following the latest output.  Nil keeps the existing always-follow
+behavior.
+
+This option may be set buffer-locally by integrations such as Agent Workspace."
+  :type '(choice (const :tag "Disabled" nil)
+                 (natnum :tag "Context lines"))
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-activity-phase-functions nil
   "Functions called after a session activity phase is applied.
 Each function is called with five arguments:
@@ -1322,6 +1334,27 @@ Used to replace raw markdown with rendered Org on message completion.")
   "Set the message start MARKER."
   (setq pi-coding-agent--message-start-marker marker))
 
+(defvar-local pi-coding-agent--streaming-scroll-generation 0
+  "Generation identifying the current visible block for scroll anchoring.")
+
+(defvar-local pi-coding-agent--streaming-scroll-anchor-marker nil
+  "Marker at the current visible block for contextual scroll anchoring.")
+
+(defun pi-coding-agent--begin-streaming-scroll-anchor ()
+  "Start scroll-anchor state for a visible streaming block."
+  (when (markerp pi-coding-agent--streaming-scroll-anchor-marker)
+    (set-marker pi-coding-agent--streaming-scroll-anchor-marker nil))
+  (setq pi-coding-agent--streaming-scroll-generation
+        (1+ pi-coding-agent--streaming-scroll-generation)
+        pi-coding-agent--streaming-scroll-anchor-marker
+        (copy-marker (point-max) nil)))
+
+(defun pi-coding-agent--clear-streaming-scroll-anchor ()
+  "Detach and clear the current streaming scroll anchor."
+  (when (markerp pi-coding-agent--streaming-scroll-anchor-marker)
+    (set-marker pi-coding-agent--streaming-scroll-anchor-marker nil))
+  (setq pi-coding-agent--streaming-scroll-anchor-marker nil))
+
 (defvar-local pi-coding-agent--tool-args-cache nil
   "Hash table mapping toolCallId to authoritative execution args.
 Needed because `tool_execution_end' events do not include args.  This is
@@ -1803,6 +1836,35 @@ larger window when the selected one cannot be split."
   "Return non-nil if WINDOW is following output (point at end of buffer)."
   (>= (window-point window) (1- (point-max))))
 
+(defun pi-coding-agent--streaming-scroll-anchor-start (window)
+  "Return contextual viewport start for the current block in WINDOW."
+  (save-excursion
+    (goto-char pi-coding-agent--streaming-scroll-anchor-marker)
+    (vertical-motion (- pi-coding-agent-streaming-scroll-context-lines) window)
+    (point)))
+
+(defun pi-coding-agent--maybe-reanchor-streaming-window (window)
+  "Reanchor following WINDOW on the first overflow of this streaming block.
+Return non-nil when WINDOW was reanchored."
+  (let ((generation pi-coding-agent--streaming-scroll-generation))
+    (when (and (integerp pi-coding-agent-streaming-scroll-context-lines)
+               (>= pi-coding-agent-streaming-scroll-context-lines 0)
+               (markerp pi-coding-agent--streaming-scroll-anchor-marker)
+               (marker-position pi-coding-agent--streaming-scroll-anchor-marker)
+               (markerp pi-coding-agent--message-start-marker)
+               (marker-position pi-coding-agent--message-start-marker)
+               (not (equal
+                     (window-parameter
+                      window 'pi-coding-agent-streaming-scroll-generation)
+                     generation))
+               (not (pos-visible-in-window-p
+                     (max (point-min) (1- (point-max))) window t)))
+      (set-window-parameter
+       window 'pi-coding-agent-streaming-scroll-generation generation)
+      (set-window-start
+       window (pi-coding-agent--streaming-scroll-anchor-start window))
+      t)))
+
 (defmacro pi-coding-agent--with-scroll-preservation (&rest body)
   "Execute BODY preserving scroll for windows not following output.
 Windows at buffer end will scroll to show new content.
@@ -1817,9 +1879,10 @@ Windows where user scrolled up stay in place."
      (dolist (pair saved-points)
        (when (window-live-p (car pair))
          (set-window-point (car pair) (cdr pair))))
-     ;; Move following windows to new end
+     ;; Keep the latest output visible after any one-time reanchor.
      (dolist (win following)
        (when (window-live-p win)
+         (pi-coding-agent--maybe-reanchor-streaming-window win)
          (set-window-point win (point-max))))))
 
 (defun pi-coding-agent--append-to-chat (text)

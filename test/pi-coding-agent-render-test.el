@@ -1497,6 +1497,83 @@ and DISPLAY controls how completed thinking is rendered."
 
 ;;; Auto-scroll
 
+(ert-deftest pi-coding-agent-test-agent-start-creates-one-scroll-generation ()
+  "A new assistant header creates one scroll generation; retries reuse it."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (let ((generation pi-coding-agent--streaming-scroll-generation)
+          (anchor (marker-position
+                   pi-coding-agent--streaming-scroll-anchor-marker)))
+      (should (= generation 1))
+      (should (< anchor
+                 (marker-position pi-coding-agent--message-start-marker)))
+      (pi-coding-agent--display-agent-start)
+      (should (= pi-coding-agent--streaming-scroll-generation generation))
+      (should (= (marker-position
+                  pi-coding-agent--streaming-scroll-anchor-marker)
+                 anchor)))))
+
+(ert-deftest pi-coding-agent-test-streaming-scroll-rearms-for-visible-blocks ()
+  "Thinking and text blocks each receive an independent scroll generation."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (let ((header-generation pi-coding-agent--streaming-scroll-generation))
+      (pi-coding-agent--handle-display-event
+       '(:type "message_update"
+         :assistantMessageEvent (:type "thinking_start")))
+      (should (= pi-coding-agent--streaming-scroll-generation
+                 (1+ header-generation)))
+      (let ((thinking-generation pi-coding-agent--streaming-scroll-generation))
+        (pi-coding-agent--handle-display-event
+         '(:type "message_update"
+           :assistantMessageEvent (:type "text_start")))
+        (should (= pi-coding-agent--streaming-scroll-generation
+                   (1+ thinking-generation)))))))
+
+(ert-deftest pi-coding-agent-test-streaming-scroll-reanchors-once-per-window ()
+  "An overflowing opted-in block reanchors each window only once."
+  (with-temp-buffer
+    (insert "context\nAssistant\n=========\nreply")
+    (setq-local pi-coding-agent-streaming-scroll-context-lines 2)
+    (setq pi-coding-agent--streaming-scroll-generation 4
+          pi-coding-agent--streaming-scroll-anchor-marker (copy-marker 9)
+          pi-coding-agent--message-start-marker (copy-marker 30))
+    (let (stored-generation window-start)
+      (cl-letf (((symbol-function 'window-parameter)
+                 (lambda (_window _parameter) stored-generation))
+                ((symbol-function 'set-window-parameter)
+                 (lambda (_window _parameter value)
+                   (setq stored-generation value)))
+                ((symbol-function 'pos-visible-in-window-p)
+                 (lambda (&rest _) nil))
+                ((symbol-function 'vertical-motion)
+                 (lambda (&rest _)
+                   (goto-char 3)))
+                ((symbol-function 'set-window-start)
+                 (lambda (_window start &optional _noforce)
+                   (setq window-start start))))
+        (should (pi-coding-agent--maybe-reanchor-streaming-window 'window))
+        (should (= stored-generation 4))
+        (should (= window-start 3))
+        (should-not
+         (pi-coding-agent--maybe-reanchor-streaming-window 'window))))))
+
+(ert-deftest pi-coding-agent-test-streaming-scroll-disabled-keeps-tail-policy ()
+  "Nil context configuration disables reply reanchoring."
+  (with-temp-buffer
+    (insert "Assistant\n=========\nreply")
+    (setq-local pi-coding-agent-streaming-scroll-context-lines nil)
+    (setq pi-coding-agent--streaming-scroll-generation 1
+          pi-coding-agent--streaming-scroll-anchor-marker (copy-marker 1)
+          pi-coding-agent--message-start-marker (copy-marker 21))
+    (cl-letf (((symbol-function 'pos-visible-in-window-p)
+               (lambda (&rest _)
+                 (ert-fail "Disabled anchoring must not query visibility"))))
+      (should-not
+       (pi-coding-agent--maybe-reanchor-streaming-window 'window)))))
+
 (ert-deftest pi-coding-agent-test-window-following-p-at-end ()
   "pi-coding-agent--window-following-p detects when window-point is at end."
   (with-temp-buffer
