@@ -1089,6 +1089,7 @@ Dispatches to appropriate handler based on method."
       ("set_editor_text" (pi-coding-agent--extension-ui-set-editor-text event))
       ("setStatus"      (pi-coding-agent--extension-ui-set-status event))
       ("setWorkingMessage" (pi-coding-agent--extension-ui-set-working-message event))
+      ("setWidget"      nil)
       (_                (pi-coding-agent--extension-ui-unsupported event proc)))))
 
 (defun pi-coding-agent--display-no-model-warning ()

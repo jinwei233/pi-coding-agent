@@ -2344,12 +2344,12 @@ See https://github.com/dnouri/pi-coding-agent/issues/176."
              :id "req-title"
              :method "setTitle"
              :title "pi - project")))))
-    (should (= (length warnings-logged) 2))
-    (should (= 1 (cl-count-if (lambda (m) (string-match-p "setWidget" m))
+    (should (= (length warnings-logged) 1))
+    (should (= 0 (cl-count-if (lambda (m) (string-match-p "setWidget" m))
                               warnings-logged)))
     (should (= 1 (cl-count-if (lambda (m) (string-match-p "setTitle" m))
                               warnings-logged)))
-    ;; setWidget and setTitle are fire-and-forget RPC methods.
+    ;; setWidget is silently ignored; both methods are fire-and-forget.
     (should (null responses-sent))))
 
 (ert-deftest pi-coding-agent-test-extension-ui-unsupported-warnings-are-buffer-local ()
@@ -2372,19 +2372,17 @@ See https://github.com/dnouri/pi-coding-agent/issues/176."
               (let ((pi-coding-agent--process t))
                 (pi-coding-agent--handle-extension-ui-request
                  '(:type "extension_ui_request"
-                   :id "req-widget"
-                   :method "setWidget"
-                   :widgetKey "my-ext"
-                   :widgetLines ["Line 1"])))))
+                   :id "req-title"
+                   :method "setTitle"
+                   :title "pi - project")))))
           (with-current-buffer buf-a
             (let ((pi-coding-agent--process t))
               (pi-coding-agent--handle-extension-ui-request
                '(:type "extension_ui_request"
-                 :id "req-widget-again"
-                 :method "setWidget"
-                 :widgetKey "my-ext"
-                 :widgetLines ["Line 2"]))))
-          (should (= 2 (cl-count-if (lambda (m) (string-match-p "setWidget" m))
+                 :id "req-title-again"
+                 :method "setTitle"
+                 :title "pi - project"))))
+          (should (= 2 (cl-count-if (lambda (m) (string-match-p "setTitle" m))
                                     warnings-logged))))
       (when (buffer-live-p buf-a) (kill-buffer buf-a))
       (when (buffer-live-p buf-b) (kill-buffer buf-b)))))
