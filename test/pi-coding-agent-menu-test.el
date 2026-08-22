@@ -2494,6 +2494,53 @@ replaced by the resumed or forked history."
       (delete-directory dir t)
       (delete-directory session-dir t))))
 
+(ert-deftest pi-coding-agent-test-history-load-waits-for-async-replay ()
+  "History load completion waits until asynchronous replay has finished."
+  (let ((chat-buf (generate-new-buffer " *pi-async-history-load*"))
+        (proc 'fake-process)
+        replay-args
+        history-count
+        completion-count)
+    (unwind-protect
+        (with-current-buffer chat-buf
+          (pi-coding-agent-chat-mode)
+          (setq-local pi-coding-agent--process proc
+                      pi-coding-agent--status 'idle)
+          (let ((pi-coding-agent-history-replay-asynchronous t)
+                (pi-coding-agent-history-replay-force-asynchronous t))
+            (cl-letf (((symbol-function 'pi-coding-agent--rpc-async)
+                       (lambda (_process command callback)
+                         (should (equal (plist-get command :type)
+                                        "get_messages"))
+                         (funcall
+                          callback
+                          '(:success t
+                            :data
+                            (:messages
+                             [(:role "assistant"
+                               :content
+                               [(:type "text" :text "History")]
+                               :timestamp 1704067200000)])))))
+                      ((symbol-function
+                        'pi-coding-agent--display-session-history-async)
+                       (lambda (&rest args)
+                         (setq replay-args args)))
+                      ((symbol-function 'pi-coding-agent--refresh-header)
+                       #'ignore))
+              (pi-coding-agent--load-session-history
+               proc
+               (lambda (count) (setq history-count count))
+               chat-buf
+               (lambda (_response)
+                 (setq completion-count (1+ (or completion-count 0)))))
+              (should replay-args)
+              (should-not history-count)
+              (should-not completion-count)
+              (funcall (nth 2 replay-args) t)
+              (should (= history-count 1))
+              (should (= completion-count 1)))))
+      (kill-buffer chat-buf))))
+
 (ert-deftest pi-coding-agent-test-fork-from-input-switches-session-rebuilds-history-and-prefills-input ()
   "Forking from the input buffer rebuilds chat history and prefills input."
   (let ((dir "/tmp/pi-coding-agent-test-fork-happy/")

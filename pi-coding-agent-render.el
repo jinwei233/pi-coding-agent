@@ -71,6 +71,36 @@
 (defconst pi-coding-agent--history-replay-gc-threshold (* 64 1024 1024)
   "Minimum `gc-cons-threshold' used while replaying full session history.")
 
+(defcustom pi-coding-agent-history-replay-slice-size 8
+  "Maximum number of messages rendered in one asynchronous history slice."
+  :type 'integer
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-history-replay-slice-seconds 0.02
+  "Soft time budget in seconds for one asynchronous history slice.
+At least one message is rendered per slice, so a single large message may
+exceed this budget."
+  :type 'number
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-history-replay-asynchronous t
+  "Whether interactive session history loads render in event-loop slices.
+Batch Emacs remains synchronous so scripts and unit tests keep deterministic
+completion semantics."
+  :type 'boolean
+  :group 'pi-coding-agent)
+
+(defvar pi-coding-agent-history-replay-force-asynchronous nil
+  "Non-nil forces sliced replay in batch tests and benchmarks.")
+
+(cl-defstruct (pi-coding-agent--history-replay-job
+               (:constructor pi-coding-agent--make-history-replay-job))
+  buffer messages results index previous-role generation validator completion timer
+  finished)
+
+(defvar-local pi-coding-agent--history-replay-job nil
+  "Current asynchronous history replay job for this chat buffer.")
+
 ;;;; Response Display
 
 (defvar-local pi-coding-agent--defer-history-postprocessing nil
@@ -6093,41 +6123,70 @@ assistant is still working, and MODE is used when that block completes."
     (message "Pi: This chat now %s completed thinking"
              (if (eq mode 'hidden) "hides" "shows"))))
 
+(defun pi-coding-agent--display-history-message (message previous-role results)
+  "Display one history MESSAGE and return its role grouping state.
+PREVIOUS-ROLE is the preceding visible message role.  RESULTS maps tool call
+IDs to their result messages."
+  (let ((role (plist-get message :role)))
+    (pcase role
+      ("user"
+       (let* ((text (pi-coding-agent--extract-history-user-message-text message))
+              (timestamp (pi-coding-agent--ms-to-time
+                          (plist-get message :timestamp))))
+         (when text
+           (pi-coding-agent--display-user-message text timestamp)))
+       "user")
+      ("assistant"
+       (unless (equal previous-role "assistant")
+         (pi-coding-agent--append-to-chat
+          (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n")))
+       (pi-coding-agent--render-history-assistant-content message results)
+       "assistant")
+      ("custom"
+       (when (plist-get message :display)
+         (pi-coding-agent--display-custom-message
+          (plist-get message :content)))
+       "custom")
+      ("compactionSummary"
+       (let* ((summary (plist-get message :summary))
+              (tokens-before (plist-get message :tokensBefore))
+              (timestamp (pi-coding-agent--ms-to-time
+                          (plist-get message :timestamp))))
+         (pi-coding-agent--display-compaction-result
+          tokens-before summary timestamp))
+       "compactionSummary")
+      (_ previous-role))))
+
 (defun pi-coding-agent--display-history-messages (messages)
   "Display MESSAGES from session history with full tool rendering.
 Consecutive assistant messages are grouped under one header.
 Tool calls are rendered with headers, output, overlays, and toggles."
-  (let ((prev-role nil)
+  (let ((previous-role nil)
         (results (pi-coding-agent--build-tool-result-index messages)))
-    (dotimes (i (length messages))
-      (let* ((message (aref messages i))
-             (role (plist-get message :role)))
-        (pcase role
-          ("user"
-           (let* ((text (pi-coding-agent--extract-history-user-message-text message))
-                  (timestamp (pi-coding-agent--ms-to-time (plist-get message :timestamp))))
-             (when text
-               (pi-coding-agent--display-user-message text timestamp)))
-           (setq prev-role "user"))
-          ("assistant"
-           (when (not (equal prev-role "assistant"))
-             (pi-coding-agent--append-to-chat
-              (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n")))
-           (pi-coding-agent--render-history-assistant-content message results)
-           (setq prev-role "assistant"))
-          ("custom"
-           (when (plist-get message :display)
-             (pi-coding-agent--display-custom-message
-              (plist-get message :content)))
-           (setq prev-role "custom"))
-          ("compactionSummary"
-           (let* ((summary (plist-get message :summary))
-                  (tokens-before (plist-get message :tokensBefore))
-                  (timestamp (pi-coding-agent--ms-to-time (plist-get message :timestamp))))
-             (pi-coding-agent--display-compaction-result tokens-before summary timestamp))
-           (setq prev-role "compactionSummary"))
-          ("toolResult"
-           nil))))))
+    (dotimes (index (length messages))
+      (setq previous-role
+            (pi-coding-agent--display-history-message
+             (aref messages index) previous-role results)))))
+
+(defun pi-coding-agent--prepare-session-history-display (messages)
+  "Prepare the current chat buffer to display canonical MESSAGES."
+  (pi-coding-agent--set-canonical-messages messages)
+  (let ((inhibit-read-only t))
+    (pi-coding-agent--clear-render-artifacts)
+    (erase-buffer)
+    (insert (pi-coding-agent--format-startup-header) "\n")))
+
+(defun pi-coding-agent--finish-session-history-display ()
+  "Finalize a complete history replay in the current chat buffer."
+  (goto-char (point-max))
+  (unless (bolp)
+    (insert "\n"))
+  (pi-coding-agent--set-message-start-marker nil)
+  (pi-coding-agent--set-streaming-marker nil)
+  (pi-coding-agent--update-hot-tail-boundary)
+  (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail)
+  (pi-coding-agent--postprocess-history-buffer)
+  (goto-char (point-max)))
 
 (defun pi-coding-agent--display-session-history (messages &optional chat-buf)
   "Display session history MESSAGES in the chat buffer.
@@ -6137,7 +6196,6 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
   (setq chat-buf (or chat-buf (pi-coding-agent--get-chat-buffer)))
   (when (and chat-buf (buffer-live-p chat-buf))
     (with-current-buffer chat-buf
-      (pi-coding-agent--set-canonical-messages messages)
       (let ((inhibit-read-only t)
             ;; A full resume/reload rebuild allocates many short strings,
             ;; overlays, and display properties.  Keep GC out of the hot path;
@@ -6145,20 +6203,129 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
             (gc-cons-threshold
              (max gc-cons-threshold
                   pi-coding-agent--history-replay-gc-threshold)))
-        (pi-coding-agent--clear-render-artifacts)
-        (erase-buffer)
-        (insert (pi-coding-agent--format-startup-header) "\n")
+        (pi-coding-agent--prepare-session-history-display messages)
         (when (vectorp messages)
           (let ((pi-coding-agent--defer-history-postprocessing t))
             (pi-coding-agent--display-history-messages messages)))
-        (goto-char (point-max))
-        (unless (bolp) (insert "\n"))
-        (pi-coding-agent--set-message-start-marker nil)
-        (pi-coding-agent--set-streaming-marker nil)
-        (pi-coding-agent--update-hot-tail-boundary)
-        (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail)
-        (pi-coding-agent--postprocess-history-buffer)
-        (goto-char (point-max))))))
+        (pi-coding-agent--finish-session-history-display)))))
+
+(defun pi-coding-agent--finish-history-replay-job (job success)
+  "Finish asynchronous history replay JOB with SUCCESS status."
+  (unless (pi-coding-agent--history-replay-job-finished job)
+    (setf (pi-coding-agent--history-replay-job-finished job) t)
+    (when-let* ((timer (pi-coding-agent--history-replay-job-timer job))
+                ((timerp timer)))
+      (cancel-timer timer))
+    (let ((buffer (pi-coding-agent--history-replay-job-buffer job)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (when (eq pi-coding-agent--history-replay-job job)
+            (setq pi-coding-agent--history-replay-job nil)))))
+    (when-let* ((completion
+                 (pi-coding-agent--history-replay-job-completion job)))
+      (funcall completion success))))
+
+(defun pi-coding-agent--history-replay-job-current-p (job)
+  "Return non-nil when asynchronous history replay JOB still owns its buffer."
+  (let ((buffer (pi-coding-agent--history-replay-job-buffer job)))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (and (eq pi-coding-agent--history-replay-job job)
+                (= pi-coding-agent--history-load-generation
+                   (pi-coding-agent--history-replay-job-generation job))))
+         (or (null (pi-coding-agent--history-replay-job-validator job))
+             (funcall (pi-coding-agent--history-replay-job-validator job))))))
+
+(defun pi-coding-agent--run-history-replay-slice (job)
+  "Render the next bounded slice for asynchronous history replay JOB."
+  (setf (pi-coding-agent--history-replay-job-timer job) nil)
+  (if (not (pi-coding-agent--history-replay-job-current-p job))
+      (pi-coding-agent--finish-history-replay-job job nil)
+    (condition-case-unless-debug err
+        (let* ((buffer (pi-coding-agent--history-replay-job-buffer job))
+               (messages (pi-coding-agent--history-replay-job-messages job))
+               (length (length messages))
+               (limit (max 1 pi-coding-agent-history-replay-slice-size))
+               (deadline (+ (float-time)
+                            (max 0 pi-coding-agent-history-replay-slice-seconds)))
+               (count 0))
+          (with-current-buffer buffer
+            (let ((inhibit-read-only t)
+                  (inhibit-redisplay t)
+                  (gc-cons-threshold
+                   (max gc-cons-threshold
+                        pi-coding-agent--history-replay-gc-threshold))
+                  (pi-coding-agent--defer-history-postprocessing t))
+              (while (and (< (pi-coding-agent--history-replay-job-index job)
+                             length)
+                          (or (= count 0)
+                              (and (< count limit)
+                                   (< (float-time) deadline))))
+                (let ((index (pi-coding-agent--history-replay-job-index job)))
+                  (setf (pi-coding-agent--history-replay-job-previous-role job)
+                        (pi-coding-agent--display-history-message
+                         (aref messages index)
+                         (pi-coding-agent--history-replay-job-previous-role job)
+                         (pi-coding-agent--history-replay-job-results job))
+                        (pi-coding-agent--history-replay-job-index job)
+                        (1+ index))
+                  (setq count (1+ count))))))
+          (if (< (pi-coding-agent--history-replay-job-index job) length)
+              (setf (pi-coding-agent--history-replay-job-timer job)
+                    (run-at-time
+                     0 nil #'pi-coding-agent--run-history-replay-slice job))
+            (with-current-buffer buffer
+              (let ((inhibit-read-only t)
+                    (gc-cons-threshold
+                     (max gc-cons-threshold
+                          pi-coding-agent--history-replay-gc-threshold)))
+                (pi-coding-agent--finish-session-history-display)))
+            (pi-coding-agent--finish-history-replay-job job t)))
+      (quit
+       (pi-coding-agent--finish-history-replay-job job nil)
+       (signal 'quit nil))
+      (error
+       (pi-coding-agent--finish-history-replay-job job nil)
+       (message "Pi: Failed to render session history - %s"
+                (error-message-string err))))))
+
+(defun pi-coding-agent--cancel-history-replay (&optional chat-buf)
+  "Cancel the asynchronous history replay owned by CHAT-BUF."
+  (let ((chat-buf (or chat-buf (pi-coding-agent--get-chat-buffer))))
+    (when (buffer-live-p chat-buf)
+      (with-current-buffer chat-buf
+        (when pi-coding-agent--history-replay-job
+          (pi-coding-agent--finish-history-replay-job
+           pi-coding-agent--history-replay-job nil))))))
+
+(defun pi-coding-agent--display-session-history-async
+    (messages chat-buf completion &optional valid-p generation)
+  "Display history MESSAGES incrementally in CHAT-BUF.
+Call COMPLETION with non-nil after a complete replay, or nil after cancellation
+or failure.  Optional VALID-P is checked before every slice.  GENERATION reuses
+an existing history-load generation; otherwise this function creates one."
+  (when (and chat-buf (buffer-live-p chat-buf))
+    (with-current-buffer chat-buf
+      (pi-coding-agent--cancel-history-replay chat-buf)
+      (let* ((generation (or generation
+                             (pi-coding-agent--invalidate-history-loads)))
+             (job
+              (pi-coding-agent--make-history-replay-job
+               :buffer chat-buf
+               :messages (if (vectorp messages) messages [])
+               :results (pi-coding-agent--build-tool-result-index messages)
+               :index 0
+               :previous-role nil
+               :generation generation
+               :validator valid-p
+               :completion completion)))
+        (let ((inhibit-read-only t))
+          (pi-coding-agent--prepare-session-history-display messages))
+        (setq pi-coding-agent--history-replay-job job)
+        (setf (pi-coding-agent--history-replay-job-timer job)
+              (run-at-time
+               0 nil #'pi-coding-agent--run-history-replay-slice job))
+        job))))
 
 (provide 'pi-coding-agent-render)
 

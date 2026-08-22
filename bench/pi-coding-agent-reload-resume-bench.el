@@ -1022,6 +1022,7 @@ TARGET-COUNT is the expected canonical message count after reload."
   "Run one reload/resume benchmark iteration and write artifacts.
 Return non-nil when all correctness checks passed.  Timing thresholds are not
 enforced."
+  (setq pi-coding-agent-history-replay-force-asynchronous t)
   (make-directory pi-coding-agent-rr-bench-out-dir t)
   (ignore-errors (delete-file pi-coding-agent-rr-bench-fake-log))
   (clrhash pi-coding-agent-rr-bench--timings)

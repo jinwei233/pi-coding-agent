@@ -550,28 +550,42 @@ from async callbacks, pass CHAT-BUF explicitly."
       (with-current-buffer chat-buf
         (let ((generation (pi-coding-agent--invalidate-history-loads)))
           (pi-coding-agent--rpc-async proc '(:type "get_messages")
-                         (lambda (response)
-                           (unwind-protect
-                               (when (and (eq (plist-get response :success) t)
-                                          (buffer-live-p chat-buf))
-                                 (with-current-buffer chat-buf
-                                   (when (and (eq pi-coding-agent--process proc)
-                                              (= generation
-                                                 pi-coding-agent--history-load-generation)
-                                              (pi-coding-agent--canonical-rerender-safe-p))
-                                     (let* ((messages (plist-get (plist-get response :data)
-                                                                 :messages))
-                                            (count (if (vectorp messages)
-                                                       (length messages)
-                                                     0)))
-                                       (pi-coding-agent--display-session-history
-                                        messages chat-buf)
-                                       ;; Refresh header after loading history (resume/fork).
-                                       (pi-coding-agent--refresh-header)
-                                       (when callback
-                                         (funcall callback count))))))
-                             (when completion-callback
-                               (funcall completion-callback response))))))))))
+            (lambda (response)
+              (let ((current-p
+                     (lambda ()
+                       (and (buffer-live-p chat-buf)
+                            (with-current-buffer chat-buf
+                              (and (eq pi-coding-agent--process proc)
+                                   (= generation
+                                      pi-coding-agent--history-load-generation)
+                                   (pi-coding-agent--canonical-rerender-safe-p)))))))
+                (if (and (eq (plist-get response :success) t)
+                         (funcall current-p))
+                    (let* ((messages
+                            (plist-get (plist-get response :data) :messages))
+                           (count (if (vectorp messages)
+                                      (length messages)
+                                    0))
+                           (finish
+                            (lambda (success)
+                              (when (and success (funcall current-p))
+                                (with-current-buffer chat-buf
+                                  (pi-coding-agent--refresh-header))
+                                (when callback
+                                  (funcall callback count)))
+                              (when completion-callback
+                                (funcall completion-callback response)))))
+                      (if (and
+                           pi-coding-agent-history-replay-asynchronous
+                           (or (not noninteractive)
+                               pi-coding-agent-history-replay-force-asynchronous))
+                          (pi-coding-agent--display-session-history-async
+                           messages chat-buf finish current-p generation)
+                        (pi-coding-agent--display-session-history
+                         messages chat-buf)
+                        (funcall finish t)))
+                  (when completion-callback
+                    (funcall completion-callback response)))))))))))
 
 (defun pi-coding-agent--session-transition-ready-p (chat-buf action)
   "Return non-nil when CHAT-BUF may ACTION another session.

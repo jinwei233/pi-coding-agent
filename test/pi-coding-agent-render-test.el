@@ -762,6 +762,87 @@ agent_end + next section's leading newline must not create triple newlines."
                 pi-coding-agent--history-replay-gc-threshold))
     (should (= gc-cons-threshold 1024))))
 
+(ert-deftest pi-coding-agent-test-async-history-replay-yields-and-matches-sync ()
+  "Asynchronous history replay yields between slices and matches sync output."
+  (let* ((messages
+          [(:role "user" :content [(:type "text" :text "Question one")]
+            :timestamp 1704067200000)
+           (:role "assistant" :content [(:type "text" :text "Answer one")]
+            :timestamp 1704067201000)
+           (:role "user" :content [(:type "text" :text "Question two")]
+            :timestamp 1704067202000)
+           (:role "assistant" :content [(:type "text" :text "Answer two")]
+            :timestamp 1704067203000)])
+         (expected
+          (with-temp-buffer
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--display-session-history messages (current-buffer))
+            (buffer-string)))
+         (chat (generate-new-buffer " *pi-async-history*"))
+         queue
+         completion)
+    (unwind-protect
+        (with-current-buffer chat
+          (pi-coding-agent-chat-mode)
+          (let ((pi-coding-agent-history-replay-slice-size 1)
+                (pi-coding-agent-history-replay-slice-seconds 10))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (_delay _repeat function &rest args)
+                         (let ((scheduled (cons function args)))
+                           (setq queue (append queue (list scheduled)))
+                           scheduled)))
+                      ((symbol-function 'timerp) (lambda (_timer) nil)))
+              (pi-coding-agent--display-session-history-async
+               messages chat
+               (lambda (success) (setq completion success)))
+              (should (= (length queue) 1))
+              (should-not completion)
+              (apply (caar queue) (cdar queue))
+              (setq queue (cdr queue))
+              (should (string-match-p "Question one" (buffer-string)))
+              (should-not (string-match-p "Answer one" (buffer-string)))
+              (should-not completion)
+              (while queue
+                (let ((scheduled (pop queue)))
+                  (apply (car scheduled) (cdr scheduled))))
+              (should completion)
+              (should (equal (buffer-string) expected)))))
+      (kill-buffer chat))))
+
+(ert-deftest pi-coding-agent-test-async-history-replay-cancels-stale-slices ()
+  "Cancelling asynchronous history replay prevents later slices from writing."
+  (let ((messages
+         [(:role "user" :content [(:type "text" :text "First")]
+           :timestamp 1704067200000)
+          (:role "assistant" :content [(:type "text" :text "Second")]
+           :timestamp 1704067201000)])
+        (chat (generate-new-buffer " *pi-cancel-history*"))
+        queue
+        completions)
+    (unwind-protect
+        (with-current-buffer chat
+          (pi-coding-agent-chat-mode)
+          (let ((pi-coding-agent-history-replay-slice-size 1)
+                (pi-coding-agent-history-replay-slice-seconds 10))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (_delay _repeat function &rest args)
+                         (let ((scheduled (cons function args)))
+                           (setq queue (append queue (list scheduled)))
+                           scheduled)))
+                      ((symbol-function 'timerp) (lambda (_timer) nil)))
+              (pi-coding-agent--display-session-history-async
+               messages chat
+               (lambda (success) (push success completions)))
+              (let ((first (pop queue)))
+                (apply (car first) (cdr first)))
+              (should (string-match-p "First" (buffer-string)))
+              (pi-coding-agent--cancel-history-replay chat)
+              (let ((stale (pop queue)))
+                (apply (car stale) (cdr stale)))
+              (should-not (string-match-p "Second" (buffer-string)))
+              (should (equal completions '(nil))))))
+      (kill-buffer chat))))
+
 (ert-deftest pi-coding-agent-test-display-session-history-postprocesses-hot-tail-only ()
   "Large history replay eagerly decorates candidate tables only in the hot tail."
   (with-temp-buffer
