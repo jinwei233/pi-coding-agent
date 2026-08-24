@@ -645,6 +645,209 @@ agent_end + next section's leading newline must not create triple newlines."
       (should (string-match-p "You" text))
       (should (string-match-p "Plain string prompt" text)))))
 
+(ert-deftest pi-coding-agent-test-history-renders-image-only-user-content ()
+  "Canonical history keeps an image-only user turn visible without local files."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-history-messages
+     (vector (list :role "user"
+                   :content [(:type "image"
+                              :mimeType "image/png"
+                              :data "unused")]
+                   :timestamp 1704067200000)))
+    (let ((text (buffer-string)))
+      (should (string-match-p "You" text))
+      (should (string-match-p "\\[image attachment\\]" text)))))
+
+(ert-deftest pi-coding-agent-test-live-user-event-renders-each-image-marker ()
+  "A live user event renders one non-owning image for each native block."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (pi-coding-agent--handle-display-event
+       '(:type "message_start"
+         :message (:role "user"
+                   :content [(:type "text" :text "compare")
+                             (:type "image" :mimeType "image/png"
+                              :data "b25l")
+                             (:type "image" :mimeType "image/jpeg"
+                              :data "dHdv")]
+                   :timestamp 1704067200000)))
+      (goto-char (point-min))
+      (let ((count 0))
+        (while (search-forward "[image attachment]" nil t)
+          (when (get-text-property (1- (point))
+                                   'pi-coding-agent-output-image)
+            (setq count (1+ count))))
+        (should (= count 2))))))
+
+(ert-deftest pi-coding-agent-test-output-image-marker-has-bounded-thumbnail ()
+  "A supported native image block becomes a bounded Output thumbnail."
+  (let (create-args)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest args)
+                 (setq create-args args)
+                 '(image :type png))))
+      (let* ((marker
+              (pi-coding-agent--output-image-marker
+               '(:type "image" :mimeType "image/png" :data "cGl4ZWxz")))
+             (display (get-text-property 0 'display marker)))
+        (should (equal (substring-no-properties marker) "[image attachment]"))
+        (should (equal display '(image :type png)))
+        (should (equal (plist-get (nthcdr 3 create-args) :max-width)
+                       pi-coding-agent-output-image-max-width))
+        (should (equal (plist-get (nthcdr 3 create-args) :max-height)
+                       pi-coding-agent-output-image-max-height))))))
+
+(ert-deftest pi-coding-agent-test-output-image-marker-falls-back-safely ()
+  "Malformed and oversized native image payloads retain textual markers."
+  (let ((pi-coding-agent-output-image-max-base64-bytes 4))
+    (dolist (block '((:type "image" :mimeType "image/png" :data "%%%")
+                     (:type "image" :mimeType "image/png" :data "cGl4ZWxz")))
+      (let ((marker (pi-coding-agent--output-image-marker block)))
+        (should (equal (substring-no-properties marker)
+                       "[image attachment]"))
+        (should-not (get-text-property 0 'display marker))))))
+
+(ert-deftest pi-coding-agent-test-live-local-image-prompt-renders-thumbnail ()
+  "A locally accepted prompt renders from serialized RPC image content."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (pi-coding-agent--display-user-message
+       (pi-coding-agent--message-transcript-text
+        '(:text "inspect"
+          :images ("uuid")
+          :rpc-images ((:type "image" :mimeType "image/png"
+                        :data "cGl4ZWxz")))))
+      (goto-char (point-min))
+      (search-forward "[image attachment]")
+      (should (get-text-property (1- (point))
+                                 'pi-coding-agent-output-image)))))
+
+(ert-deftest pi-coding-agent-test-history-renders-user-and-assistant-images ()
+  "History uses one Output renderer for user and assistant native images."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (pi-coding-agent--display-history-messages
+       [(:role "user"
+          :content [(:type "image" :mimeType "image/png" :data "dXNlcg==")]
+          :timestamp 1704067200000)
+         (:role "assistant"
+          :content [(:type "image" :mimeType "image/png"
+                     :data "YXNzaXN0YW50")]
+          :timestamp 1704067201000)])
+      (goto-char (point-min))
+      (let ((count 0))
+        (while (search-forward "[image attachment]" nil t)
+          (when (get-text-property (1- (point))
+                                   'pi-coding-agent-output-image)
+            (setq count (1+ count))))
+        (should (= count 2))))))
+
+(ert-deftest pi-coding-agent-test-deferred-output-image-materializes-lazily ()
+  "Deferred history keeps a marker until the image jit pass sees its region."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (jit-lock-unregister #'pi-coding-agent--jit-materialize-output-images)
+    (let ((pi-coding-agent--defer-history-postprocessing t)
+          (create-count 0)
+          marker marker-start marker-end)
+      (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+                ((symbol-function 'create-image)
+                 (lambda (&rest _)
+                   (setq create-count (1+ create-count))
+                   '(image :type png))))
+        (setq marker
+              (pi-coding-agent--output-image-marker
+               '(:type "image" :mimeType "image/png" :data "cGl4ZWxz")
+               t))
+        (should (= create-count 0))
+        (let ((inhibit-read-only t))
+          (insert "prefix ")
+          (setq marker-start (point))
+          (insert marker)
+          (setq marker-end (point))
+          (insert " suffix"))
+        (should-not (get-text-property marker-start 'display))
+        (pi-coding-agent--jit-materialize-output-images
+         (+ marker-start 3) (+ marker-start 6))
+        (should (= create-count 1))
+        (should (get-text-property marker-start 'display))
+        (should (get-text-property (1- marker-end) 'display))
+        (should-not (get-text-property (1- marker-start) 'display))
+        (should-not (get-text-property marker-end 'display))))))
+
+(ert-deftest pi-coding-agent-test-output-image-preview-uses-workbench ()
+  "C-j previews an Output image from its in-memory payload and keeps focus."
+  (let ((chat (generate-new-buffer " *pi-output-image-preview*"))
+        opened preview-bytes)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer chat)
+          (pi-coding-agent-chat-mode)
+          (let ((marker
+                 (pi-coding-agent--output-image-marker
+                  '(:type "image" :mimeType "image/png"
+                    :data "cHJldmlldy1ieXRlcw==")
+                  t))
+                (origin (selected-window)))
+            (let ((inhibit-read-only t))
+              (insert marker))
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'require) (lambda (&rest _) t))
+                      ((symbol-function 'image-mode) #'ignore)
+                      ((symbol-function
+                        'cabins-agent-workspace-open-temporary-workbench)
+                       (lambda (buffer)
+                         (setq opened buffer
+                               preview-bytes
+                               (with-current-buffer buffer (buffer-string))))))
+              (pi-coding-agent-chat-newline-or-preview))
+            (should (buffer-live-p opened))
+            (should (equal preview-bytes "preview-bytes"))
+            (should (eq (selected-window) origin))))
+      (when (buffer-live-p opened)
+        (kill-buffer opened))
+      (when (buffer-live-p chat)
+        (kill-buffer chat)))))
+
+(ert-deftest pi-coding-agent-test-live-assistant-image-renders-at-message-end ()
+  "A live assistant native image is appended when its message completes."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (pi-coding-agent--handle-display-event
+       '(:type "message_start" :message (:role "assistant")))
+      (pi-coding-agent--handle-display-event
+       '(:type "message_end"
+         :message (:role "assistant"
+                   :content [(:type "image" :mimeType "image/png"
+                              :data "aW1hZ2U=")])))
+      (goto-char (point-min))
+      (search-forward "[image attachment]")
+      (should (get-text-property (1- (point))
+                                 'pi-coding-agent-output-image)))))
+
+(ert-deftest pi-coding-agent-test-chat-c-j-without-image-keeps-newline-command ()
+  "C-j away from an Output image delegates to the prior newline command."
+  (with-temp-buffer
+    (let ((called nil))
+      (cl-letf (((symbol-function 'newline)
+                 (lambda (&rest _) (setq called t))))
+        (pi-coding-agent-chat-newline-or-preview))
+      (should called))))
+
 (ert-deftest pi-coding-agent-test-history-renders-assistant-string-content ()
   "Session history handles assistant messages stored as plain strings."
   (with-temp-buffer
@@ -2732,6 +2935,35 @@ See https://github.com/dnouri/pi-coding-agent/issues/176."
                           '((:type "text" :text "file1\nfile2"))
                           nil nil)
     (should (string-match-p "file1" (buffer-string)))))
+
+(ert-deftest pi-coding-agent-test-tool-result-renders-native-image ()
+  "A completed tool result keeps its native image in the summary block."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+              ((symbol-function 'create-image)
+               (lambda (&rest _) '(image :type png))))
+      (let ((block (pi-coding-agent--display-tool-start
+                    "vision" '(:prompt "draw") "tool-image")))
+        (pi-coding-agent--display-tool-end
+         "vision" '(:prompt "draw")
+         '((:type "text" :text "generated")
+           (:type "image" :mimeType "image/png" :data "dG9vbA=="))
+         nil nil block))
+      (goto-char (point-min))
+      (search-forward "[image attachment]")
+      (should (get-text-property (1- (point))
+                                 'pi-coding-agent-output-image))
+      (goto-char (point-min))
+      (search-forward "TAB details")
+      (let ((button (button-at (1- (point)))))
+        (let ((inhibit-read-only t))
+          (button-put button 'pi-coding-agent-expanded t))
+        (pi-coding-agent--toggle-tool-summary button))
+      (goto-char (point-min))
+      (search-forward "[image attachment]")
+      (should (get-text-property (1- (point))
+                                 'pi-coding-agent-output-image)))))
 
 (ert-deftest pi-coding-agent-test-bash-output-wrapped-in-bare-fence ()
   "Bash output is wrapped in a bare fence (no language tag)."

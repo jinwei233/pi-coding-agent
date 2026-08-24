@@ -156,6 +156,22 @@ File references also complete: use =TAB= on paths such as =./=, =../=,
 and =~/=.  Absolute paths complete too, except for a bare =/= at the
 start of the buffer, where slash-command completion wins.
 
+On macOS, =C-y= attaches a clipboard image through =pngpaste= and
+falls back to normal text yank when no image is available.  =C-c C-i=
+explicitly requests an image, and accepting a PNG, JPEG, GIF, or WebP
+through =@= completion imports it into input-buffer-owned storage.
+Manually typed and non-image =@= references remain text.  Attachments
+are normalized asynchronously with ImageMagick =magick= to at most
+2000x2000 and 4.5 MiB of base64 each; a message defaults to at most
+four images and 12 MiB total.
+
+Use =C-j= on an attachment to preview it in the Agent Workspace
+Workbench, =C-c C-d= to remove it, and normal undo/redo or =M-p=/=M-n=
+to recover it.  Image-only prompts are valid.  A text-only model keeps
+the draft visible but blocks sending until an image-capable model is
+selected.  Aborting restores unaccepted local follow-ups, including
+their images, in FIFO order.
+
 While composing, you can page through the chat without moving focus
 out of the input buffer.  Use =M+PageDown= and =M+PageUp= to scroll
 the linked chat window (also known as =M-<next>= and =M-<prior>=).  If
@@ -235,6 +251,10 @@ and error thresholds.
 | =M-p= / =M-n=    | input   | 🕰️ Prompt history (=C-↑= / =C-↓= also work)   |
 | =C-r=            | input   | 🕵️ Incremental prompt-history search          |
 | =TAB=            | input   | 🪄 Complete paths, and =/= commands           |
+| =C-y=            | input   | Attach clipboard image, or yank text          |
+| =C-c C-i=        | input   | Explicitly attach clipboard image             |
+| =C-c C-d=        | input   | Remove image attachment at point              |
+| =C-j=            | input   | Preview image at point, or insert newline      |
 | =M+<prior/next>= | input   | 🛗 Scroll linked chat window                  |
 | =TAB=            | chat    | 🪗 Toggle thinking block, tool block, or turn |
 | =!=              | chat    | 🐚 Run a Dired-inspired command on a file    |

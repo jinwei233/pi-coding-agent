@@ -1045,6 +1045,7 @@ When PERSIST-DEFAULT is non-nil, also set MODEL as Pi's new-session default."
            (progn
              (with-current-buffer chat-buf
                (pi-coding-agent--update-state-from-response response)
+               (pi-coding-agent--notify-input-state-change)
                (force-mode-line-update t))
              (message (if persist-default
                           "Pi: Switched to %s and set it as the new-session default"

@@ -71,6 +71,20 @@
 (declare-function pi-coding-agent-history-isearch-backward "pi-coding-agent-input")
 (declare-function pi-coding-agent-queue-steering "pi-coding-agent-input")
 (declare-function pi-coding-agent-input-mode "pi-coding-agent-input")
+(declare-function pi-coding-agent-smart-yank "pi-coding-agent-input")
+(declare-function pi-coding-agent-attach-clipboard-image "pi-coding-agent-input")
+(declare-function pi-coding-agent-remove-image-at-point "pi-coding-agent-input")
+(declare-function pi-coding-agent-input-newline-or-preview "pi-coding-agent-input")
+(declare-function pi-coding-agent--serialize-image-envelope
+                  "pi-coding-agent-input" (envelope))
+(declare-function pi-coding-agent--prepare-image-envelope-for-rpc
+                  "pi-coding-agent-input" (envelope))
+(declare-function pi-coding-agent--image-envelope-draft
+                  "pi-coding-agent-input" (envelope))
+
+;; Optional Agent Workspace integration.
+(declare-function cabins-agent-workspace-open-temporary-workbench
+                  "cabins-agent-workspace" (buffer))
 
 ;; pi-coding-agent-menu.el (menu and session commands)
 (declare-function pi-coding-agent-menu "pi-coding-agent-menu")
@@ -187,6 +201,22 @@ Bash output is typically more verbose, so fewer lines are shown."
 (defcustom pi-coding-agent-preview-max-bytes 51200
   "Maximum bytes for tool output preview (50KB default).
 Prevents huge single-line outputs from blowing up the chat buffer."
+  :type 'natnum
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-output-image-max-width 320
+  "Maximum displayed width in pixels for native images in Agent Output."
+  :type 'natnum
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-output-image-max-height 240
+  "Maximum displayed height in pixels for native images in Agent Output."
+  :type 'natnum
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-output-image-max-base64-bytes (* 9 512 1024)
+  "Largest base64 image payload decoded for Agent Output display.
+Larger native image blocks retain their compact textual fallback."
   :type 'natnum
   :group 'pi-coding-agent)
 
@@ -328,6 +358,117 @@ verticals and a single header rule.  Has no effect when
 `pi-coding-agent-prettify-tables' is nil (raw markdown pipes are used)."
   :type 'boolean
   :group 'pi-coding-agent)
+
+(defconst pi-coding-agent--output-image-marker "[image attachment]"
+  "Canonical textual fallback for a native image in Agent Output.")
+
+(defun pi-coding-agent--output-image-data (block)
+  "Decode and return supported native image bytes from BLOCK, or nil."
+  (let ((mime (plist-get block :mimeType))
+        (data (plist-get block :data)))
+    (when (and (member mime '("image/png" "image/jpeg"
+                              "image/gif" "image/webp"))
+               (stringp data)
+               (not (string-empty-p data))
+               (<= (string-bytes data)
+                   pi-coding-agent-output-image-max-base64-bytes)
+               (= (% (length data) 4) 0))
+      (condition-case nil
+          (base64-decode-string data)
+        (error nil)))))
+
+(defun pi-coding-agent--output-image-spec (block)
+  "Return a bounded display image spec for native image BLOCK, or nil."
+  (when (display-images-p)
+    (when-let* ((data (pi-coding-agent--output-image-data block)))
+      (condition-case nil
+          (create-image data nil t
+                        :max-width pi-coding-agent-output-image-max-width
+                        :max-height pi-coding-agent-output-image-max-height
+                        :ascent 'center)
+        (error nil)))))
+
+(defun pi-coding-agent--output-image-marker (block &optional defer)
+  "Return a non-owning Output marker for native image BLOCK.
+When DEFER is non-nil, leave image-spec creation to the chat jit pass."
+  (let ((marker
+         (propertize pi-coding-agent--output-image-marker
+                     'pi-coding-agent-output-image block
+                     'rear-nonsticky
+                     '(pi-coding-agent-output-image display help-echo)
+                     'face 'shadow
+                     'help-echo "Image output; C-j previews in Workbench")))
+    (unless defer
+      (when-let* ((spec (pi-coding-agent--output-image-spec block)))
+        (put-text-property 0 (length marker) 'display spec marker)))
+    marker))
+
+(defun pi-coding-agent--jit-materialize-output-images (beg end)
+  "Materialize deferred Output image markers overlapping BEG through END."
+  (when (display-images-p)
+    (let ((position beg))
+      (while (< position end)
+        (let* ((block (get-text-property
+                       position 'pi-coding-agent-output-image))
+               (span-start
+                (if (and block
+                         (> position (point-min))
+                         (equal block
+                                (get-text-property
+                                 (1- position)
+                                 'pi-coding-agent-output-image)))
+                    (or (previous-single-property-change
+                         position 'pi-coding-agent-output-image nil
+                         (point-min))
+                        (point-min))
+                  position))
+               (span-end
+                (or (next-single-property-change
+                     position 'pi-coding-agent-output-image nil
+                     (if block (point-max) end))
+                    (if block (point-max) end))))
+          (when (and block
+                     (not (get-text-property position 'display)))
+            (when-let* ((spec (pi-coding-agent--output-image-spec block)))
+              (let ((inhibit-read-only t))
+                (put-text-property span-start span-end 'display spec))))
+          (setq position (max (1+ position) span-end)))))))
+
+(defun pi-coding-agent--output-image-at-point ()
+  "Return the native Output image block at or immediately before point."
+  (or (get-text-property (point) 'pi-coding-agent-output-image)
+      (and (> (point) (point-min))
+           (get-text-property (1- (point))
+                              'pi-coding-agent-output-image))))
+
+(defun pi-coding-agent-preview-output-image-at-point ()
+  "Preview the native Output image at point in the Workspace Workbench."
+  (interactive)
+  (let* ((block (pi-coding-agent--output-image-at-point))
+         (data (and block (pi-coding-agent--output-image-data block))))
+    (unless data
+      (user-error "Pi: No previewable Output image at point"))
+    (unless (require 'cabins-agent-workspace nil t)
+      (user-error "Pi: Agent Workspace is required for image preview"))
+    (let* ((origin (selected-window))
+           (name (format "*Pi Output Image Preview: %s*" (buffer-name)))
+           (buffer (get-buffer-create name)))
+      (with-current-buffer buffer
+        (let ((inhibit-read-only t))
+          (erase-buffer)
+          (set-buffer-multibyte nil)
+          (insert data))
+        (image-mode))
+      (cabins-agent-workspace-open-temporary-workbench buffer)
+      (when (window-live-p origin)
+        (select-window origin)))))
+
+(defun pi-coding-agent-chat-newline-or-preview ()
+  "Preview an Output image at point, otherwise retain the prior C-j behavior."
+  (interactive)
+  (if (pi-coding-agent--output-image-at-point)
+      (pi-coding-agent-preview-output-image-at-point)
+    (newline)))
 
 ;;;; Faces
 
@@ -564,6 +705,7 @@ Return nil when PATH is not a string."
     (define-key map (kbd "n") #'pi-coding-agent-next-message)
     (define-key map (kbd "p") #'pi-coding-agent-previous-message)
     (define-key map (kbd "f") #'pi-coding-agent-fork-at-point)
+    (define-key map (kbd "C-j") #'pi-coding-agent-chat-newline-or-preview)
     (define-key map (kbd "TAB") #'pi-coding-agent-toggle-tool-section)
     (define-key map (kbd "<tab>") #'pi-coding-agent-toggle-tool-section)
     (define-key map (kbd "!") #'pi-coding-agent-shell-command-at-point)
@@ -912,6 +1054,7 @@ This is a read-only buffer showing the conversation history."
   ;; tables on the same redisplay that fontifies them, so resumed sessions
   ;; stay fast to load yet every table becomes a grid once seen.
   (jit-lock-register #'pi-coding-agent--jit-decorate-tables)
+  (jit-lock-register #'pi-coding-agent--jit-materialize-output-images)
 
   ;; Compute theme-derived faces used by chat overlays.
   (pi-coding-agent--update-theme-derived-faces)
@@ -948,6 +1091,10 @@ removing the instructional header that would otherwise appear."
     (define-key map (kbd "<C-up>") #'pi-coding-agent-previous-input)
     (define-key map (kbd "<C-down>") #'pi-coding-agent-next-input)
     (define-key map (kbd "C-r") #'pi-coding-agent-history-isearch-backward)
+    (define-key map (kbd "C-y") #'pi-coding-agent-smart-yank)
+    (define-key map (kbd "C-j") #'pi-coding-agent-input-newline-or-preview)
+    (define-key map (kbd "C-c C-i") #'pi-coding-agent-attach-clipboard-image)
+    (define-key map (kbd "C-c C-d") #'pi-coding-agent-remove-image-at-point)
     ;; Message queuing (steering only - follow-up handled by C-c C-c)
     (define-key map (kbd "C-c C-s") #'pi-coding-agent-queue-steering)
     map)
@@ -1113,6 +1260,15 @@ so built-in other-window scrolling commands target the linked chat."
 
 (defvar-local pi-coding-agent--input-buffer nil
   "Reference to the input buffer for this session.")
+
+(defvar pi-coding-agent-input-state-change-hook nil
+  "Hook run in a linked input buffer after authoritative state changes.")
+
+(defun pi-coding-agent--notify-input-state-change ()
+  "Notify the linked input buffer that current runtime state changed."
+  (when (buffer-live-p pi-coding-agent--input-buffer)
+    (with-current-buffer pi-coding-agent--input-buffer
+      (run-hooks 'pi-coding-agent-input-state-change-hook))))
 
 (defvar pi-coding-agent--activity-phase)
 
@@ -1397,6 +1553,35 @@ oldest message is sent after the session settles, and dropped only after
 prompt preflight accepts it.  This is simpler than using pi's RPC follow_up
 command.")
 
+(defun pi-coding-agent--message-envelope-p (message)
+  "Return non-nil when MESSAGE is a text-plus-image envelope."
+  (and (listp message)
+       (plist-member message :text)
+       (plist-member message :images)))
+
+(defun pi-coding-agent--message-text (message)
+  "Return MESSAGE's textual content without attachment identity."
+  (if (pi-coding-agent--message-envelope-p message)
+      (plist-get message :text)
+    message))
+
+(defun pi-coding-agent--message-images (message)
+  "Return MESSAGE's ordered attachment UUID list, if any."
+  (and (pi-coding-agent--message-envelope-p message)
+       (plist-get message :images)))
+
+(defun pi-coding-agent--message-transcript-text (message)
+  "Return a non-owning transcript representation of MESSAGE."
+  (concat (or (pi-coding-agent--message-text message) "")
+          (mapconcat
+           (lambda (image)
+             (concat "\n" (pi-coding-agent--output-image-marker image)))
+           (or (plist-get message :rpc-images)
+               (mapcar (lambda (_uuid)
+                         '(:type "image"))
+                       (pi-coding-agent--message-images message)))
+           "")))
+
 (defun pi-coding-agent--push-followup (message)
   "Push MESSAGE onto the follow-up queue."
   (push message pi-coding-agent--followup-queue))
@@ -1419,15 +1604,18 @@ Follow-ups are processed in FIFO order: first pushed, first sent."
   (reverse pi-coding-agent--followup-queue))
 
 (defun pi-coding-agent--restore-input-text (text)
-  "Restore TEXT to the linked input buffer for user recovery.
+  "Restore TEXT or a complete message envelope to the linked input buffer.
 Recovered text is older than any draft currently in the input buffer, so it is
 placed first and separated from the draft by a blank line."
   (when-let* ((input-buf pi-coding-agent--input-buffer)
               ((buffer-live-p input-buf)))
     (with-current-buffer input-buf
-      (let ((draft (buffer-string)))
+      (let ((draft (buffer-string))
+            (restored (if (pi-coding-agent--message-envelope-p text)
+                          (pi-coding-agent--image-envelope-draft text)
+                        text)))
         (erase-buffer)
-        (insert text)
+        (insert restored)
         (unless (string-empty-p draft)
           (insert "\n\n" draft))
         (goto-char (point-max))))))
@@ -1436,13 +1624,15 @@ placed first and separated from the draft by a blank line."
   "Move all queued follow-ups back to the input buffer and clear the queue.
 If the linked input buffer is gone, leave the queue intact rather than losing
 user text."
-  (when-let* (((buffer-live-p pi-coding-agent--input-buffer))
-              ((consp pi-coding-agent--followup-queue)))
-    (let ((text (mapconcat #'identity
-                           (pi-coding-agent--followups-in-fifo-order)
-                           "\n\n")))
+  (cond
+   ((null pi-coding-agent--followup-queue) t)
+   ((buffer-live-p pi-coding-agent--input-buffer)
+    (let ((text (pi-coding-agent--followups-in-fifo-order)))
       (pi-coding-agent--clear-followup-queue)
-      (pi-coding-agent--restore-input-text text))))
+      (dolist (message (reverse text))
+        (pi-coding-agent--restore-input-text message)))
+    t)
+   (t nil)))
 
 (defun pi-coding-agent--peek-followup ()
   "Return the oldest queued follow-up message without removing it."
@@ -2468,6 +2658,7 @@ Safely handles dead buffers by checking liveness first."
           (plist-put new-state :status new-status)
           (setq pi-coding-agent--status new-status
                 pi-coding-agent--state new-state)))
+      (pi-coding-agent--notify-input-state-change)
       (force-mode-line-update t))))
 
 ;;;; Sending Infrastructure
@@ -2547,7 +2738,10 @@ Shows an error message if process is unavailable.
 ON-SUCCESS is called in the chat buffer after prompt preflight accepts TEXT.
 ON-FAILURE is called in the chat buffer if preflight rejects TEXT.
 ON-NO-AGENT-START is called if success is not followed by agent_start."
-  (let ((proc (pi-coding-agent--get-process))
+  (let* ((message (pi-coding-agent--message-text text))
+         (images (and (pi-coding-agent--message-images text)
+                      (plist-get text :rpc-images)))
+         (proc (pi-coding-agent--get-process))
         (chat-buf (pi-coding-agent--get-chat-buffer))
         (prompt-generation nil))
     (cond
@@ -2571,7 +2765,9 @@ ON-NO-AGENT-START is called if success is not followed by agent_start."
           (pi-coding-agent--set-activity-phase "thinking")))
       (pi-coding-agent--rpc-async
        proc
-       (list :type "prompt" :message text)
+       (append (list :type "prompt" :message message)
+               (when images
+                 (list :images (vconcat images))))
        (lambda (response)
          (if (eq (plist-get response :success) t)
              (when (buffer-live-p chat-buf)

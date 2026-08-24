@@ -633,5 +633,70 @@ SPEC is (SESSION SCENARIO &rest EXTRA-ARGS)."
                           events)))
         (should custom-end)))))
 
+(ert-deftest pi-coding-agent-fake-pi-test-preserves-images-on-prompt-and-steer ()
+  "Fake Pi preserves native image items on prompt and steering user turns."
+  (pi-coding-agent-fake-pi-test-with-process (proc "prompt-lifecycle")
+    (let ((first-image '(:type "image" :mimeType "image/png" :data "first"))
+          (second-image '(:type "image" :mimeType "image/jpeg" :data "second")))
+      (pi-coding-agent-fake-pi-test--send
+       proc (list :type "prompt" :message "initial"
+                  :images (vector first-image second-image)))
+      (pi-coding-agent-fake-pi-test--collect-until
+       proc (lambda (event)
+              (equal (plist-get event :type) "agent_start")))
+      (pi-coding-agent-fake-pi-test--send
+       proc (list :type "steer" :message "steer"
+                  :images (vector second-image)))
+      (let* ((events (pi-coding-agent-fake-pi-test--collect-until
+                      proc (lambda (event)
+                             (equal (plist-get event :type) "agent_end"))))
+             (users (seq-filter
+                     (lambda (event)
+                       (and (equal (plist-get event :type) "message_end")
+                            (equal (plist-get (plist-get event :message) :role)
+                                   "user")))
+                     events)))
+        (should (= (length users) 2))
+        (should (equal (cdr (append (plist-get (plist-get (car users) :message)
+                                             :content) nil))
+                       (list first-image second-image)))
+        (should (equal (cdr (append (plist-get (plist-get (cadr users) :message)
+                                             :content) nil))
+                       (list second-image)))))))
+
+(ert-deftest pi-coding-agent-fake-pi-test-sends-image-only-envelope-in-order ()
+  "Image-only input reaches fake Pi as ordered native image content."
+  (pi-coding-agent-fake-pi-test-with-session (session "prompt-lifecycle")
+    (let* ((chat-buf (plist-get session :chat-buffer))
+           (input-buf (plist-get session :input-buffer))
+           (dir (make-temp-file "pi-envelope-test-" t))
+           (first (expand-file-name "first.png" dir))
+           (second (expand-file-name "second.png" dir)))
+      (unwind-protect
+          (progn
+            (with-temp-file first (insert "first-image"))
+            (with-temp-file second (insert "second-image"))
+            (with-current-buffer input-buf
+              (puthash "first" (list :path first :mime "image/png"
+                                     :base64-size 16 :owned t)
+                       (pi-coding-agent--image-registry))
+              (puthash "second" (list :path second :mime "image/png"
+                                      :base64-size 16 :owned t)
+                       (pi-coding-agent--image-registry))
+              (pi-coding-agent--insert-image-token "second")
+              (pi-coding-agent--insert-image-token "first")
+              (pi-coding-agent-send))
+            (should
+             (pi-coding-agent-test-wait-until
+              (lambda ()
+                (with-current-buffer chat-buf
+                  (and (string-match-p "Fake reply for:" (buffer-string))
+                       (string-match-p "\\[image attachment\\]" (buffer-string)))))
+              pi-coding-agent-fake-pi-test--timeout 0.01
+              (plist-get session :process)))
+            (with-current-buffer input-buf
+              (should (string-empty-p (buffer-string))))
+        (delete-directory dir t))))))
+
 (provide 'pi-coding-agent-fake-pi-test)
 ;;; pi-coding-agent-fake-pi-test.el ends here

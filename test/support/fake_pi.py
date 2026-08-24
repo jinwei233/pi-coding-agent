@@ -307,7 +307,7 @@ class FakePiHarness:
         self._extension_waiter = threading.Event()
         self._extension_response: JsonDict | None = None
         self._pending_extension_id: str | None = None
-        self._pending_steer_message: str | None = None
+        self._pending_steer_message: tuple[str, list[JsonDict]] | None = None
         self._run_thread: threading.Thread | None = None
         self._message_serial = 0
         self._session_root_dir = tempfile.TemporaryDirectory(
@@ -321,9 +321,10 @@ class FakePiHarness:
             "api": "fake-api",
             "contextWindow": 8192,
             "maxTokens": 1024,
+            "input": ["text", "image"],
         }
         self.state = SessionState(model=model)
-        self.user_messages: list[dict[str, str]] = []
+        self.user_messages: list[JsonDict] = []
         self._reset_session_file()
 
     def run(self) -> int:
@@ -380,12 +381,13 @@ class FakePiHarness:
             return
         self._abort_requested.clear()
         message = str(command["message"])
+        images = list(command.get("images", []))
         match self.scenario.prompt:
             case TextStreamPrompt() as behavior:
                 self._respond(command)
                 self._start_run(
                     name=f"fake-pi-text-stream-{self.scenario.name}",
-                    target=lambda: self._run_text_prompt(message, behavior),
+                    target=lambda: self._run_text_prompt(message, images, behavior),
                 )
             case ExtensionDialogPrompt() as behavior:
                 if message != behavior.command_name:
@@ -425,7 +427,10 @@ class FakePiHarness:
         if not isinstance(self.scenario.prompt, TextStreamPrompt):
             self._fail(command, "Current fake scenario does not support steer")
             return
-        self._pending_steer_message = str(command["message"])
+        self._pending_steer_message = (
+            str(command["message"]),
+            list(command.get("images", [])),
+        )
         self._respond(command)
 
     def _handle_new_session(self, command: JsonDict) -> None:
@@ -469,15 +474,19 @@ class FakePiHarness:
             self._extension_waiter.set()
         self._log("extension-response", command)
 
-    def _run_text_prompt(self, message: str, behavior: TextStreamPrompt) -> None:
+    def _run_text_prompt(
+        self, message: str, images: list[JsonDict], behavior: TextStreamPrompt
+    ) -> None:
         """Run a streamed-text prompt scenario."""
         self.state.is_streaming = True
         emitted_messages: list[JsonDict] = []
         current_message = message
+        current_images = images
         self._write_json({"type": "agent_start"})
         while True:
             completed, assistant_message = self._emit_text_turn(
                 current_message,
+                current_images,
                 behavior=behavior,
                 assistant_text_template=(
                     behavior.assistant_text
@@ -492,12 +501,13 @@ class FakePiHarness:
             pending_steer = self._take_pending_steer()
             if pending_steer is None:
                 break
-            current_message = pending_steer
+            current_message, current_images = pending_steer
         self._finish_run(emitted_messages)
 
     def _emit_text_turn(
         self,
         user_text: str,
+        images: list[JsonDict],
         *,
         behavior: TextStreamPrompt,
         assistant_text_template: str,
@@ -507,7 +517,7 @@ class FakePiHarness:
         Returns ``(completed, assistant_message)``.  When ``completed`` is
         false, the assistant message is undefined because the run was aborted.
         """
-        user_message = self._build_user_message(user_text)
+        user_message = self._build_user_message(user_text, images)
         self._persist_user_message(user_message)
         if behavior.echo_user:
             self._write_json({"type": "message_start", "message": user_message})
@@ -779,7 +789,7 @@ class FakePiHarness:
         self._run_thread = thread
         thread.start()
 
-    def _take_pending_steer(self) -> str | None:
+    def _take_pending_steer(self) -> tuple[str, list[JsonDict]] | None:
         """Return and clear the queued steering message, if any."""
         message = self._pending_steer_message
         self._pending_steer_message = None
@@ -818,11 +828,15 @@ class FakePiHarness:
             "details": {"truncation": None, "fullOutputPath": None},
         }
 
-    def _build_user_message(self, text: str) -> JsonDict:
+    def _build_user_message(
+        self, text: str, images: list[JsonDict] | None = None
+    ) -> JsonDict:
         """Return a user message payload."""
+        content: list[JsonDict] = [{"type": "text", "text": text}]
+        content.extend(images or [])
         return {
             "role": "user",
-            "content": [{"type": "text", "text": text}],
+            "content": content,
             "timestamp": now_ms(),
         }
 
@@ -848,7 +862,8 @@ class FakePiHarness:
         """Append a user message to the real session file and fork list."""
         entry_id = self._entry_id("user")
         text = message["content"][0]["text"]
-        self.user_messages.append({"entryId": entry_id, "text": text})
+        self.user_messages.append({"entryId": entry_id, "text": text,
+                                   "images": message["content"][1:]})
         self._append_session_line({"type": "message", "entryId": entry_id, "message": message})
         self.state.message_count += 1
 

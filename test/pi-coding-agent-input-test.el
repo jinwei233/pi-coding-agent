@@ -589,8 +589,8 @@ Uses :false (JSON false representation) to verify boolean normalization."
       (kill-buffer chat-buf)
       (kill-buffer input-buf))))
 
-(ert-deftest pi-coding-agent-test-aborted-preflight-compaction-clears-followups-before-prompt-failure ()
-  "Aborted preflight compaction clears follow-ups while prompt failure is pending."
+(ert-deftest pi-coding-agent-test-aborted-preflight-compaction-preserves-unrecoverable-queue ()
+  "Aborted preflight keeps followups when no input buffer can recover them."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((sent-text nil))
@@ -613,7 +613,7 @@ Uses :false (JSON false representation) to verify boolean normalization."
            :result nil)))
       (should (eq pi-coding-agent--status 'idle))
       (should (equal pi-coding-agent--activity-phase "thinking"))
-      (should (null pi-coding-agent--followup-queue))
+      (should (equal pi-coding-agent--followup-queue '("discarded follow-up")))
       (should (null sent-text)))))
 
 (ert-deftest pi-coding-agent-test-failed-preflight-compaction-prompt-failure-restores-original ()
@@ -761,8 +761,8 @@ Uses :false (JSON false representation) to verify boolean normalization."
       (kill-buffer chat-buf)
       (kill-buffer input-buf))))
 
-(ert-deftest pi-coding-agent-test-compaction-end-aborted-clears-queue ()
-  "compaction_end when aborted clears followup queue without sending."
+(ert-deftest pi-coding-agent-test-compaction-end-aborted-restores-queue ()
+  "compaction_end when aborted restores followups without sending."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((sent-text nil))
@@ -777,8 +777,8 @@ Uses :false (JSON false representation) to verify boolean normalization."
          '(:type "compaction_end"
            :reason "threshold"
            :aborted t)))
-      ;; Queue should be cleared (user cancelled)
-      (should (null pi-coding-agent--followup-queue))
+      ;; Without an input recovery target, queued work remains recoverable.
+      (should (equal pi-coding-agent--followup-queue '("queued message")))
       ;; No message should have been sent
       (should (null sent-text)))))
 
@@ -860,27 +860,79 @@ Uses :false (JSON false representation) to verify boolean normalization."
         (pi-coding-agent-abort)
         (should (null sent-command))))))
 
-(ert-deftest pi-coding-agent-test-abort-clears-followup-queue ()
-  "Aborting clears the follow-up queue so queued messages are not sent.
-When user aborts, they want to stop everything - including queued messages."
-  (with-temp-buffer
-    (pi-coding-agent-chat-mode)
-    (let ((inhibit-read-only t)
-          (message-was-sent nil))
-      (insert "Some streaming content")
-      ;; Set up state as if we're streaming with a queued message
-      (setq pi-coding-agent--aborted t
-            pi-coding-agent--followup-queue '("queued message that should be discarded"))
-      ;; Mock send functions to detect if queue processing sends the message
-      (cl-letf (((symbol-function 'pi-coding-agent--prepare-and-send)
-                 (lambda (_text) (setq message-was-sent t)))
-                ((symbol-function 'pi-coding-agent--refresh-header) #'ignore))
-        ;; Simulate agent_end arriving after abort
-        (pi-coding-agent--display-agent-end)
-        ;; Queue should be empty (either cleared or not processed)
-        (should (null pi-coding-agent--followup-queue))
-        ;; Key assertion: queued message should NOT have been sent
-        (should-not message-was-sent)))))
+(ert-deftest pi-coding-agent-test-abort-restores-followup-queue-once ()
+  "Aborting restores unaccepted local follow-ups in FIFO order."
+  (let ((chat-buf (generate-new-buffer " *pi-abort-chat*"))
+        (input-buf (generate-new-buffer " *pi-abort-input*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (insert "Some streaming content"))
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--aborted t
+                  pi-coding-agent--followup-queue '("second" "first"))
+            (cl-letf (((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (&rest _) (ert-fail "must not send after abort")))
+                      ((symbol-function 'pi-coding-agent--refresh-header) #'ignore))
+              (pi-coding-agent--display-agent-end)
+              ;; A duplicate lifecycle event cannot restore the same queue again.
+              (pi-coding-agent--display-agent-end)
+              (should (null pi-coding-agent--followup-queue))))
+          (with-current-buffer input-buf
+            (should (equal (buffer-string) "first\n\nsecond"))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf))))
+
+(ert-deftest pi-coding-agent-test-abort-restores-image-followups-once-in-fifo-order ()
+  "Abort restores text and image follow-ups once without the active prompt."
+  (let ((chat-buf (generate-new-buffer " *pi-abort-image-chat*"))
+        (input-buf (generate-new-buffer " *pi-abort-image-input*"))
+        (path (make-temp-file "pi-abort-image-" nil ".png")))
+    (unwind-protect
+        (progn
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "abort-image"
+                     (list :path path :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry)))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--aborted t
+                  pi-coding-agent--followup-queue
+                  (list "second"
+                        (list :text "first"
+                              :images '("abort-image")
+                              :draft
+                              (concat
+                               "first "
+                               (propertize
+                                "[[pi-image:abort-image]]"
+                                'pi-coding-agent-image-uuid "abort-image")))))
+            (cl-letf (((symbol-function 'pi-coding-agent--refresh-header) #'ignore))
+              (pi-coding-agent--display-agent-end)
+              (pi-coding-agent--handle-compaction-end-event
+               '(:type "compaction_end" :aborted t))
+              (pi-coding-agent--display-agent-end))
+            (should-not pi-coding-agent--followup-queue))
+          (with-current-buffer input-buf
+            (should (equal (buffer-string)
+                           "first [[pi-image:abort-image]]\n\nsecond"))
+            (should (equal
+                     (get-text-property 7 'pi-coding-agent-image-uuid)
+                     "abort-image"))
+            (should-not (string-match-p "active prompt" (buffer-string)))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
 
 ;;; Kill Buffer Protection
 
@@ -2965,6 +3017,44 @@ Pi handles command expansion on the server side."
           (should (equal (plist-get rpc-message :message) "/greet world")))
       (delete-process fake-proc))))
 
+(ert-deftest pi-coding-agent-test-send-prompt-uses-json-image-array ()
+  "Image prompt dispatch uses a vector so JSON encoding is unambiguous."
+  (let* ((rpc-message nil)
+         (fake-proc (start-process "test" nil "cat"))
+         (image '(:type "image" :data "cGl4ZWxz" :mimeType "image/png")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pi-coding-agent--get-process)
+                   (lambda () fake-proc))
+                  ((symbol-function 'pi-coding-agent--rpc-async)
+                   (lambda (_proc msg _cb) (setq rpc-message msg)))
+                  ((symbol-function 'call-process) #'ignore))
+          (pi-coding-agent--send-prompt
+           (list :text "inspect" :images '("uuid") :rpc-images (list image)))
+          (should (vectorp (plist-get rpc-message :images)))
+          (should (equal (aref (plist-get rpc-message :images) 0) image))
+          (let ((encoded (json-encode rpc-message)))
+            (should (string-match-p
+                     "\"images\"[[:space:]]*:[[:space:]]*\\["
+                     encoded))))
+      (delete-process fake-proc))))
+
+(ert-deftest pi-coding-agent-test-send-steer-uses-json-image-array ()
+  "Image steering dispatch uses the same unambiguous JSON array boundary."
+  (let* ((rpc-message nil)
+         (fake-proc (start-process "test" nil "cat"))
+         (image '(:type "image" :data "cGl4ZWxz" :mimeType "image/png")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'pi-coding-agent--get-process)
+                   (lambda () fake-proc))
+                  ((symbol-function 'pi-coding-agent--rpc-async)
+                   (lambda (_proc msg _cb) (setq rpc-message msg))))
+          (should
+           (pi-coding-agent--send-steer-message
+            (list :text "inspect" :images '("uuid") :rpc-images (list image))))
+          (should (vectorp (plist-get rpc-message :images)))
+          (should (equal (aref (plist-get rpc-message :images) 0) image)))
+      (delete-process fake-proc))))
+
 (ert-deftest pi-coding-agent-test-send-prompt-marks-sending-until-preflight-fails ()
   "pi-coding-agent--send-prompt closes the local pre-agent_start idle gap."
   (let* ((rpc-callback nil)
@@ -3783,7 +3873,8 @@ Pi handles command expansion on the server side."
                    (lambda (_proc _cmd callback)
                      (funcall callback (list :success t :command "set_model" :data selected-model))))
                   ((symbol-function 'completing-read)
-                   (lambda (&rest _) "Model B")))
+                   (lambda (_prompt collection &rest _)
+                     (cadr collection))))
           (with-current-buffer buf-a
             (pi-coding-agent-chat-mode)
             (setq pi-coding-agent--process :proc-a)
@@ -4544,6 +4635,1083 @@ no spurious faces are applied to plain colon-ending lines."
           (should-error (pi-coding-agent-input-previous-message)
                         :type 'user-error))
       (kill-buffer chat-buf))))
+
+(ert-deftest pi-coding-agent-test-image-envelope-extracts-owned-tokens-only ()
+  "Only registered, package-owned tokens become ordered image references."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((dir (make-temp-file "pi-image-test-" t))
+           (path (expand-file-name "one.png" dir))
+           (uuid "owned-image"))
+      (unwind-protect
+          (progn
+            (with-temp-file path (insert "PNG"))
+            (puthash uuid (list :uuid uuid :path path :mime "image/png"
+                                :base64-size 4 :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "before ")
+            (pi-coding-agent--insert-image-token uuid)
+            (insert " after [[pi-image:typed-image]]")
+            (let ((envelope (pi-coding-agent--image-draft-envelope)))
+              (should (equal (plist-get envelope :text)
+                             "before  after [[pi-image:typed-image]]"))
+              (should (equal (plist-get envelope :images) (list uuid)))))
+        (delete-directory dir t)))))
+
+(ert-deftest pi-coding-agent-test-image-envelope-serializes-ordered-native-images ()
+  "Image RPC serialization preserves draft ordering and MIME metadata."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((dir (make-temp-file "pi-image-test-" t))
+           (first (expand-file-name "first.png" dir))
+           (second (expand-file-name "second.jpg" dir)))
+      (unwind-protect
+          (progn
+            (with-temp-file first (insert "first"))
+            (with-temp-file second (insert "second"))
+            (puthash "first" (list :path first :mime "image/png"
+                                   :base64-size 8 :owned t)
+                     (pi-coding-agent--image-registry))
+            (puthash "second" (list :path second :mime "image/jpeg"
+                                    :base64-size 8 :owned t)
+                     (pi-coding-agent--image-registry))
+            (let ((images (pi-coding-agent--serialize-image-envelope
+                           '(:text "compare" :images ("second" "first")))))
+              (should (equal (mapcar (lambda (image) (plist-get image :mimeType))
+                                     images)
+                             '("image/jpeg" "image/png")))
+              (should (equal (mapcar (lambda (image) (plist-get image :data))
+                                     images)
+                             (list (base64-encode-string "second" t)
+                                   (base64-encode-string "first" t))))))
+        (delete-directory dir t)))))
+
+(ert-deftest pi-coding-agent-test-image-cleanup-removes-only-client-owned-data ()
+  "Input cleanup does not delete imported sources or another client's files."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((dir (make-temp-file "pi-image-test-" t))
+           (owned (expand-file-name "owned.png" dir))
+           (source (make-temp-file "pi-image-source-" nil ".png")))
+      (unwind-protect
+          (progn
+            (with-temp-file owned (insert "owned"))
+            (with-temp-file source (insert "source"))
+            (setq pi-coding-agent--image-attachment-directory dir)
+            (puthash "owned" (list :path owned :owned t)
+                     (pi-coding-agent--image-registry))
+            (puthash "source" (list :path source :owned nil)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--cleanup-image-attachments)
+            (should-not (file-exists-p owned))
+            (should (file-exists-p source)))
+        (when (file-exists-p source) (delete-file source))
+        (when (file-directory-p dir) (delete-directory dir t))))))
+
+(ert-deftest pi-coding-agent-test-image-token-survives-trim-history-and-rehydration ()
+  "Canonical token identity survives normal string and history operations."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((dir (make-temp-file "pi-image-test-" t))
+           (path (expand-file-name "one.png" dir))
+           (uuid "history-image"))
+      (unwind-protect
+          (progn
+            (with-temp-file path (insert "PNG"))
+            (puthash uuid (list :path path :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "  ")
+            (pi-coding-agent--insert-image-token uuid)
+            (insert "  ")
+            (let ((draft (string-trim (buffer-string))))
+              (should (equal (get-text-property 0 'pi-coding-agent-image-uuid draft)
+                             uuid))
+              (pi-coding-agent--history-add draft)
+              (erase-buffer)
+              (insert (ring-ref (pi-coding-agent--input-ring) 0))
+              (remove-text-properties (point-min) (point-max)
+                                      '(display nil face nil help-echo nil))
+              (pi-coding-agent--rehydrate-image-tokens)
+              (should (equal (get-text-property
+                              (point-min) 'pi-coding-agent-image-uuid)
+                             uuid))))
+        (delete-directory dir t)))))
+
+(ert-deftest pi-coding-agent-test-image-history-keeps-equal-text-distinct-by-uuid ()
+  "History does not conflate equal text drafts carrying different images."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((dir (make-temp-file "pi-image-test-" t))
+           (first (expand-file-name "first.png" dir))
+           (second (expand-file-name "second.png" dir)))
+      (unwind-protect
+          (progn
+            (with-temp-file first (insert "one"))
+            (with-temp-file second (insert "two"))
+            (dolist (pair `(("first" . ,first) ("second" . ,second)))
+              (puthash (car pair) (list :path (cdr pair) :mime "image/png"
+                                        :owned t)
+                       (pi-coding-agent--image-registry)))
+            (pi-coding-agent--history-add
+             (propertize "[[pi-image:first]]"
+                         'pi-coding-agent-image-uuid "first"))
+            (pi-coding-agent--history-add
+             (propertize "[[pi-image:second]]"
+                         'pi-coding-agent-image-uuid "second"))
+            (should (= (ring-length (pi-coding-agent--input-ring)) 2)))
+        (delete-directory dir t)))))
+
+(ert-deftest pi-coding-agent-test-image-async-import-preserves-edits-and-source ()
+  "Async image import replaces only its unchanged reference after completion."
+  (skip-unless (executable-find "magick"))
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((source (make-temp-file "pi-image-source-" nil ".png"))
+           (reference (concat "@" source))
+           (start (copy-marker (point-min) nil))
+           end)
+      (unwind-protect
+          (progn
+            (call-process "magick" nil nil nil "-size" "8x8" "xc:red" source)
+            (insert reference)
+            (setq start (copy-marker (point-min) nil)
+                  end (copy-marker (point-max) nil))
+            (pi-coding-agent--start-image-normalization
+             source 'file source start nil
+             (lambda ()
+               (when (equal (buffer-substring-no-properties start end) reference)
+                 (delete-region start end)
+                 t)))
+            (goto-char (point-max))
+            (insert " preserved edit")
+            (should
+             (pi-coding-agent-test-wait-until
+              (lambda ()
+                (> (hash-table-count (pi-coding-agent--image-registry)) 0))
+              5 0.01))
+            (should (file-exists-p source))
+            (should (string-match-p "\\[\\[pi-image:" (buffer-string)))
+            (should (string-suffix-p " preserved edit" (buffer-string))))
+        (when (file-exists-p source) (delete-file source))))))
+
+(ert-deftest pi-coding-agent-test-image-manual-known-token-remains-text ()
+  "Typing a registry UUID without package identity does not create an attachment."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (puthash "known" '(:path "/tmp/not-read.png" :mime "image/png")
+             (pi-coding-agent--image-registry))
+    (insert "typed [[pi-image:known]]")
+    (pi-coding-agent--rehydrate-image-tokens)
+    (let ((envelope (pi-coding-agent--image-draft-envelope)))
+      (should (equal (plist-get envelope :text)
+                     "typed [[pi-image:known]]"))
+      (should-not (plist-get envelope :images))
+      (should-not (get-text-property 7 'pi-coding-agent-image-uuid)))))
+
+(ert-deftest pi-coding-agent-test-image-broken-token-is-visible-and-blocks-send ()
+  "A valid token with missing backing data remains a broken attachment."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (puthash "broken" '(:path "/tmp/pi-image-does-not-exist.png"
+                        :name "missing.png" :mime "image/png" :owned t)
+             (pi-coding-agent--image-registry))
+    (pi-coding-agent--insert-image-token "broken")
+    (should (equal (get-text-property (point-min) 'face) 'error))
+    (should (equal (get-text-property (point-min) 'display)
+                   "[image missing: missing.png]"))
+    (let ((envelope (pi-coding-agent--image-draft-envelope)))
+      (should (equal (plist-get envelope :images) '("broken")))
+      (should-error (pi-coding-agent--image-validate-envelope envelope)
+                    :type 'user-error))))
+
+(ert-deftest pi-coding-agent-test-image-token-delete-undo-redo-preserves-identity ()
+  "Deleting an attachment is undoable and redoable without registry mutation."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (buffer-enable-undo)
+    (let ((path (make-temp-file "pi-image-undo-" nil ".png")))
+      (unwind-protect
+          (progn
+            (puthash "undo-image" (list :path path :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "undo-image")
+            (setq buffer-undo-list nil)
+            (goto-char (point-min))
+            (should (equal (pi-coding-agent--remove-image-at-point) "undo-image"))
+            (undo-boundary)
+            (undo-only 1)
+            (should (equal
+                     (get-text-property (point-min)
+                                        'pi-coding-agent-image-uuid)
+                     "undo-image"))
+            (let ((last-command 'undo))
+              (undo-redo))
+            (should (string-empty-p (buffer-string)))
+            (should (gethash "undo-image" (pi-coding-agent--image-registry))))
+        (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-history-restores-entry-and-saved-draft ()
+  "M-p and M-n preserve attachment identity in history and the saved draft."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let ((path-a (make-temp-file "pi-image-history-a-" nil ".png"))
+          (path-b (make-temp-file "pi-image-history-b-" nil ".png")))
+      (unwind-protect
+          (progn
+            (puthash "history-a" (list :path path-a :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (puthash "history-b" (list :path path-b :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "sent ")
+            (pi-coding-agent--insert-image-token "history-a")
+            (pi-coding-agent--history-add (buffer-string))
+            (erase-buffer)
+            (insert "draft ")
+            (pi-coding-agent--insert-image-token "history-b")
+            (pi-coding-agent-previous-input)
+            (should (equal
+                     (get-text-property 6 'pi-coding-agent-image-uuid)
+                     "history-a"))
+            (pi-coding-agent-next-input)
+            (should (equal
+                     (get-text-property 7 'pi-coding-agent-image-uuid)
+                     "history-b")))
+        (dolist (path (list path-a path-b))
+          (when (file-exists-p path) (delete-file path)))))))
+
+(ert-deftest pi-coding-agent-test-image-presentation-follows-model-capability ()
+  "Attachment presentation distinguishes unknown, text-only, and capable models."
+  (let ((chat-buf (generate-new-buffer " *pi-image-model-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-model-input*"))
+        (path (make-temp-file "pi-image-model-" nil ".png")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state nil))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "model-image"
+                     (list :path path :name "model.png" :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "model-image")
+            (should (eq (get-text-property (point-min) 'face) 'shadow)))
+          (with-current-buffer chat-buf
+            (setq pi-coding-agent--state '(:model (:input ["text"])))
+            (pi-coding-agent--notify-input-state-change))
+          (with-current-buffer input-buf
+            (should (eq (get-text-property (point-min) 'face) 'warning)))
+          (with-current-buffer chat-buf
+            (setq pi-coding-agent--state '(:model (:input ["text" "image"])))
+            (pi-coding-agent--notify-input-state-change))
+          (with-current-buffer input-buf
+            (should (eq (get-text-property (point-min) 'face) 'success)))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-send-prepares-native-payload-before-clear ()
+  "An image-only send serializes its payload before accepting the draft."
+  (let ((chat-buf (generate-new-buffer " *pi-image-send-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-send-input*"))
+        (path (make-temp-file "pi-image-send-" nil ".png"))
+        sent)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "image-bytes"))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state '(:model (:input ["text" "image"]))
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "send-image"
+                     (list :path path :mime "image/png" :base64-size 16 :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "send-image")
+            (cl-letf (((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (message &rest _) (setq sent message))))
+              (pi-coding-agent-send))
+            (should (string-empty-p (buffer-string)))
+            (should (equal (plist-get sent :text) ""))
+            (should (equal (plist-get sent :images) '("send-image")))
+            (should (equal (plist-get (car (plist-get sent :rpc-images)) :mimeType)
+                           "image/png"))
+            (should (= (ring-length (pi-coding-agent--input-ring)) 1)))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-message-limits-default-and-overrides ()
+  "Image count and aggregate limits use documented defaults and custom values."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (should (= pi-coding-agent-image-message-max-count 4))
+    (should (= pi-coding-agent-image-message-max-base64-bytes (* 12 1024 1024)))
+    (let ((path (make-temp-file "pi-image-limit-" nil ".png")))
+      (unwind-protect
+          (progn
+            (dolist (uuid '("a" "b"))
+              (puthash uuid (list :path path :mime "image/png"
+                                  :base64-size 8 :owned t)
+                       (pi-coding-agent--image-registry)))
+            (let ((pi-coding-agent-image-message-max-count 1))
+              (should-error
+               (pi-coding-agent--image-validate-envelope
+                '(:text "" :images ("a" "b")))
+               :type 'user-error))
+            (let ((pi-coding-agent-image-message-max-base64-bytes 10))
+              (should-error
+               (pi-coding-agent--image-validate-envelope
+                '(:text "" :images ("a" "b")))
+               :type 'user-error)))
+        (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-capture-error-preserves-draft ()
+  "A capture backend error leaves text, point, undo, and registry unchanged."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (buffer-enable-undo)
+    (insert "keep this")
+    (goto-char 5)
+    (let ((before (copy-tree buffer-undo-list))
+          (pi-coding-agent-image-capture-function
+           (lambda (_file) (user-error "capture failed"))))
+      (should-error (pi-coding-agent-attach-clipboard-image) :type 'user-error)
+      (should (equal (buffer-string) "keep this"))
+      (should (= (point) 5))
+      (should (equal buffer-undo-list before))
+      (should (= (hash-table-count (pi-coding-agent--image-registry)) 0)))))
+
+(ert-deftest pi-coding-agent-test-image-builtin-command-is-rejected-unchanged ()
+  "A local slash command cannot consume attached images."
+  (let ((chat-buf (generate-new-buffer " *pi-image-command-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-command-input*"))
+        (path (make-temp-file "pi-image-command-" nil ".png"))
+        shown)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "command-image"
+                     (list :path path :mime "image/png" :base64-size 4 :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "/compact ")
+            (pi-coding-agent--insert-image-token "command-image")
+            (let ((draft (buffer-string)))
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (setq shown (apply #'format format-string args)))))
+                (pi-coding-agent-send))
+              (should (equal (buffer-string) draft))
+              (should (string-match-p "cannot include images"
+                                      (downcase shown))))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-followup-drains-complete-envelope ()
+  "A queued image follow-up reaches prompt dispatch with its native payload."
+  (let ((chat-buf (generate-new-buffer " *pi-image-drain-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-drain-input*"))
+        (path (make-temp-file "pi-image-drain-" nil ".png"))
+        sent)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "pixels"))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "drain"
+                     (list :path path :mime "image/png"
+                           :base64-size 8 :owned t)
+                     (pi-coding-agent--image-registry)))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--status 'idle
+                  pi-coding-agent--followup-queue
+                  (list (list :text "queued"
+                              :images '("drain")
+                              :draft
+                              (propertize
+                               "[[pi-image:drain]]"
+                               'pi-coding-agent-image-uuid "drain"))))
+            (cl-letf (((symbol-function 'pi-coding-agent--send-prompt)
+                       (lambda (message &optional on-success &rest _)
+                         (setq sent message)
+                         (when on-success
+                           (funcall on-success))))
+                      ((symbol-function 'pi-coding-agent--display-user-message)
+                       #'ignore))
+              (pi-coding-agent--process-followup-queue))
+            (should-not pi-coding-agent--followup-queue)
+            (should (equal (plist-get sent :images) '("drain")))
+            (should (= (length (plist-get sent :rpc-images)) 1))
+            (should (equal
+                     (plist-get (car (plist-get sent :rpc-images)) :mimeType)
+                     "image/png"))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path)
+        (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-queued-serialization-failure-restores-fifo ()
+  "A broken queued image restores itself and later messages in FIFO order."
+  (let ((chat-buf (generate-new-buffer " *pi-image-queue-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-queue-input*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "missing"
+                     '(:path "/tmp/pi-queued-image-missing.png"
+                       :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry)))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--status 'idle
+                  pi-coding-agent--followup-queue
+                  (list "later"
+                        (list :text "first "
+                              :images '("missing")
+                              :draft (concat
+                                      "first "
+                                      (propertize
+                                       "[[pi-image:missing]]"
+                                       'pi-coding-agent-image-uuid "missing")))))
+            (cl-letf (((symbol-function 'message) #'ignore))
+              (pi-coding-agent--process-followup-queue))
+            (should-not pi-coding-agent--followup-queue))
+          (with-current-buffer input-buf
+            (should (string-prefix-p "first [[pi-image:missing]]\n\nlater"
+                                     (buffer-string)))
+            (should (equal
+                     (get-text-property 7 'pi-coding-agent-image-uuid)
+                     "missing"))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf))))
+
+(ert-deftest pi-coding-agent-test-image-capability-pending-send-cancels-on-edit ()
+  "An edit invalidates capability resolution and duplicate sends stay single."
+  (let ((chat-buf (generate-new-buffer " *pi-image-capability-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-capability-input*"))
+        (path (make-temp-file "pi-image-capability-" nil ".png"))
+        callback
+        (rpc-count 0)
+        (send-count 0))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--process 'mock-process
+                  pi-coding-agent--state nil
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "pending"
+                     (list :path path :mime "image/png" :base64-size 4 :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "pending")
+            (cl-letf (((symbol-function 'pi-coding-agent--rpc-async)
+                       (lambda (_proc _command cb)
+                         (setq rpc-count (1+ rpc-count)
+                               callback cb)))
+                      ((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (&rest _) (setq send-count (1+ send-count))))
+                      ((symbol-function 'message) #'ignore))
+              (pi-coding-agent-send)
+              (pi-coding-agent-send)
+              (should (= rpc-count 1))
+              (insert "edited")
+              (funcall callback
+                       '(:success t
+                         :data (:model (:input ["text" "image"])
+                                :isStreaming :json-false)))
+              (should (= send-count 0))
+              (should (string-suffix-p "edited" (buffer-string))))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-at-import-is-one-undo-transaction ()
+  "Undo restores the exact @ reference and redo restores the same image UUID."
+  (skip-unless (executable-find "magick"))
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (buffer-enable-undo)
+    (let* ((source (make-temp-file "pi-image-at-undo-" nil ".png"))
+           (reference (concat "@" source)))
+      (unwind-protect
+          (progn
+            (call-process "magick" nil nil nil "-size" "8x8" "xc:blue" source)
+            (insert (string-remove-suffix ".png" reference))
+            (setq buffer-undo-list nil)
+            (insert ".png")
+            (pi-coding-agent--accept-file-reference-completion
+             (point-min) (point-max) source)
+            (should
+             (pi-coding-agent-test-wait-until
+              (lambda () (string-match-p "\\`\\[\\[pi-image:" (buffer-string)))
+              5 0.01))
+            (let ((token (buffer-string))
+                  (uuid (get-text-property (point-min)
+                                           'pi-coding-agent-image-uuid)))
+              (undo-boundary)
+              (undo-only 1)
+              (should (equal (buffer-string) reference))
+              (let ((last-command 'undo))
+                (undo-redo))
+              (should (equal (buffer-string) token))
+              (should (equal
+                       (get-text-property (point-min)
+                                          'pi-coding-agent-image-uuid)
+                       uuid))
+              (should (gethash uuid (pi-coding-agent--image-registry)))))
+        (when (file-exists-p source) (delete-file source))))))
+
+(ert-deftest pi-coding-agent-test-image-completion-paths-share-accept-helper ()
+  "Automatic and CAPF completion both use the image accept helper."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          calls)
+      (pi-coding-agent-input-mode)
+      (insert "@")
+      (cl-letf (((symbol-function 'pi-coding-agent--get-project-files)
+                 (lambda () '("shot.png")))
+                ((symbol-function 'completing-read)
+                 (lambda (&rest _) "shot.png"))
+                ((symbol-function 'pi-coding-agent--accept-file-reference-completion)
+                 (lambda (start end candidate)
+                   (push (list start end candidate) calls))))
+        (pi-coding-agent--complete-file-reference)
+        (erase-buffer)
+        (insert "@shot.png")
+        (pi-coding-agent--file-reference-completion-exit "shot.png" 'finished))
+      (should (= (length calls) 2))
+      (should (equal (mapcar #'caddr calls) '("shot.png" "shot.png"))))))
+
+(ert-deftest pi-coding-agent-test-image-capf-uses-helm-real-candidate ()
+  "CAPF image import ignores Helm display decoration on its candidate."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          accepted)
+      (pi-coding-agent-input-mode)
+      (insert "@shot.png")
+      (cl-letf (((symbol-function 'pi-coding-agent--accepted-image-file)
+                 (lambda (candidate)
+                   (setq accepted candidate)
+                   "/tmp/shot.png"))
+                ((symbol-function 'pi-coding-agent--start-image-normalization)
+                 #'ignore))
+        (pi-coding-agent--file-reference-completion-exit
+         (propertize "shot.png " 'helm-realvalue "shot.png")
+         'finished))
+      (should (equal accepted "shot.png")))))
+
+(ert-deftest pi-coding-agent-test-image-nonimage-completion-stays-text ()
+  "A formally accepted non-image remains an ordinary @ reference."
+  (skip-unless (executable-find "magick"))
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let* ((source (make-temp-file "pi-image-nonimage-" nil ".txt"))
+           (reference (concat "@" source)))
+      (unwind-protect
+          (progn
+            (with-temp-file source (insert "ordinary text"))
+            (insert reference)
+            (cl-letf (((symbol-function 'message) #'ignore))
+              (pi-coding-agent--accept-file-reference-completion
+               (point-min) (point-max) source)
+              (should
+               (pi-coding-agent-test-wait-until
+                (lambda ()
+                  (null (cl-remove-if-not
+                         #'process-live-p
+                         pi-coding-agent--image-acquisition-processes)))
+                5 0.01)))
+            (should (equal (buffer-string) reference))
+            (should (= (hash-table-count (pi-coding-agent--image-registry)) 0)))
+        (when (file-exists-p source) (delete-file source))))))
+
+(ert-deftest pi-coding-agent-test-image-repeated-imports-own-independent-copies ()
+  "Repeated imports create distinct UUIDs independent from later source changes."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil))
+      (pi-coding-agent-input-mode))
+    (let ((source (make-temp-file "pi-image-repeat-" nil ".png"))
+          (pi-coding-agent-image-normalize-function
+           (lambda (input output)
+             (copy-file input output t)
+             (list :mime "image/png" :width 1 :height 1
+                   :size 3 :base64-size 4))))
+      (unwind-protect
+          (progn
+            (with-temp-file source (insert "one"))
+            (let* ((first (pi-coding-agent--import-image-file
+                           source 'file source))
+                   (second (pi-coding-agent--import-image-file
+                            source 'file source))
+                   (first-path (plist-get (pi-coding-agent--image-record first)
+                                          :path))
+                   (second-path (plist-get (pi-coding-agent--image-record second)
+                                           :path)))
+              (should-not (equal first second))
+              (should-not (equal first-path second-path))
+              (with-temp-file source (insert "changed"))
+              (delete-file source)
+              (should (equal (with-temp-buffer
+                               (insert-file-contents first-path)
+                               (buffer-string))
+                             "one"))
+              (should (equal (with-temp-buffer
+                               (insert-file-contents second-path)
+                               (buffer-string))
+                             "one"))))
+        (when (file-exists-p source) (delete-file source))))))
+
+(ert-deftest pi-coding-agent-test-image-preview-and-contextual-newline ()
+  "C-j previews only the point-local attachment and otherwise inserts a newline."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          (path (make-temp-file "pi-image-preview-" nil ".png"))
+          previewed)
+      (pi-coding-agent-input-mode)
+      (unwind-protect
+          (progn
+            (call-process "magick" nil nil nil "-size" "8x8" "xc:green" path)
+            (puthash "preview"
+                     (list :path path :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "preview")
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'require) (lambda (&rest _) t))
+                      ((symbol-function 'image-mode) #'ignore)
+                      ((symbol-function
+                        'cabins-agent-workspace-open-temporary-workbench)
+                       (lambda (buffer) (setq previewed buffer))))
+              (pi-coding-agent-input-newline-or-preview))
+            (should (buffer-live-p previewed))
+            (should (equal (buffer-file-name previewed) path))
+            (kill-buffer previewed)
+            (goto-char (point-max))
+            (insert " text")
+            (pi-coding-agent-input-newline-or-preview)
+            (should (string-suffix-p "\n" (buffer-string))))
+        (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-capability-resolution-sends-unchanged-draft ()
+  "A current capable response dispatches exactly one unchanged pending send."
+  (let ((chat-buf (generate-new-buffer " *pi-image-resolve-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-resolve-input*"))
+        (path (make-temp-file "pi-image-resolve-" nil ".png"))
+        callback
+        sent)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "pixels"))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--process 'mock-process
+                  pi-coding-agent--state nil
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "resolve"
+                     (list :path path :mime "image/png"
+                           :base64-size 12 :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "resolve")
+            (cl-letf (((symbol-function 'pi-coding-agent--rpc-async)
+                       (lambda (_proc _command cb) (setq callback cb)))
+                      ((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (message &rest _) (setq sent message))))
+              (pi-coding-agent-send)
+              (funcall callback
+                       '(:success t
+                         :data (:model (:input ["text" "image"])
+                                :isStreaming :json-false))))
+            (should (equal (plist-get sent :images) '("resolve")))
+            (should (string-empty-p (buffer-string)))
+            (should-not pi-coding-agent--image-pending-send))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-capability-stale-session-response-is-ignored ()
+  "A session transition invalidates a pending capability response."
+  (let ((chat-buf (generate-new-buffer " *pi-image-stale-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-stale-input*"))
+        (path (make-temp-file "pi-image-stale-" nil ".png"))
+        callback
+        sent)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--process 'mock-process
+                  pi-coding-agent--state nil
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "stale"
+                     (list :path path :mime "image/png"
+                           :base64-size 4 :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "stale")
+            (cl-letf (((symbol-function 'pi-coding-agent--rpc-async)
+                       (lambda (_proc _command cb) (setq callback cb)))
+                      ((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (&rest _) (setq sent t))))
+              (pi-coding-agent-send)
+              (with-current-buffer chat-buf
+                (pi-coding-agent--begin-session-transition 'new-process))
+              (funcall callback
+                       '(:success t
+                         :data (:model (:input ["text" "image"])
+                                :isStreaming :json-false))))
+            (should-not sent)
+            (should-not pi-coding-agent--image-pending-send)
+            (should-not (with-current-buffer chat-buf
+                          (plist-get pi-coding-agent--state :model)))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-text-only-model-preserves-draft ()
+  "A text-only model rejects image send without changing input or history."
+  (let ((chat-buf (generate-new-buffer " *pi-image-text-only-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-text-only-input*"))
+        (path (make-temp-file "pi-image-text-only-" nil ".png"))
+        shown)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state '(:model (:input ["text"]))
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "text-only"
+                     (list :path path :mime "image/png"
+                           :base64-size 4 :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "text-only")
+            (let ((draft (buffer-string)))
+              (cl-letf (((symbol-function 'message)
+                         (lambda (format-string &rest args)
+                           (setq shown (apply #'format format-string args)))))
+                (pi-coding-agent-send))
+              (should (equal (buffer-string) draft))
+              (should-not pi-coding-agent--input-ring)
+              (should (string-match-p "text-only" shown)))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-pi-slash-command-keeps-native-images ()
+  "A Pi-handled slash command carries its native image payload."
+  (let ((chat-buf (generate-new-buffer " *pi-image-slash-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-slash-input*"))
+        (path (make-temp-file "pi-image-slash-" nil ".png"))
+        sent)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "pixels"))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state '(:model (:input ["text" "image"]))
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "slash"
+                     (list :path path :mime "image/png"
+                           :base64-size 8 :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "/extension ")
+            (pi-coding-agent--insert-image-token "slash")
+            (cl-letf (((symbol-function 'pi-coding-agent--prepare-and-send)
+                       (lambda (message &rest _) (setq sent message))))
+              (pi-coding-agent-send))
+            (should (equal (plist-get sent :text) "/extension"))
+            (should (= (length (plist-get sent :rpc-images)) 1)))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-envelope-survives-logical-session-reset ()
+  "Resetting chat session state does not mutate input attachment ownership."
+  (let ((chat-buf (generate-new-buffer " *pi-image-reset-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-reset-input*"))
+        (path (make-temp-file "pi-image-reset-" nil ".png")))
+    (unwind-protect
+        (progn
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (puthash "reset"
+                     (list :path path :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "reset")
+            (pi-coding-agent--history-add (buffer-string)))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf)
+            (pi-coding-agent--reset-session-state))
+          (with-current-buffer input-buf
+            (should (gethash "reset" (pi-coding-agent--image-registry)))
+            (should (file-readable-p path))
+            (should (= (ring-length (pi-coding-agent--input-ring)) 1))
+            (should (equal
+                     (get-text-property (point-min)
+                                        'pi-coding-agent-image-uuid)
+                     "reset"))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path) (delete-file path)))))
+
+(ert-deftest pi-coding-agent-test-image-smart-yank-falls-back-but-explicit-attach-does-not ()
+  "Only smart yank inserts clipboard text when no image is available."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          (pi-coding-agent-image-capture-function
+           (lambda (_file) 'no-image)))
+      (pi-coding-agent-input-mode)
+      (kill-new "clipboard text")
+      (insert "before after")
+      (goto-char 8)
+      (pi-coding-agent-smart-yank)
+      (should (equal (buffer-string) "before clipboard textafter"))
+      (erase-buffer)
+      (insert "unchanged")
+      (pi-coding-agent-attach-clipboard-image)
+      (should (equal (buffer-string) "unchanged")))))
+
+(ert-deftest pi-coding-agent-test-image-smart-yank-success-does-not-yank-text ()
+  "Successful smart image capture starts normalization without text yank."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          normalized)
+      (pi-coding-agent-input-mode)
+      (kill-new "must not appear")
+      (insert "draft")
+      (let ((pi-coding-agent-image-capture-function
+             (lambda (file)
+               (with-temp-file file (insert "image")))))
+        (cl-letf (((symbol-function 'pi-coding-agent--start-image-normalization)
+                   (lambda (source kind original marker delete-source &optional _before)
+                     (setq normalized
+                           (list source kind original (marker-position marker)
+                                 delete-source)))))
+          (pi-coding-agent-smart-yank)))
+      (should normalized)
+      (should (eq (nth 1 normalized) 'clipboard))
+      (should (= (nth 3 normalized) (point-max)))
+      (should (nth 4 normalized))
+      (should (equal (buffer-string) "draft"))
+      (when (file-exists-p (car normalized))
+        (delete-file (car normalized))))))
+
+(ert-deftest pi-coding-agent-test-image-pngpaste-status-one-means-no-image ()
+  "Pngpaste status 1 means no image even when its target already exists."
+  (let ((target (make-temp-file "pi-image-empty-clipboard-" nil ".png")))
+    (unwind-protect
+        (cl-letf (((symbol-function 'executable-find)
+                   (lambda (_program) "/usr/local/bin/pngpaste"))
+                  ((symbol-function 'call-process)
+                   (lambda (&rest _) 1)))
+          (should (eq (pi-coding-agent--capture-clipboard-image target)
+                      'no-image)))
+      (when (file-exists-p target)
+        (delete-file target)))))
+
+(ert-deftest pi-coding-agent-test-image-completion-rejects-invalid-locality-without-edit ()
+  "Remote, missing, and unreadable accepted paths stay textual with feedback."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          messages)
+      (pi-coding-agent-input-mode)
+      (insert "@/ssh:host:/tmp/shot.png")
+      (cl-letf (((symbol-function 'message)
+                 (lambda (format-string &rest args)
+                   (push (apply #'format format-string args) messages))))
+        (pi-coding-agent--accept-file-reference-completion
+         (point-min) (point-max) "/ssh:host:/tmp/shot.png"))
+      (should (equal (buffer-string) "@/ssh:host:/tmp/shot.png"))
+      (should (string-match-p "Remote files" (car messages)))
+      (should (= (hash-table-count (pi-coding-agent--image-registry)) 0)))))
+
+(ert-deftest pi-coding-agent-test-image-thumbnails-have-stable-bounds ()
+  "Every enabled inline image uses the fixed thumbnail bounds."
+  (let ((chat-buf (generate-new-buffer " *pi-image-bounds-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-bounds-input*"))
+        (path-a (make-temp-file "pi-image-bounds-a-" nil ".png"))
+        (path-b (make-temp-file "pi-image-bounds-b-" nil ".png"))
+        image-arguments)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state '(:model (:input ["text" "image"]))))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "bounds-a" (list :path path-a :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (puthash "bounds-b" (list :path path-b :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (cl-letf (((symbol-function 'display-images-p) (lambda () t))
+                      ((symbol-function 'create-image)
+                       (lambda (&rest args)
+                         (push args image-arguments)
+                         '(image :type png))))
+              (pi-coding-agent--insert-image-token "bounds-a")
+              (insert " ")
+              (pi-coding-agent--insert-image-token "bounds-b"))
+            (should (>= (length image-arguments) 2))
+            (dolist (arguments image-arguments)
+              (should (= (plist-get (nthcdr 3 arguments) :max-width) 96))
+              (should (= (plist-get (nthcdr 3 arguments) :max-height) 64)))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (dolist (path (list path-a path-b))
+        (when (file-exists-p path)
+          (delete-file path))))))
+
+(ert-deftest pi-coding-agent-test-image-content-sniffing-ignores-extension ()
+  "Supported image bytes are recognized independently of the file extension."
+  (skip-unless (executable-find "magick"))
+  (let ((source (make-temp-file "pi-image-content-" nil ".txt")))
+    (unwind-protect
+        (progn
+          (should (eq 0 (call-process "magick" nil nil nil
+                                      "-size" "2x2" "xc:red"
+                                      (concat "png:" source))))
+          (should (equal (pi-coding-agent--image-mime-type source)
+                         "image/png")))
+      (when (file-exists-p source)
+        (delete-file source)))))
+
+(ert-deftest pi-coding-agent-test-image-history-isearch-preserves-token-properties ()
+  "History isearch restores image identity for entries and saved drafts."
+  (with-temp-buffer
+    (let ((pi-coding-agent-input-markdown-highlighting nil)
+          (path-a (make-temp-file "pi-image-isearch-a-" nil ".png"))
+          (path-b (make-temp-file "pi-image-isearch-b-" nil ".png")))
+      (pi-coding-agent-input-mode)
+      (unwind-protect
+          (progn
+            (puthash "isearch-a" (list :path path-a :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (puthash "isearch-b" (list :path path-b :mime "image/png" :owned t)
+                     (pi-coding-agent--image-registry))
+            (pi-coding-agent--insert-image-token "isearch-a")
+            (pi-coding-agent--history-add (buffer-string))
+            (erase-buffer)
+            (pi-coding-agent--insert-image-token "isearch-b")
+            (setq pi-coding-agent--history-isearch-saved-input (buffer-string))
+            (pi-coding-agent--history-isearch-goto 0)
+            (should (equal (get-text-property
+                            (point-min) 'pi-coding-agent-image-uuid)
+                           "isearch-a"))
+            (pi-coding-agent--history-isearch-goto nil)
+            (should (equal (get-text-property
+                            (point-min) 'pi-coding-agent-image-uuid)
+                           "isearch-b")))
+        (dolist (path (list path-a path-b))
+          (when (file-exists-p path)
+            (delete-file path)))))))
+
+(ert-deftest pi-coding-agent-test-image-send-undo-restores-accepted-draft ()
+  "Undo after image send restores the same propertized accepted draft."
+  (let ((chat-buf (generate-new-buffer " *pi-image-send-undo-chat*"))
+        (input-buf (generate-new-buffer " *pi-image-send-undo-input*"))
+        (path (make-temp-file "pi-image-send-undo-" nil ".png")))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "pixels"))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--input-buffer input-buf
+                  pi-coding-agent--state '(:model (:input ["text" "image"]))
+                  pi-coding-agent--status 'idle))
+          (with-current-buffer input-buf
+            (let ((pi-coding-agent-input-markdown-highlighting nil))
+              (pi-coding-agent-input-mode))
+            (buffer-enable-undo)
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (puthash "send-undo"
+                     (list :path path :mime "image/png"
+                           :base64-size 8 :owned t)
+                     (pi-coding-agent--image-registry))
+            (insert "inspect ")
+            (pi-coding-agent--insert-image-token "send-undo")
+            (setq buffer-undo-list nil)
+            (cl-letf (((symbol-function 'pi-coding-agent--prepare-and-send)
+                       #'ignore))
+              (pi-coding-agent-send))
+            (should (string-empty-p (buffer-string)))
+            (undo-boundary)
+            (undo-only 1)
+            (should (string-prefix-p "inspect [[pi-image:send-undo]]"
+                                     (buffer-string)))
+            (should (equal
+                     (get-text-property 9 'pi-coding-agent-image-uuid)
+                     "send-undo"))
+            (let ((last-command 'undo))
+              (undo-redo))
+            (should (string-empty-p (buffer-string)))))
+      (kill-buffer input-buf)
+      (kill-buffer chat-buf)
+      (when (file-exists-p path)
+        (delete-file path)))))
 
 (provide 'pi-coding-agent-input-test)
 ;;; pi-coding-agent-input-test.el ends here

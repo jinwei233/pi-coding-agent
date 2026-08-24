@@ -48,6 +48,8 @@
 
 ;; Forward references for functions in other modules
 (declare-function pi-coding-agent-compact "pi-coding-agent-menu" (&optional custom-instructions))
+(declare-function pi-coding-agent--prepare-image-envelope-for-rpc
+                  "pi-coding-agent-input" (envelope))
 ;; Declare the Emacs 29 minimum API.  Adding Emacs 30's optional TAG here makes
 ;; its byte compiler pad three-argument calls, producing incompatible bytecode.
 (declare-function treesit-parser-create "treesit.c"
@@ -710,7 +712,9 @@ follow-up as a fresh prompt.")
       (pi-coding-agent--finalize-live-tool-blocks 'pi-coding-agent-tool-block-error)
       (when pi-coding-agent--tool-args-cache
         (clrhash pi-coding-agent--tool-args-cache))
-      ;; Abort means "stop everything" — discard queued follow-ups too
+      ;; Abort stops Pi-owned work, but local follow-ups were never accepted
+      ;; by Pi and must remain editable.  This is idempotent once the queue
+      ;; has transferred to the input buffer.
       (when pi-coding-agent--aborted
         (when pi-coding-agent--transient-tool-pairs
           (clrhash pi-coding-agent--transient-tool-pairs))
@@ -723,7 +727,8 @@ follow-up as a fresh prompt.")
             (delete-region (point) (point-max))
             (insert "\n\n" (propertize "[Aborted]" 'face 'error) "\n")))
         (pi-coding-agent--set-aborted nil)
-        (pi-coding-agent--clear-followup-queue))
+        (unless (pi-coding-agent--restore-followup-queue-to-input)
+          (message "Pi: Follow-up recovery is pending because the input buffer is unavailable")))
       (pi-coding-agent--with-scroll-preservation
         (save-excursion
           (goto-char (point-max))
@@ -760,21 +765,46 @@ Returns non-nil if TEXT matched a built-in command and was handled."
             (_ (funcall handler)))
           t)))))
 
-(defun pi-coding-agent--prepare-and-send (text &optional queued)
-  "Prepare chat buffer state and send TEXT to pi.
+(defun pi-coding-agent--prepare-and-send (message &optional queued)
+  "Prepare chat buffer state and send MESSAGE to pi.
 Built-in slash commands are dispatched locally via the dispatch table.
 Other slash commands (extensions, skills, prompts) are sent to pi without
 local transcript display.  Regular text is displayed after prompt preflight
 accepts it.
-When QUEUED is non-nil, TEXT is the oldest local follow-up and is removed
+When QUEUED is non-nil, MESSAGE is the oldest local follow-up and is removed
 from the queue only after prompt preflight succeeds.
 Must be called with chat buffer current.  Pi events own streaming/idle turn
 transitions; prompt submission marks the local pre-event window as busy."
   (pi-coding-agent--invalidate-history-loads)
-  (cond
+  (let* ((queued-message message)
+         (text (pi-coding-agent--message-text message))
+         (images (pi-coding-agent--message-images message))
+         transcript)
+    (when (and images (null (plist-get message :rpc-images)))
+      (condition-case error-data
+          (setq message
+                (if (buffer-live-p pi-coding-agent--input-buffer)
+                    (with-current-buffer pi-coding-agent--input-buffer
+                      (pi-coding-agent--prepare-image-envelope-for-rpc message))
+                  (user-error "Pi: Image message has no recovery input buffer")))
+        (user-error
+         (when queued
+           (pi-coding-agent--restore-followup-queue-to-input))
+         (message "%s" (error-message-string error-data))
+         (setq message nil))))
+    (when message
+      (setq transcript (pi-coding-agent--message-transcript-text message)))
+    (cond
+   ((null message))
    ;; Built-in slash commands are interactive client actions, not durable queued
    ;; prompts.  Busy input refuses new ones; this guard keeps stale queued items
    ;; from running later out of context.
+   ((and images (pi-coding-agent--builtin-command-text-p text))
+    (if queued
+        (pi-coding-agent--restore-followup-queue-to-input)
+      (pi-coding-agent--restore-input-text message))
+    (message "Pi: Local /%s commands cannot include images"
+             (pi-coding-agent--builtin-command-name text)))
    ((and queued (pi-coding-agent--builtin-command-text-p text))
     (pi-coding-agent--restore-followup-queue-to-input)
     (message "Pi: Cannot run queued /%s command automatically"
@@ -784,43 +814,43 @@ transitions; prompt submission marks the local pre-event window as busy."
    ;; Other slash commands: don't display locally, send to pi.
    ((string-prefix-p "/" text)
     (pi-coding-agent--send-prompt
-     text
+     message
      (when queued
-       (lambda () (pi-coding-agent--drop-followup text)))
+       (lambda () (pi-coding-agent--drop-followup queued-message)))
      (if queued
          #'pi-coding-agent--restore-followup-queue-to-input
-       (lambda () (pi-coding-agent--restore-input-text text)))
+       (lambda () (pi-coding-agent--restore-input-text message)))
      #'pi-coding-agent--schedule-followup-queue-processing))
    ;; Regular text is displayed only after prompt preflight accepts it.  That
    ;; keeps rejected prompts out of the transcript and lets us restore them to
    ;; the input buffer for user recovery.
    (queued
     (pi-coding-agent--send-prompt
-     text
+     message
      (lambda ()
-       (when (pi-coding-agent--drop-followup text)
-         (pi-coding-agent--display-user-message text (current-time))
+       (when (pi-coding-agent--drop-followup queued-message)
+         (pi-coding-agent--display-user-message transcript (current-time))
          (setq pi-coding-agent--local-user-message text)
          (setq pi-coding-agent--assistant-header-shown nil)))
      #'pi-coding-agent--restore-followup-queue-to-input
      #'pi-coding-agent--schedule-followup-queue-processing))
    (t
     (pi-coding-agent--send-prompt
-     text
+     message
      (lambda ()
-       (pi-coding-agent--display-user-message text (current-time))
+       (pi-coding-agent--display-user-message transcript (current-time))
        (setq pi-coding-agent--local-user-message text)
        (setq pi-coding-agent--assistant-header-shown nil))
-     (lambda () (pi-coding-agent--restore-input-text text))
-     #'pi-coding-agent--schedule-followup-queue-processing))))
+     (lambda () (pi-coding-agent--restore-input-text message))
+     #'pi-coding-agent--schedule-followup-queue-processing)))))
 
 (defun pi-coding-agent--process-followup-queue ()
   "Send the oldest follow-up only when it is safe to become the next prompt.
 Messages are processed in FIFO order and dropped only after preflight accepts
 them."
   (when (pi-coding-agent--ready-to-drain-followups-p)
-    (when-let* ((text (pi-coding-agent--peek-followup)))
-      (pi-coding-agent--prepare-and-send text 'queued))))
+    (when-let* ((message (pi-coding-agent--peek-followup)))
+      (pi-coding-agent--prepare-and-send message 'queued))))
 
 (defun pi-coding-agent--display-compaction-failure (error-message)
   "Display failed compaction ERROR-MESSAGE without changing the queue."
@@ -845,8 +875,8 @@ Status transitions are handled by `pi-coding-agent--update-state-from-event'."
       (pi-coding-agent--set-activity-phase
        (pi-coding-agent--post-compaction-activity-phase))
       (message "Pi: Compaction cancelled")
-      ;; Clear queue on abort (user wanted to stop).
-      (pi-coding-agent--clear-followup-queue))
+      (unless (pi-coding-agent--restore-followup-queue-to-input)
+        (message "Pi: Follow-up recovery is pending because the input buffer is unavailable")))
      (result
       (pi-coding-agent--handle-compaction-success
        (plist-get result :tokensBefore)
@@ -1270,15 +1300,17 @@ Updates buffer-local state and renders display updates."
                  (timestamp (plist-get message :timestamp))
                  (text (when content
                          (pi-coding-agent--extract-user-message-text content)))
+                 (display-text (when content
+                                 (pi-coding-agent--extract-user-message-display content)))
                  (local-msg pi-coding-agent--local-user-message))
             ;; Clear local tracking
             (setq pi-coding-agent--local-user-message nil)
             ;; Display if: no local message, OR pi's message differs (expanded template)
-            (when (and text
+            (when (and display-text
                        (or (null local-msg)
-                           (not (string= text local-msg))))
+                           (not (string= (or text "") local-msg))))
               (pi-coding-agent--display-user-message
-               text
+               display-text
                (pi-coding-agent--ms-to-time timestamp))
               ;; Reset so next assistant message shows its header
               (setq pi-coding-agent--assistant-header-shown nil))))
@@ -1337,6 +1369,20 @@ Updates buffer-local state and renders display updates."
        ;; Display error if message ended with error (e.g., API error)
        (when (equal (plist-get message :stopReason) "error")
          (pi-coding-agent--display-error (plist-get message :errorMessage)))
+       ;; Text arrives incrementally, while native image blocks are complete
+       ;; only on message_end.
+       (when assistant-p
+         (let ((images
+                (delq nil
+                      (mapcar
+                       (lambda (block)
+                         (when (equal (plist-get block :type) "image")
+                           (pi-coding-agent--output-image-marker block)))
+                       (pi-coding-agent--content-block-list
+                        (plist-get message :content))))))
+           (when images
+             (pi-coding-agent--append-to-chat
+              (concat "\n" (string-join images "\n") "\n")))))
        ;; Refresh header so cost and context % update promptly.
        (when assistant-p
          (pi-coding-agent--refresh-header)))
@@ -1784,6 +1830,21 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
        (pi-coding-agent--render-safe-string (plist-get block :text))))
    (pi-coding-agent--content-block-list content)
    "\n"))
+
+(defun pi-coding-agent--tool-result-images (content)
+  "Return native image blocks from tool result CONTENT."
+  (seq-filter
+   (lambda (block)
+     (equal (plist-get block :type) "image"))
+   (pi-coding-agent--content-block-list content)))
+
+(defun pi-coding-agent--insert-output-image-blocks (blocks &optional defer)
+  "Insert native image BLOCKS at point using Output rendering.
+When DEFER is non-nil, leave image-spec creation to the chat jit pass."
+  (dolist (block blocks)
+    (unless (bolp)
+      (insert "\n"))
+    (insert (pi-coding-agent--output-image-marker block defer) "\n")))
 
 (defun pi-coding-agent--tool-generic-summary (data)
   "Return a fixed conservative one-line summary for generic DATA."
@@ -2375,6 +2436,21 @@ Returns the concatenated text, or nil if empty."
   (let ((text (pi-coding-agent--extract-text-from-content content)))
     (unless (string-empty-p text) text)))
 
+(defun pi-coding-agent--extract-user-message-display (content &optional defer)
+  "Return visible user CONTENT with one rendered marker per native image.
+When DEFER is non-nil, defer image-spec creation to the chat jit pass."
+  (let ((blocks (if (vectorp content) (append content nil) content))
+        (parts nil))
+    (dolist (block blocks)
+      (pcase (plist-get block :type)
+        ("text" (push (or (plist-get block :text) "") parts))
+        ("image"
+         (push (concat "\n"
+                       (pi-coding-agent--output-image-marker block defer))
+               parts))))
+    (let ((display (apply #'concat (nreverse parts))))
+      (unless (string-empty-p display) display))))
+
 (defun pi-coding-agent--get-tail-lines (content n)
   "Get last N non-blank lines from CONTENT by scanning backward.
 Blank lines are included in the returned content but do not count
@@ -2667,6 +2743,7 @@ if none exists, render the result at point without a live overlay."
           :offset (pi-coding-agent--tool-arg-get args :offset)
           :line-count lines
           :summary summary
+          :images (pi-coding-agent--tool-result-images content)
           :detail-locator detail-locator)))
 
 (defun pi-coding-agent--insert-tool-summary (record)
@@ -2683,10 +2760,14 @@ if none exists, render the result at point without a live overlay."
      'pi-coding-agent-tool-toggle t
      'pi-coding-agent-tool-call-id tool-call-id
      'pi-coding-agent-summary summary
+     'pi-coding-agent-tool-images (plist-get record :images)
      'pi-coding-agent-expanded nil)
     (when (< (+ tab-start (length "TAB details")) (length summary))
       (insert (substring summary (+ tab-start (length "TAB details")))))
-    (insert "\n")))
+    (insert "\n")
+    (pi-coding-agent--insert-output-image-blocks
+     (plist-get record :images)
+     pi-coding-agent--defer-history-postprocessing)))
 
 (defun pi-coding-agent--render-tool-detail-inline
     (block tool-call-id summary)
@@ -2694,8 +2775,9 @@ if none exists, render the result at point without a live overlay."
   (let* ((pair (pi-coding-agent--resolve-tool-detail-pair tool-call-id))
          (detail (and pair (pi-coding-agent--tool-detail-text pair)))
          (tool-call (plist-get pair :tool-call))
+         (tool-result (plist-get pair :tool-result))
          (name (or (plist-get tool-call :name)
-                   (plist-get (plist-get pair :tool-result) :toolName)))
+                   (plist-get tool-result :toolName)))
          (args (plist-get tool-call :arguments))
          (lang (pi-coding-agent--path-to-language
                 (pi-coding-agent--tool-path-string
@@ -2710,6 +2792,10 @@ if none exists, render the result at point without a live overlay."
       (goto-char (marker-position header-end))
       (delete-region (point) (marker-position end-marker))
       (pi-coding-agent--insert-rendered-tool-content detail lang edit-p)
+      (pi-coding-agent--insert-output-image-blocks
+       (pi-coding-agent--tool-result-images
+        (plist-get tool-result :content))
+       pi-coding-agent--defer-history-postprocessing)
       (insert-text-button
        "[-]"
        'action #'pi-coding-agent--toggle-tool-summary
@@ -2717,6 +2803,9 @@ if none exists, render the result at point without a live overlay."
        'pi-coding-agent-tool-toggle t
        'pi-coding-agent-tool-call-id tool-call-id
        'pi-coding-agent-summary summary
+       'pi-coding-agent-tool-images
+       (pi-coding-agent--tool-result-images
+        (plist-get tool-result :content))
        'pi-coding-agent-expanded t)
       (insert "\n")
       (set-marker end-marker (point))
@@ -2728,6 +2817,7 @@ if none exists, render the result at point without a live overlay."
   "Expand, collapse, or open the lazily resolved detail for BUTTON."
   (let* ((tool-call-id (button-get button 'pi-coding-agent-tool-call-id))
          (summary (button-get button 'pi-coding-agent-summary))
+         (images (button-get button 'pi-coding-agent-tool-images))
          (expanded (button-get button 'pi-coding-agent-expanded))
          (overlay (seq-find
                    (lambda (candidate)
@@ -2745,7 +2835,9 @@ if none exists, render the result at point without a live overlay."
             (goto-char (marker-position header-end))
             (delete-region (point) (marker-position end-marker))
             (pi-coding-agent--insert-tool-summary
-             (list :tool-call-id tool-call-id :summary summary))
+             (list :tool-call-id tool-call-id
+                   :summary summary
+                   :images images))
             (set-marker end-marker (point))
             (pi-coding-agent--tool-block-refresh-overlay block)
             (overlay-put overlay 'pi-coding-agent-tool-detail-expanded nil)))
@@ -2805,8 +2897,15 @@ real live and history tools always carry an id and use the summary renderer."
     (if tool-call-id
         (pi-coding-agent--display-tool-end-summary
          tool-name args content details is-error block)
-      (pi-coding-agent--display-tool-end-legacy
-       tool-name args content details is-error block))))
+      (progn
+        (pi-coding-agent--display-tool-end-legacy
+         tool-name args content details is-error block)
+        (let ((inhibit-read-only t))
+          (save-excursion
+            (goto-char (point-max))
+            (pi-coding-agent--insert-output-image-blocks
+             (pi-coding-agent--tool-result-images content)
+             pi-coding-agent--defer-history-postprocessing)))))))
 
 (defun pi-coding-agent--ranges-excluding-property (start end prop)
   "Return contiguous ranges in START..END where PROP is nil."
@@ -5768,7 +5867,8 @@ MESSAGE has no visible text content."
      ((stringp content)
       (unless (string-empty-p content) content))
      ((vectorp content)
-      (pi-coding-agent--extract-user-message-text content))
+      (pi-coding-agent--extract-user-message-display
+       content pi-coding-agent--defer-history-postprocessing))
      (t nil))))
 
 (defun pi-coding-agent--completed-thinking-rendered-from-normalized
@@ -5917,6 +6017,11 @@ RESULTS maps toolCallId strings to matching toolResult messages."
                (pi-coding-agent--render-history-thinking
                 (pi-coding-agent--render-safe-string
                  (plist-get block :thinking))))
+              ("image"
+               (flush-text)
+               (pi-coding-agent--render-history-text
+                (pi-coding-agent--output-image-marker
+                 block pi-coding-agent--defer-history-postprocessing)))
               ("toolCall"
                (flush-text)
                (pi-coding-agent--render-history-tool
