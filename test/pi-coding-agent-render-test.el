@@ -1012,6 +1012,158 @@ agent_end + next section's leading newline must not create triple newlines."
               (should (equal (buffer-string) expected)))))
       (kill-buffer chat))))
 
+(ert-deftest pi-coding-agent-test-stable-async-history-keeps-visible-tail ()
+  "Stable async replay leaves the visible tail unchanged until final commit."
+  (let* ((messages
+          [(:role "user" :content [(:type "text" :text "Old question")]
+            :timestamp 1704067200000)
+           (:role "assistant" :content [(:type "text" :text "Old answer")]
+            :timestamp 1704067201000)
+           (:role "user" :content [(:type "text" :text "Latest question")]
+            :timestamp 1704067202000)
+           (:role "assistant" :content [(:type "text" :text "Latest answer")]
+            :timestamp 1704067203000)])
+         (expected
+          (with-temp-buffer
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--display-session-history messages (current-buffer))
+            (buffer-string)))
+         (chat (generate-new-buffer " *pi-stable-async-history*"))
+         (window (selected-window))
+         (original-buffer (window-buffer))
+         queue
+         completion)
+    (unwind-protect
+        (progn
+          (set-window-buffer window chat)
+          (with-current-buffer chat
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (erase-buffer)
+              (dotimes (index 20)
+                (insert (format "local tail %02d\n" index))))
+            (setq-local pi-coding-agent-history-replay-stable-viewport t)
+            (goto-char (point-max))
+            (set-window-point window (point-max))
+            (set-window-start window (line-beginning-position -4))
+            (let ((initial-content (buffer-string))
+                  (initial-start (window-start window))
+                  (pi-coding-agent-history-replay-slice-size 1)
+                  (pi-coding-agent-history-replay-slice-seconds 10))
+              (cl-letf (((symbol-function 'run-at-time)
+                         (lambda (_delay _repeat function &rest args)
+                           (let ((scheduled (cons function args)))
+                             (setq queue (append queue (list scheduled)))
+                             scheduled)))
+                        ((symbol-function 'timerp) (lambda (_timer) nil)))
+                (pi-coding-agent--display-session-history-async
+                 messages chat
+                 (lambda (success) (setq completion success)))
+                (let ((first (pop queue)))
+                  (apply (car first) (cdr first)))
+                (should (equal (buffer-string) initial-content))
+                (should (= (window-start window) initial-start))
+                (should-not completion)
+                (while queue
+                  (let ((scheduled (pop queue)))
+                    (apply (car scheduled) (cdr scheduled))))
+                (should completion)
+                (should (equal (buffer-string) expected))
+                (should (= (window-point window) (point-max)))
+                (should (treesit-parser-list nil nil t))
+                (font-lock-ensure (point-min) (point-max))
+                (with-selected-window window
+                  (goto-char (point-max))
+                  (recenter -1))))))
+      (when (window-live-p window)
+        (set-window-buffer window original-buffer))
+      (kill-buffer chat))))
+
+(ert-deftest pi-coding-agent-test-cancel-stable-history-keeps-local-tail ()
+  "Cancelling stable replay discards staging and preserves visible history."
+  (let ((messages
+         [(:role "user" :content [(:type "text" :text "First")]
+           :timestamp 1704067200000)
+          (:role "assistant" :content [(:type "text" :text "Second")]
+           :timestamp 1704067201000)])
+        (chat (generate-new-buffer " *pi-cancel-stable-history*"))
+        queue
+        completions)
+    (unwind-protect
+        (with-current-buffer chat
+          (pi-coding-agent-chat-mode)
+          (let ((inhibit-read-only t))
+            (erase-buffer)
+            (insert "local tail"))
+          (setq-local pi-coding-agent-history-replay-stable-viewport t)
+          (let ((pi-coding-agent-history-replay-slice-size 1)
+                (pi-coding-agent-history-replay-slice-seconds 10))
+            (cl-letf (((symbol-function 'run-at-time)
+                       (lambda (_delay _repeat function &rest args)
+                         (let ((scheduled (cons function args)))
+                           (setq queue (append queue (list scheduled)))
+                           scheduled)))
+                      ((symbol-function 'timerp) (lambda (_timer) nil)))
+              (pi-coding-agent--display-session-history-async
+               messages chat
+               (lambda (success) (push success completions)))
+              (let ((first (pop queue)))
+                (apply (car first) (cdr first)))
+              (should (equal (buffer-string) "local tail"))
+              (pi-coding-agent--cancel-history-replay chat)
+              (should (equal (buffer-string) "local tail"))
+              (let ((stale (pop queue)))
+                (apply (car stale) (cdr stale)))
+              (should (equal completions '(nil))))))
+      (kill-buffer chat))))
+
+(ert-deftest pi-coding-agent-test-stable-history-transfers-render-state ()
+  "Stable replay transfers overlays and marker-backed state to the live chat."
+  (let ((chat (generate-new-buffer " *pi-stable-history-target*"))
+        (staging (generate-new-buffer " *pi-stable-history-staging*"))
+        (messages [(:role "assistant"
+                    :content [(:type "text" :text "Authoritative")])])
+        completion)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (insert "local tail")))
+          (with-current-buffer staging
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (insert "authoritative history"))
+            (overlay-put (make-overlay (point-min) (point-max))
+                         'pi-coding-agent-tool-block t)
+            (pi-coding-agent--set-canonical-messages messages)
+            (move-marker pi-coding-agent--hot-tail-start
+                         (point-min) (current-buffer)))
+          (let ((job
+                 (pi-coding-agent--make-history-replay-job
+                  :buffer staging
+                  :target-buffer chat
+                  :stable-viewport t
+                  :completion
+                  (lambda (success) (setq completion success)))))
+            (with-current-buffer chat
+              (setq pi-coding-agent--history-replay-job job))
+            (pi-coding-agent--finish-history-replay-job job t))
+          (should completion)
+          (should-not (buffer-live-p staging))
+          (with-current-buffer chat
+            (should (equal (buffer-string) "authoritative history"))
+            (should (equal pi-coding-agent--canonical-messages messages))
+            (should (eq (marker-buffer pi-coding-agent--hot-tail-start) chat))
+            (should
+             (seq-some
+              (lambda (overlay)
+                (overlay-get overlay 'pi-coding-agent-tool-block))
+              (overlays-in (point-min) (point-max))))))
+      (when (buffer-live-p staging)
+        (kill-buffer staging))
+      (kill-buffer chat))))
+
 (ert-deftest pi-coding-agent-test-async-history-replay-cancels-stale-slices ()
   "Cancelling asynchronous history replay prevents later slices from writing."
   (let ((messages

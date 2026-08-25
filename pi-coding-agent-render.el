@@ -92,13 +92,22 @@ completion semantics."
   :type 'boolean
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-history-replay-stable-viewport nil
+  "Whether asynchronous history replay keeps visible content stable.
+When non-nil, history is rendered in a hidden staging buffer and committed
+after the complete replay.  This keeps the current buffer readable while the
+event-loop-friendly replay runs in the background.  The option is intended to
+be enabled buffer-locally by hosts that already show a useful history tail."
+  :type 'boolean
+  :group 'pi-coding-agent)
+
 (defvar pi-coding-agent-history-replay-force-asynchronous nil
   "Non-nil forces sliced replay in batch tests and benchmarks.")
 
 (cl-defstruct (pi-coding-agent--history-replay-job
                (:constructor pi-coding-agent--make-history-replay-job))
-  buffer messages results index previous-role generation validator completion timer
-  finished)
+  buffer target-buffer stable-viewport messages results index previous-role
+  generation validator completion timer finished)
 
 (defvar-local pi-coding-agent--history-replay-job nil
   "Current asynchronous history replay job for this chat buffer.")
@@ -117,6 +126,36 @@ Streaming table decoration is comparatively expensive because it queries the
 current message with tree-sitter.  Most assistant text is not table content, so
 we track whether a pipe has appeared since the last decoration attempt and skip
 the query when no table can be present.")
+
+(defconst pi-coding-agent--history-render-state-variables
+  '(pi-coding-agent--canonical-messages
+    pi-coding-agent--hot-tail-start
+    pi-coding-agent--streaming-marker
+    pi-coding-agent--in-code-block
+    pi-coding-agent--in-thinking-block
+    pi-coding-agent--thinking-marker
+    pi-coding-agent--thinking-start-marker
+    pi-coding-agent--thinking-raw
+    pi-coding-agent--thinking-raw-chunks
+    pi-coding-agent--thinking-pending-chars
+    pi-coding-agent--thinking-stream-started
+    pi-coding-agent--line-parse-state
+    pi-coding-agent--message-start-marker
+    pi-coding-agent--streaming-scroll-generation
+    pi-coding-agent--streaming-scroll-anchor-marker
+    pi-coding-agent--tool-args-cache
+    pi-coding-agent--transient-tool-pairs
+    pi-coding-agent--tool-detail-buffers
+    pi-coding-agent--live-tool-blocks
+    pi-coding-agent--tool-block-order-counter
+    pi-coding-agent--thinking-block-order-counter
+    pi-coding-agent--pending-tool-overlay
+    pi-coding-agent--assistant-header-shown
+    pi-coding-agent--streaming-table-candidate
+    pi-coding-agent--last-table-display-width
+    pi-coding-agent--table-decoration-pending
+    pi-coding-agent--visible-string-cache)
+  "Buffer-local state that belongs to rendered transcript text.")
 
 (defun pi-coding-agent--history-postprocessing-deferred-p ()
   "Return non-nil when history display post-processing is currently deferred."
@@ -6314,6 +6353,71 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
             (pi-coding-agent--display-history-messages messages)))
         (pi-coding-agent--finish-session-history-display)))))
 
+(defun pi-coding-agent--discard-treesit-state-before-text-swap (buffer)
+  "Remove BUFFER-local tree-sitter state before swapping its text."
+  (with-current-buffer buffer
+    (let ((parsers (treesit-parser-list nil nil t)))
+      (dolist (overlay (overlays-in (point-min) (point-max)))
+        (when-let* ((parser (overlay-get overlay 'treesit-parser)))
+          (cl-pushnew parser parsers)
+          (delete-overlay overlay)))
+      (dolist (parser parsers)
+        ;; Deleting a host parser may also invalidate its local embedded
+        ;; parsers, so tolerate those already-deleted objects in PARSERS.
+        (ignore-errors (treesit-parser-delete parser)))
+      (setq treesit-primary-parser nil))))
+
+(defun pi-coding-agent--restore-treesit-state-after-text-swap ()
+  "Recreate tree-sitter state for the current Markdown chat buffer."
+  (when (derived-mode-p 'md-ts-mode)
+    (let ((inline-parser (treesit-parser-create 'markdown-inline)))
+      (treesit-parser-set-included-ranges
+       inline-parser `((,(point-min) . ,(point-min)))))
+    (treesit-parser-create 'markdown)
+    (md-ts-setup)))
+
+(defun pi-coding-agent--commit-staged-history (job)
+  "Commit the completed staged history in JOB to its target buffer."
+  (let* ((render-buffer (pi-coding-agent--history-replay-job-buffer job))
+         (target-buffer
+          (pi-coding-agent--history-replay-job-target-buffer job))
+         (windows (get-buffer-window-list target-buffer nil t))
+         (target-max (with-current-buffer target-buffer (point-max)))
+         (window-state
+          (mapcar
+           (lambda (window)
+             (list window
+                   (= (window-point window) target-max)
+                   (window-point window)
+                   (window-start window)))
+           windows)))
+    (with-current-buffer target-buffer
+      (let ((inhibit-read-only t))
+        (pi-coding-agent--clear-render-artifacts)))
+    (pi-coding-agent--discard-treesit-state-before-text-swap target-buffer)
+    (pi-coding-agent--discard-treesit-state-before-text-swap render-buffer)
+    (with-current-buffer target-buffer
+      (let ((inhibit-read-only t)
+            (inhibit-modification-hooks t)
+            (inhibit-redisplay t))
+        (buffer-swap-text render-buffer))
+      (dolist (variable pi-coding-agent--history-render-state-variables)
+        (set (make-local-variable variable)
+             (buffer-local-value variable render-buffer)))
+      (pi-coding-agent--restore-treesit-state-after-text-swap))
+    (dolist (state window-state)
+      (let ((window (nth 0 state))
+            (following (nth 1 state))
+            (saved-point (nth 2 state))
+            (saved-start (nth 3 state)))
+        (when (window-live-p window)
+          (if following
+              (set-window-point
+               window (with-current-buffer target-buffer (point-max)))
+            (let ((maximum (with-current-buffer target-buffer (point-max))))
+              (set-window-point window (min saved-point maximum))
+              (set-window-start window (min saved-start maximum) t))))))))
+
 (defun pi-coding-agent--finish-history-replay-job (job success)
   "Finish asynchronous history replay JOB with SUCCESS status."
   (unless (pi-coding-agent--history-replay-job-finished job)
@@ -6321,20 +6425,45 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
     (when-let* ((timer (pi-coding-agent--history-replay-job-timer job))
                 ((timerp timer)))
       (cancel-timer timer))
-    (let ((buffer (pi-coding-agent--history-replay-job-buffer job)))
-      (when (buffer-live-p buffer)
-        (with-current-buffer buffer
+    (let ((buffer (pi-coding-agent--history-replay-job-buffer job))
+          (target-buffer
+           (pi-coding-agent--history-replay-job-target-buffer job)))
+      (when (and success
+                 (pi-coding-agent--history-replay-job-stable-viewport job)
+                 (buffer-live-p buffer)
+                 (buffer-live-p target-buffer))
+        (condition-case err
+            (pi-coding-agent--commit-staged-history job)
+          (error
+           (setq success nil)
+           (message "Pi: Failed to commit rendered session history - %s"
+                    (error-message-string err)))))
+      (when (buffer-live-p target-buffer)
+        (with-current-buffer target-buffer
           (when (eq pi-coding-agent--history-replay-job job)
-            (setq pi-coding-agent--history-replay-job nil)))))
+            (setq pi-coding-agent--history-replay-job nil))))
+      (when (and (not (eq buffer target-buffer))
+                 (buffer-live-p buffer))
+        ;; Render-owned markers, overlays, and caches now belong to TARGET-BUFFER.
+        ;; The normal chat cleanup would clear those shared objects after the
+        ;; text swap, so discard the empty staging shell without that hook.
+        (with-current-buffer buffer
+          (remove-hook 'kill-buffer-hook
+                       #'pi-coding-agent--cleanup-on-kill t))
+        (let ((kill-buffer-query-functions nil))
+          (kill-buffer buffer))))
     (when-let* ((completion
                  (pi-coding-agent--history-replay-job-completion job)))
       (funcall completion success))))
 
 (defun pi-coding-agent--history-replay-job-current-p (job)
   "Return non-nil when asynchronous history replay JOB still owns its buffer."
-  (let ((buffer (pi-coding-agent--history-replay-job-buffer job)))
+  (let ((buffer (pi-coding-agent--history-replay-job-buffer job))
+        (target-buffer
+         (pi-coding-agent--history-replay-job-target-buffer job)))
     (and (buffer-live-p buffer)
-         (with-current-buffer buffer
+         (buffer-live-p target-buffer)
+         (with-current-buffer target-buffer
            (and (eq pi-coding-agent--history-replay-job job)
                 (= pi-coding-agent--history-load-generation
                    (pi-coding-agent--history-replay-job-generation job))))
@@ -6414,9 +6543,17 @@ an existing history-load generation; otherwise this function creates one."
       (pi-coding-agent--cancel-history-replay chat-buf)
       (let* ((generation (or generation
                              (pi-coding-agent--invalidate-history-loads)))
+             (stable-viewport
+              pi-coding-agent-history-replay-stable-viewport)
+             (render-buffer
+              (if stable-viewport
+                  (generate-new-buffer " *pi-history-replay*")
+                chat-buf))
              (job
               (pi-coding-agent--make-history-replay-job
-               :buffer chat-buf
+               :buffer render-buffer
+               :target-buffer chat-buf
+               :stable-viewport stable-viewport
                :messages (if (vectorp messages) messages [])
                :results (pi-coding-agent--build-tool-result-index messages)
                :index 0
@@ -6424,8 +6561,12 @@ an existing history-load generation; otherwise this function creates one."
                :generation generation
                :validator valid-p
                :completion completion)))
-        (let ((inhibit-read-only t))
-          (pi-coding-agent--prepare-session-history-display messages))
+        (when stable-viewport
+          (with-current-buffer render-buffer
+            (pi-coding-agent-chat-mode)))
+        (with-current-buffer render-buffer
+          (let ((inhibit-read-only t))
+            (pi-coding-agent--prepare-session-history-display messages)))
         (setq pi-coding-agent--history-replay-job job)
         (setf (pi-coding-agent--history-replay-job-timer job)
               (run-at-time
