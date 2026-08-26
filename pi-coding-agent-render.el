@@ -45,6 +45,7 @@
 (require 'pi-coding-agent-table)
 (require 'cl-lib)
 (require 'ansi-color)
+(require 'thingatpt)
 
 ;; Forward references for functions in other modules
 (declare-function pi-coding-agent-compact "pi-coding-agent-menu" (&optional custom-instructions))
@@ -5009,6 +5010,95 @@ line metadata."
              :fragment fragment
              :label label)))))))
 
+(defun pi-coding-agent--trim-url-candidate (url)
+  "Return URL without common trailing prose punctuation."
+  (when (stringp url)
+    (while (string-match-p "[]),.;:!?，。；：！？）】]+\\'" url)
+      (setq url (substring url 0 -1)))
+    url))
+
+(defun pi-coding-agent--normalize-web-url (url)
+  "Return a browser URL for URL-like text, or nil."
+  (when-let* ((url)
+              (candidate (pi-coding-agent--trim-url-candidate
+                          (substring-no-properties url))))
+    (cond
+     ((string-match-p "\\`[[:alpha:]][[:alnum:]+.-]*:" candidate)
+      candidate)
+     ((string-prefix-p "//" candidate)
+      (concat "https:" candidate))
+     ((string-match-p
+       "\\`[[:alnum:]][[:alnum:]-]*\\(?:\\.[[:alnum:]][[:alnum:]-]*\\)+\\(?::[0-9]+\\)?/"
+       candidate)
+      (concat "https://" candidate)))))
+
+(defun pi-coding-agent--visible-url-at-point ()
+  "Return a visible URL or bare domain path at point, or nil."
+  (or (pi-coding-agent--normalize-web-url (thing-at-point 'url t))
+      (save-excursion
+        (let ((line-start (line-beginning-position))
+              (line-end (line-end-position))
+              (position (point))
+              found)
+          (goto-char line-start)
+          (while (and (not found)
+                      (re-search-forward
+                       "\\(?:https?://\\|[[:alnum:]][[:alnum:]-]*\\(?:\\.[[:alnum:]][[:alnum:]-]*\\)+\\(?::[0-9]+\\)?/\\)[^][<>()\"'`[:space:]]+"
+                       line-end t))
+            (when (<= (match-beginning 0) position (match-end 0))
+              (setq found
+                    (pi-coding-agent--normalize-web-url
+                     (match-string-no-properties 0)))))
+          found))))
+
+(defun pi-coding-agent--semantic-link-url-from-owner (owner)
+  "Return browser URL destination for semantic link OWNER, or nil."
+  (let* ((type (plist-get owner :type))
+         (label-projection (plist-get owner :label-projection))
+         (label-positions (plist-get label-projection :positions))
+         (destination-start (plist-get owner :destination-start))
+         (destination-end (plist-get owner :destination-end))
+         (position (point)))
+    (when (and (not (plist-get owner :malformed))
+               (member type '("inline_link" "image"))
+               label-positions destination-start destination-end
+               (seq-contains-p label-positions position #'=))
+      (let* ((raw (buffer-substring-no-properties
+                   destination-start destination-end))
+             (angle (and (> (length raw) 1)
+                         (string-prefix-p "<" raw)
+                         (string-suffix-p ">" raw)))
+             (source (if angle (substring raw 1 -1) raw)))
+        (pi-coding-agent--normalize-web-url source)))))
+
+(defun pi-coding-agent--semantic-link-url-at-point ()
+  "Return browser URL from a Markdown link label at point, or nil."
+  (condition-case nil
+      (save-restriction
+        (widen)
+        (let ((pi-coding-agent--semantic-link-resolver-parsers (list :active))
+              (pi-coding-agent--semantic-code-span-at-point :active)
+              state owner url)
+          (setq state (pi-coding-agent--semantic-link-parser-state))
+          (unwind-protect
+              (progn
+                (pi-coding-agent--semantic-link-isolate-parser-state state)
+                (let ((treesit-range-settings nil))
+                  (when-let* ((host
+                               (pi-coding-agent--semantic-link-host-at-point)))
+                    (unless (plist-get host :over-cap)
+                      (setq owner
+                            (pi-coding-agent--semantic-link-owner-at-point
+                             host)))))
+                (when owner
+                  (setq url
+                        (pi-coding-agent--semantic-link-url-from-owner
+                         owner))))
+            (pi-coding-agent--semantic-link-cleanup-parser-state state))
+          url))
+    (pi-coding-agent-semantic-link-parser-error nil)
+    (error nil)))
+
 (defun pi-coding-agent--semantic-link-parser-overlays ()
   "Return every inline-parser overlay md-ts could adopt in this buffer.
 Use `overlay-lists' rather than positional overlay APIs: local ranges are
@@ -5769,6 +5859,17 @@ placement.  With prefix argument TOGGLE, invert the opener request."
   (let ((target (or (pi-coding-agent--file-target-at-point)
                     (user-error "No file at point"))))
     (pi-coding-agent--visit-file-target target toggle)))
+
+(defun pi-coding-agent-open-at-point (&optional toggle)
+  "Open a web URL at point, falling back to `pi-coding-agent-visit-file'.
+Visible URLs and remote Markdown link labels are opened with `browse-url'.
+When no URL is present, local file target behavior matches RET.  With prefix
+argument TOGGLE, pass the fallback request to `pi-coding-agent-visit-file'."
+  (interactive "P")
+  (if-let* ((url (or (pi-coding-agent--semantic-link-url-at-point)
+                    (pi-coding-agent--visible-url-at-point))))
+      (browse-url url)
+    (pi-coding-agent-visit-file toggle)))
 
 ;;;; Diff Overlay Highlighting
 
