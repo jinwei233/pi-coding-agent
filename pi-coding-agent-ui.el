@@ -59,6 +59,7 @@
 (declare-function pi-coding-agent--dispatch-button "pi-coding-agent-render")
 (declare-function pi-coding-agent--cleanup-on-kill "pi-coding-agent-render")
 (declare-function pi-coding-agent--restore-tool-properties "pi-coding-agent-render")
+(declare-function pi-coding-agent--tool-block-overlay "pi-coding-agent-render")
 (declare-function pi-coding-agent--maybe-refresh-hot-tail-tables "pi-coding-agent-table")
 (declare-function pi-coding-agent--jit-decorate-tables "pi-coding-agent-table")
 
@@ -159,6 +160,56 @@ behavior.
 This option may be set buffer-locally by integrations such as Agent Workspace."
   :type '(choice (const :tag "Disabled" nil)
                  (natnum :tag "Context lines"))
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-parser-lifecycle-enabled t
+  "Whether Pi chat buffers reclaim local Tree-sitter parsers from cold history.
+The buffer-wide Markdown parsers and all unrecognized parser ownership remain
+untouched.  This option may be set buffer-locally for A/B comparison."
+  :type 'boolean
+  :group 'pi-coding-agent)
+(make-variable-buffer-local 'pi-coding-agent-parser-lifecycle-enabled)
+
+(defcustom pi-coding-agent-parser-reconcile-delay 0.1
+  "Seconds before a Pi chat buffer reconciles local parser ownership."
+  :type 'number
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-parser-visible-margin-heights 1
+  "Window heights retained around visible Pi chat content."
+  :type 'natnum
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-parser-hot-tail-max-bytes (* 32 1024)
+  "Maximum recent hot-tail bytes that retain local parsers.
+Visible windows and actively updated tool blocks are retained independently."
+  :type 'natnum
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-parser-lifecycle-metrics-functions nil
+  "Functions called after Pi local parser reconciliation.
+Each function receives CHAT-BUFFER, BEFORE-COUNT, AFTER-COUNT,
+RECLAIMED-COUNT and RETAINED-RANGES."
+  :type 'hook
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-cross-read-batching-enabled t
+  "Whether compatible Pi deltas may be combined across process reads.
+This option may be set buffer-locally in the chat buffer associated with a
+process."
+  :type 'boolean
+  :group 'pi-coding-agent)
+(make-variable-buffer-local 'pi-coding-agent-cross-read-batching-enabled)
+
+(defcustom pi-coding-agent-cross-read-batching-delay 0.016
+  "Maximum seconds a mergeable Pi delta may wait for an adjacent delta."
+  :type 'number
+  :group 'pi-coding-agent)
+
+(defcustom pi-coding-agent-cross-read-batching-metrics-functions nil
+  "Functions called after a pending cross-read delta is dispatched.
+Each function receives PROCESS, MERGED-EVENT-COUNT and REASON."
+  :type 'hook
   :group 'pi-coding-agent)
 
 (defcustom pi-coding-agent-activity-phase-functions nil
@@ -818,6 +869,327 @@ makes the hot region empty by moving the marker to `point-max'."
   "Return non-nil when POS is inside the hot tail."
   (>= pos (marker-position pi-coding-agent--hot-tail-start)))
 
+;;;; Local Parser Lifecycle
+
+(defvar pi-coding-agent--live-tool-blocks)
+(defvar pi-coding-agent--session-transition-generation)
+(defvar pi-coding-agent--semantic-link-resolver-parsers)
+(defvar pi-coding-agent--message-start-marker)
+(defvar pi-coding-agent--streaming-marker)
+(defvar pi-coding-agent--thinking-start-marker)
+(defvar pi-coding-agent--thinking-marker)
+
+(defvar-local pi-coding-agent--parser-reconcile-timer nil
+  "Pending local parser reconciliation timer.")
+
+(defvar-local pi-coding-agent--parser-lifecycle-generation 0
+  "Generation invalidating stale local parser reconciliation callbacks.")
+
+(defvar-local pi-coding-agent--parser-reconciling nil
+  "Non-nil while the current chat buffer is reconciling local parsers.")
+
+(defun pi-coding-agent--all-treesit-parsers ()
+  "Return all Tree-sitter parsers associated with the current buffer."
+  (condition-case nil
+      (treesit-parser-list nil nil t)
+    (wrong-number-of-arguments
+     (treesit-parser-list))))
+
+(defun pi-coding-agent--all-overlays ()
+  "Return every overlay in the current buffer without duplicates."
+  (delete-dups
+   (append (car (overlay-lists)) (cdr (overlay-lists)))))
+
+(defun pi-coding-agent--local-parser-overlay-metadata-p (overlay parsers)
+  "Return non-nil when OVERLAY has complete local parser metadata in PARSERS."
+  (let ((parser (overlay-get overlay 'treesit-parser))
+        (host (overlay-get overlay 'treesit-host-parser))
+        (timestamp (overlay-get overlay 'treesit-parser-ov-timestamp)))
+    (and (overlay-buffer overlay)
+         parser
+         host
+         (integerp timestamp)
+         (if (fboundp 'treesit-parser-p)
+             (and (treesit-parser-p parser)
+                  (treesit-parser-p host)
+                  (eq (ignore-errors (treesit-parser-buffer parser))
+                      (current-buffer))
+                  (eq (ignore-errors (treesit-parser-buffer host))
+                      (current-buffer)))
+           (and (memq parser parsers)
+                (memq host parsers)))
+         (not (eq parser host)))))
+
+(defun pi-coding-agent--tag-local-parser-ownership (start end)
+  "Tag complete local parsers owned by md-ts update between START and END."
+  (unless pi-coding-agent--semantic-link-resolver-parsers
+    (let ((parsers
+           (unless (fboundp 'treesit-parser-p)
+             (pi-coding-agent--all-treesit-parsers)))
+          (tick (buffer-chars-modified-tick))
+          (start (or start (point-min)))
+          (end (or end (point-max))))
+      (dolist (overlay (overlays-in start end))
+        (when (and
+               (pi-coding-agent--local-parser-overlay-metadata-p
+                overlay parsers)
+               (eql (overlay-get overlay 'treesit-parser-ov-timestamp) tick)
+               (equal
+                (ignore-errors
+                  (treesit-parser-included-ranges
+                   (overlay-get overlay 'treesit-parser)))
+                (list (cons (overlay-start overlay) (overlay-end overlay)))))
+          (overlay-put overlay 'pi-coding-agent-local-parser-owner 'md-ts))))))
+
+(defun pi-coding-agent--observe-md-ts-local-range-update
+    (original &rest arguments)
+  "Call ORIGINAL with ARGUMENTS and tag md-ts local parser ownership."
+  (prog1 (apply original arguments)
+    (when (derived-mode-p 'pi-coding-agent-chat-mode)
+      (pi-coding-agent--tag-local-parser-ownership
+       (nth 3 arguments) (nth 4 arguments))
+      (pi-coding-agent--schedule-parser-reconciliation))))
+
+(defun pi-coding-agent--ensure-parser-ownership-advice ()
+  "Install the idempotent md-ts ownership observation advice."
+  (unless (advice-member-p
+           #'pi-coding-agent--observe-md-ts-local-range-update
+           'md-ts--treesit--update-ranges-local)
+    (advice-add
+     'md-ts--treesit--update-ranges-local :around
+     #'pi-coding-agent--observe-md-ts-local-range-update)))
+
+(defun pi-coding-agent--local-parser-ownership-overlay-p (overlay parsers)
+  "Return non-nil when OVERLAY proves Pi-tagged local ownership in PARSERS."
+  (and (eq (overlay-get overlay 'pi-coding-agent-local-parser-owner) 'md-ts)
+       (pi-coding-agent--local-parser-overlay-metadata-p overlay parsers)))
+
+(defun pi-coding-agent--local-parser-ownership-overlays ()
+  "Return verified local parser ownership overlays in the current buffer."
+  (let ((parsers
+         (unless (fboundp 'treesit-parser-p)
+           (pi-coding-agent--all-treesit-parsers))))
+    (seq-filter
+     (lambda (overlay)
+       (pi-coding-agent--local-parser-ownership-overlay-p overlay parsers))
+     (pi-coding-agent--all-overlays))))
+
+(defun pi-coding-agent--merge-parser-ranges (ranges)
+  "Sort and merge overlapping or adjacent RANGES."
+  (let (merged)
+    (dolist (range
+             (sort (seq-filter
+                    (lambda (item)
+                      (and (integer-or-marker-p (car-safe item))
+                           (integer-or-marker-p (cdr-safe item))
+                           (< (car item) (cdr item))))
+                    ranges)
+                   (lambda (left right) (< (car left) (car right)))))
+      (let ((start (max (point-min) (car range)))
+            (end (min (point-max) (cdr range))))
+        (when (< start end)
+          (if (and merged (<= start (cdar merged)))
+              (setcdr (car merged) (max end (cdar merged)))
+            (push (cons start end) merged)))))
+    (nreverse merged)))
+
+(defun pi-coding-agent--parser-window-range (window)
+  "Return retained parser range for WINDOW, including configured margin."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (let* ((start (or (window-start window) (point-min)))
+           (end (or (window-end window t) (window-point window) (point-max)))
+           (margin-lines
+            (* pi-coding-agent-parser-visible-margin-heights
+               (max 1 (window-body-height window)))))
+      (cons
+       (save-excursion
+         (goto-char start)
+         (forward-line (- margin-lines))
+         (point))
+       (save-excursion
+         (goto-char end)
+         (forward-line margin-lines)
+         (point))))))
+
+(defun pi-coding-agent--live-tool-parser-ranges ()
+  "Return parser ranges occupied by actively updated tool blocks."
+  (let (ranges)
+    (when pi-coding-agent--live-tool-blocks
+      (maphash
+       (lambda (_tool-call-id block)
+         (when-let* ((overlay
+                      (and (fboundp 'pi-coding-agent--tool-block-overlay)
+                           (pi-coding-agent--tool-block-overlay block)))
+                     ((overlay-buffer overlay)))
+           (push (cons (overlay-start overlay) (overlay-end overlay)) ranges)))
+       pi-coding-agent--live-tool-blocks))
+    ranges))
+
+(defun pi-coding-agent--parser-tail-start (end max-bytes)
+  "Return the earliest character position within MAX-BYTES before END."
+  (let* ((minimum-byte (position-bytes (point-min)))
+         (end-byte (position-bytes end))
+         (target-byte (max minimum-byte (- end-byte max-bytes)))
+         position)
+    (while (and (< target-byte end-byte)
+                (not (setq position (byte-to-position target-byte))))
+      (setq target-byte (1+ target-byte)))
+    (or position end)))
+
+(defun pi-coding-agent--bounded-active-parser-range (start-marker end-marker)
+  "Return bounded parser range ending at END-MARKER after START-MARKER."
+  (when (and (markerp start-marker)
+             (eq (marker-buffer start-marker) (current-buffer))
+             (markerp end-marker)
+             (eq (marker-buffer end-marker) (current-buffer)))
+    (let ((start (marker-position start-marker))
+          (end (marker-position end-marker)))
+      (when (< start end)
+        (cons (max start
+                   (pi-coding-agent--parser-tail-start
+                    end pi-coding-agent-parser-hot-tail-max-bytes))
+              end)))))
+
+(defun pi-coding-agent--active-content-parser-ranges ()
+  "Return bounded parser ranges around live message and thinking tails."
+  (delq nil
+        (list
+         (pi-coding-agent--bounded-active-parser-range
+          pi-coding-agent--message-start-marker
+          pi-coding-agent--streaming-marker)
+         (pi-coding-agent--bounded-active-parser-range
+          pi-coding-agent--thinking-start-marker
+          pi-coding-agent--thinking-marker))))
+
+(defun pi-coding-agent--parser-retained-ranges ()
+  "Return merged ranges whose local parsers should remain active."
+  (let* ((tail-boundary
+          (if (markerp pi-coding-agent--hot-tail-start)
+              (marker-position pi-coding-agent--hot-tail-start)
+            (point-min)))
+         (bounded-tail
+          (max
+           tail-boundary
+           (pi-coding-agent--parser-tail-start
+            (point-max) pi-coding-agent-parser-hot-tail-max-bytes)))
+         (ranges
+          (list (cons bounded-tail (point-max)))))
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (when-let* ((range (pi-coding-agent--parser-window-range window)))
+        (push range ranges)))
+    (setq ranges
+          (nconc (pi-coding-agent--active-content-parser-ranges)
+                 (pi-coding-agent--live-tool-parser-ranges)
+                 ranges))
+    (pi-coding-agent--merge-parser-ranges ranges)))
+
+(defun pi-coding-agent--parser-overlay-overlaps-ranges-p (overlay ranges)
+  "Return non-nil when OVERLAY overlaps one of RANGES."
+  (let ((start (overlay-start overlay))
+        (end (overlay-end overlay)))
+    (seq-some
+     (lambda (range)
+       (and (< start (cdr range)) (> end (car range))))
+     ranges)))
+
+(defun pi-coding-agent--reconcile-local-parsers ()
+  "Reclaim verified local parsers wholly outside retained Pi ranges.
+Return the number of parser objects reclaimed."
+  (when (and pi-coding-agent-parser-lifecycle-enabled
+             (derived-mode-p 'pi-coding-agent-chat-mode)
+             (not pi-coding-agent--parser-reconciling))
+    (let* ((pi-coding-agent--parser-reconciling t)
+           (ranges (pi-coding-agent--parser-retained-ranges))
+           (ownership (pi-coding-agent--local-parser-ownership-overlays))
+           (all-overlays (pi-coding-agent--all-overlays))
+           (groups (make-hash-table :test #'eq))
+           (before (length ownership))
+           (reclaimed 0))
+      (dolist (overlay ownership)
+        (push overlay
+              (gethash (overlay-get overlay 'treesit-parser) groups)))
+      (maphash
+       (lambda (parser overlays)
+         (let ((all-references
+                (seq-filter
+                 (lambda (overlay)
+                   (eq (overlay-get overlay 'treesit-parser) parser))
+                 all-overlays)))
+           (when (and (= (length all-references) (length overlays))
+                      (not (seq-some
+                            (lambda (overlay)
+                              (pi-coding-agent--parser-overlay-overlaps-ranges-p
+                               overlay ranges))
+                            overlays)))
+             (when (ignore-errors
+                     (treesit-parser-delete parser)
+                     t)
+               (dolist (overlay overlays)
+                 (delete-overlay overlay))
+               (setq reclaimed (1+ reclaimed))))))
+       groups)
+      (let ((after
+             (length (pi-coding-agent--local-parser-ownership-overlays))))
+        (run-hook-with-args
+         'pi-coding-agent-parser-lifecycle-metrics-functions
+         (current-buffer) before after reclaimed ranges))
+      reclaimed)))
+
+(defun pi-coding-agent--run-parser-reconciliation
+    (buffer generation session-generation)
+  "Reconcile parsers in BUFFER when GENERATION and SESSION-GENERATION are current."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and (= generation pi-coding-agent--parser-lifecycle-generation)
+                 (= session-generation
+                    pi-coding-agent--session-transition-generation))
+        (setq pi-coding-agent--parser-reconcile-timer nil)
+        (condition-case nil
+            (pi-coding-agent--reconcile-local-parsers)
+          (error
+           (setq-local pi-coding-agent-parser-lifecycle-enabled nil)))))))
+
+(defun pi-coding-agent--schedule-parser-reconciliation (&rest _ignored)
+  "Schedule one bounded-delay parser reconciliation for this Pi chat buffer."
+  (when (and pi-coding-agent-parser-lifecycle-enabled
+             (derived-mode-p 'pi-coding-agent-chat-mode)
+             (not (timerp pi-coding-agent--parser-reconcile-timer)))
+    (let ((buffer (current-buffer))
+          (generation pi-coding-agent--parser-lifecycle-generation)
+          (session-generation pi-coding-agent--session-transition-generation)
+          (timer (timer-create)))
+      (condition-case nil
+          (progn
+            (timer-set-function
+             timer #'pi-coding-agent--run-parser-reconciliation
+             (list buffer generation session-generation))
+            (timer-set-time
+             timer
+             (timer-relative-time nil
+                                  pi-coding-agent-parser-reconcile-delay))
+            (timer-activate timer)
+            (setq pi-coding-agent--parser-reconcile-timer timer))
+        (error
+         (setq pi-coding-agent--parser-reconcile-timer nil))))))
+
+(defun pi-coding-agent--parser-window-scrolled (window _display-start)
+  "Schedule parser reconciliation when WINDOW showing this buffer scrolls."
+  (when (eq (window-buffer window) (current-buffer))
+    (pi-coding-agent--schedule-parser-reconciliation)))
+
+(defun pi-coding-agent--cancel-parser-reconciliation ()
+  "Cancel parser reconciliation and invalidate delayed callbacks."
+  (setq pi-coding-agent--parser-lifecycle-generation
+        (1+ pi-coding-agent--parser-lifecycle-generation))
+  (when (timerp pi-coding-agent--parser-reconcile-timer)
+    (cancel-timer pi-coding-agent--parser-reconcile-timer))
+  (setq pi-coding-agent--parser-reconcile-timer nil))
+
+(defun pi-coding-agent--cleanup-parser-lifecycle ()
+  "Cancel all local parser lifecycle state owned by this chat buffer."
+  (pi-coding-agent--cancel-parser-reconciliation))
+
 ;;;; Chat Navigation
 
 (defun pi-coding-agent--find-you-heading (search-fn)
@@ -1045,6 +1417,7 @@ This is a read-only buffer showing the conversation history."
   (setq-local window-point-insertion-type t)
   ;; Recent content is hot by default in a fresh chat buffer.
   (setq-local pi-coding-agent--hot-tail-start (copy-marker (point-min) nil))
+  (pi-coding-agent--ensure-parser-ownership-advice)
 
   ;; Run after font-lock to undo markdown damage in tool overlays.
   (jit-lock-register #'pi-coding-agent--restore-tool-properties)
@@ -1055,7 +1428,6 @@ This is a read-only buffer showing the conversation history."
   ;; stay fast to load yet every table becomes a grid once seen.
   (jit-lock-register #'pi-coding-agent--jit-decorate-tables)
   (jit-lock-register #'pi-coding-agent--jit-materialize-output-images)
-
   ;; Compute theme-derived faces used by chat overlays.
   (pi-coding-agent--update-theme-derived-faces)
 
@@ -1063,6 +1435,10 @@ This is a read-only buffer showing the conversation history."
   (add-hook 'after-save-hook #'pi-coding-agent--restore-chat-buffer-read-only nil t)
   (add-hook 'window-configuration-change-hook
             #'pi-coding-agent--maybe-refresh-hot-tail-tables nil t)
+  (add-hook 'window-configuration-change-hook
+            #'pi-coding-agent--schedule-parser-reconciliation nil t)
+  (add-hook 'window-scroll-functions
+            #'pi-coding-agent--parser-window-scrolled nil t)
   (add-hook 'window-size-change-functions
             #'pi-coding-agent--maybe-rebalance-windows)
   (add-hook 'kill-buffer-query-functions

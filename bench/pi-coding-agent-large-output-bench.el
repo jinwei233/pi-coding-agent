@@ -13,6 +13,24 @@
 
 (defconst pi-coding-agent-large-output-bench--delta-sizes '(128 1024 8192))
 
+(defconst pi-coding-agent-large-output-bench--parser-counts
+  '(2 100 500 1000)
+  "Approximate Markdown inline parser counts used by lifecycle benchmarks.")
+
+(defconst pi-coding-agent-large-output-bench--parser-payload-size
+  (* 128 1024)
+  "Target byte size for every parser-cardinality workload.")
+
+(defconst pi-coding-agent-large-output-bench--structured-fixture
+  (concat
+   "Plain paragraph with **bold**, `inline code`, and [a link](file.el:12).\n\n"
+   "> Thinking-style quoted text with *emphasis*.\n\n"
+   "```elisp\n(message \"synthetic\")\n```\n\n"
+   "Tool-like output: read file.el\n\n"
+   "![synthetic image](file:///tmp/nonexistent.png)\n\n"
+   "| Kind | Value |\n| --- | ---: |\n| parser | 1000 |\n")
+  "Synthetic mixed Markdown fixture; never reads user session data.")
+
 (defun pi-coding-agent-large-output-bench--result
     (kind size delta elapsed buffer-size)
   "Print one benchmark result for KIND, SIZE, DELTA, ELAPSED and BUFFER-SIZE."
@@ -44,6 +62,335 @@
       (while (< (buffer-size) size)
         (insert line))
       (buffer-substring-no-properties (point-min) (1+ size)))))
+
+(defun pi-coding-agent-large-output-bench--parser-payload
+    (parser-count size)
+  "Return SIZE bytes yielding approximately PARSER-COUNT inline parsers.
+`md-ts-mode' keeps one placeholder inline parser, so the payload contains one
+fewer paragraph than PARSER-COUNT."
+  (let* ((paragraphs (max 1 (1- parser-count)))
+         (bases
+          (cl-loop for index below paragraphs
+                   collect
+                   (format "Paragraph %04d with **bold** and `code`." index)))
+         (base-size
+          (+ (apply #'+ (mapcar #'length bases))
+             (* 2 (1- paragraphs))))
+         (padding (max 0 (- size base-size)))
+         (padding-each (/ padding paragraphs))
+         (padding-remainder (% padding paragraphs)))
+    (with-temp-buffer
+      (cl-loop
+       for text in bases
+       for index from 0
+       do
+        (unless (bobp)
+          (insert "\n\n"))
+        (insert text)
+        (insert
+         (make-string
+          (+ padding-each (if (< index padding-remainder) 1 0))
+          ?x)))
+      (buffer-substring-no-properties
+       (point-min) (min (point-max) (1+ size))))))
+
+(defun pi-coding-agent-large-output-bench--inline-parser-count ()
+  "Return the number of Markdown inline parsers in the current buffer."
+  (cl-count 'markdown-inline
+            (condition-case nil
+                (treesit-parser-list nil nil t)
+              (wrong-number-of-arguments
+               (treesit-parser-list)))
+            :key #'treesit-parser-language))
+
+(defun pi-coding-agent-large-output-bench--parser-overlay-count ()
+  "Return the number of local parser ownership overlays in this buffer."
+  (cl-count-if
+   (lambda (overlay)
+     (and (overlay-get overlay 'treesit-parser)
+          (overlay-get overlay 'treesit-host-parser)
+          (overlay-get overlay 'treesit-parser-ov-timestamp)))
+   (overlays-in (point-min) (point-max))))
+
+(defun pi-coding-agent-large-output-bench--run-parser-workload
+    (parser-count visible redisplay-p &optional lifecycle iterations)
+  "Run one parser workload for PARSER-COUNT.
+VISIBLE controls whether the benchmark buffer is displayed.  REDISPLAY-P
+forces redisplay after each incremental update when VISIBLE is non-nil.
+LIFECYCLE enables cold parser reclamation before incremental updates.
+ITERATIONS defaults to 200."
+  (let ((buffer (generate-new-buffer " *pi-parser-lifecycle-bench*"))
+        (payload
+         (pi-coding-agent-large-output-bench--parser-payload
+          parser-count pi-coding-agent-large-output-bench--parser-payload-size))
+        (updates 0)
+        (redisplays 0)
+        elapsed
+        metrics)
+    (setq iterations (or iterations 200))
+    (unwind-protect
+        (save-window-excursion
+          (when visible
+            (switch-to-buffer buffer))
+          (with-current-buffer buffer
+            (pi-coding-agent-chat-mode)
+            (setq-local pi-coding-agent-parser-lifecycle-enabled lifecycle)
+            (let ((inhibit-read-only t))
+              (insert payload))
+            (font-lock-ensure (point-min) (point-max))
+            (pi-coding-agent--cancel-parser-reconciliation)
+            (when visible
+              (redisplay t))
+            (let ((before-parsers
+                   (pi-coding-agent-large-output-bench--inline-parser-count)))
+              (move-marker pi-coding-agent--hot-tail-start (point-max))
+              (when lifecycle
+                (pi-coding-agent--reconcile-local-parsers))
+            (goto-char (point-max))
+            (pi-coding-agent--display-agent-start)
+            (add-hook 'after-change-functions
+                      (lambda (&rest _args) (setq updates (1+ updates)))
+                      nil t)
+            (garbage-collect)
+            (setq elapsed
+                  (benchmark-run
+                    1
+                    (dotimes (_ iterations)
+                      (pi-coding-agent--display-message-delta " streamed")
+                      (when (and visible redisplay-p)
+                        (setq redisplays (1+ redisplays))
+                        (redisplay t)))))
+            (setq metrics
+                  (list
+                   :kind 'parser-cardinality
+                   :requested-parsers parser-count
+                   :parser-lifecycle lifecycle
+                   :iterations iterations
+                   :before-inline-parsers before-parsers
+                   :inline-parsers
+                   (pi-coding-agent-large-output-bench--inline-parser-count)
+                   :ownership-overlays
+                   (pi-coding-agent-large-output-bench--parser-overlay-count)
+                   :visible visible
+                   :redisplay redisplay-p
+                   :buffer-updates updates
+                   :redisplays redisplays
+                   :seconds (nth 0 elapsed)
+                   :gc-count (nth 1 elapsed)
+                   :gc-seconds (nth 2 elapsed)
+                   :buffer-bytes (buffer-size))))))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (set-buffer-modified-p nil))
+        (kill-buffer buffer)))
+    metrics))
+
+;;;###autoload
+(defun pi-coding-agent-large-output-bench-run-parser-lifecycle ()
+  "Run the parser-cardinality benchmark matrix and print result plists."
+  (interactive)
+  (let ((visible-options
+         (if (display-graphic-p) '(nil t) '(nil))))
+    (dolist (parser-count pi-coding-agent-large-output-bench--parser-counts)
+      (dolist (visible visible-options)
+        (dolist (redisplay-p (if visible '(nil t) '(nil)))
+          (dolist (lifecycle '(nil t))
+            (prin1
+             (pi-coding-agent-large-output-bench--run-parser-workload
+              parser-count visible redisplay-p lifecycle
+              (if (and visible redisplay-p) 20 200)))
+            (terpri)))))))
+
+(defun pi-coding-agent-large-output-bench--cross-read-stream
+    (batching count)
+  "Benchmark COUNT one-delta reads with cross-read BATCHING."
+  (let ((buffer (generate-new-buffer " *pi-cross-read-bench*"))
+        (process (start-process "cat" nil "cat"))
+        (updates 0)
+        elapsed
+        metrics)
+    (unwind-protect
+        (with-current-buffer buffer
+          (pi-coding-agent-chat-mode)
+          (setq-local pi-coding-agent-cross-read-batching-enabled batching
+                      pi-coding-agent-cross-read-batching-delay 10
+                      pi-coding-agent--session-transition-generation 0
+                      pi-coding-agent--process process)
+          (set-process-buffer process buffer)
+          (process-put process 'pi-coding-agent-chat-buffer buffer)
+          (pi-coding-agent--register-display-handler process)
+          (add-hook 'after-change-functions
+                    (lambda (&rest _arguments)
+                      (setq updates (1+ updates)))
+                    nil t)
+          (pi-coding-agent--process-filter
+           process
+           (concat
+            (json-encode '(:type "agent_start"))
+            "\n"
+            (json-encode
+             '(:type "message_start"
+               :message (:role "assistant" :timestamp 1)))
+            "\n"))
+          (garbage-collect)
+          (setq elapsed
+                (benchmark-run
+                  1
+                  (dotimes (_ count)
+                    (pi-coding-agent--process-filter
+                     process
+                     (concat
+                      (json-encode
+                       '(:type "message_update"
+                         :message (:role "assistant" :timestamp 1)
+                         :assistantMessageEvent
+                         (:type "text_delta"
+                          :contentIndex 0
+                          :delta "x")))
+                      "\n")))
+                  (pi-coding-agent--flush-pending-delta process 'benchmark)))
+          (setq metrics
+                (list :kind 'cross-read
+                      :batching batching
+                      :delta-count count
+                      :buffer-updates updates
+                      :seconds (nth 0 elapsed)
+                      :gc-count (nth 1 elapsed)
+                      :gc-seconds (nth 2 elapsed)
+                      :buffer-bytes (buffer-size))))
+      (pi-coding-agent--cancel-pending-delta process)
+      (when (processp process)
+        (pi-coding-agent--unregister-display-handler process)
+        (when (process-live-p process)
+          (delete-process process)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq pi-coding-agent--process nil)
+          (set-buffer-modified-p nil))
+        (kill-buffer buffer)))
+    metrics))
+
+;;;###autoload
+(defun pi-coding-agent-large-output-bench-run-cross-read ()
+  "Run cross-read batching A/B workloads and print result plists."
+  (interactive)
+  (dolist (batching '(nil t))
+    (prin1
+     (pi-coding-agent-large-output-bench--cross-read-stream batching 500))
+    (terpri)))
+
+(defun pi-coding-agent-large-output-bench--combined-gui
+    (parser-count lifecycle batching delta-count)
+  "Measure visible streaming with parser and BATCHING controls.
+PARSER-COUNT sets initial cardinality, LIFECYCLE controls cold reclamation,
+and DELTA-COUNT is the number of one-character process reads."
+  (let ((buffer (generate-new-buffer " *pi-parser-combined-gui-bench*"))
+        (process (start-process "cat" nil "cat"))
+        (payload
+         (pi-coding-agent-large-output-bench--parser-payload
+          parser-count pi-coding-agent-large-output-bench--parser-payload-size))
+        (updates 0)
+        elapsed
+        metrics)
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (with-current-buffer buffer
+            (pi-coding-agent-chat-mode)
+            (setq-local pi-coding-agent-parser-lifecycle-enabled lifecycle
+                        pi-coding-agent-parser-reconcile-delay 999
+                        pi-coding-agent-cross-read-batching-enabled batching
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0
+                        pi-coding-agent--process process)
+            (let ((inhibit-read-only t))
+              (insert payload))
+            (font-lock-ensure)
+            (pi-coding-agent--cancel-parser-reconciliation)
+            (move-marker pi-coding-agent--hot-tail-start (point-max))
+            (when lifecycle
+              (pi-coding-agent--reconcile-local-parsers))
+            (set-process-buffer process buffer)
+            (set-process-query-on-exit-flag process nil)
+            (process-put process 'pi-coding-agent-chat-buffer buffer)
+            (pi-coding-agent--register-display-handler process)
+            (dolist
+                (event
+                 (list
+                  '(:type "agent_start")
+                  '(:type "message_start"
+                    :message (:role "assistant" :timestamp 1))))
+              (pi-coding-agent--process-filter
+               process (concat (json-encode event) "\n")))
+            (goto-char (point-max))
+            (set-window-point (selected-window) (point-max))
+            (redisplay t)
+            (add-hook 'after-change-functions
+                      (lambda (&rest _arguments)
+                        (setq updates (1+ updates)))
+                      nil t)
+            (garbage-collect)
+            (setq elapsed
+                  (benchmark-run
+                    1
+                    (dotimes (_ delta-count)
+                      (pi-coding-agent--process-filter
+                       process
+                       (concat
+                        (json-encode
+                         '(:type "message_update"
+                           :message (:role "assistant" :timestamp 1)
+                           :assistantMessageEvent
+                           (:type "text_delta"
+                            :contentIndex 0
+                            :delta "x")))
+                        "\n"))
+                      (redisplay t))
+                    (pi-coding-agent--flush-pending-delta process 'benchmark)
+                    (redisplay t)))
+            (setq metrics
+                  (list
+                   :kind 'combined-gui
+                   :requested-parsers parser-count
+                   :parser-lifecycle lifecycle
+                   :batching batching
+                   :delta-count delta-count
+                   :inline-parsers
+                   (pi-coding-agent-large-output-bench--inline-parser-count)
+                   :ownership-overlays
+                   (pi-coding-agent-large-output-bench--parser-overlay-count)
+                   :buffer-updates updates
+                   :seconds (nth 0 elapsed)
+                   :gc-count (nth 1 elapsed)
+                   :gc-seconds (nth 2 elapsed)
+                   :buffer-bytes (buffer-size)))))
+      (pi-coding-agent--cancel-pending-delta process)
+      (when (processp process)
+        (pi-coding-agent--unregister-display-handler process)
+        (when (process-live-p process)
+          (delete-process process)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (pi-coding-agent--cleanup-parser-lifecycle)
+          (setq pi-coding-agent--process nil)
+          (set-buffer-modified-p nil))
+        (kill-buffer buffer)))
+    metrics))
+
+;;;###autoload
+(defun pi-coding-agent-large-output-bench-run-combined-gui ()
+  "Run the four-way visible parser lifecycle and batching comparison."
+  (interactive)
+  (unless (display-graphic-p)
+    (user-error "Combined benchmark requires a graphical frame"))
+  (let (results)
+    (dolist (lifecycle '(nil t))
+      (dolist (batching '(nil t))
+        (push
+         (pi-coding-agent-large-output-bench--combined-gui
+          1000 lifecycle batching 50)
+         results)))
+    (nreverse results)))
 
 (defun pi-coding-agent-large-output-bench--history (size)
   "Benchmark rendering a synthetic assistant history of SIZE bytes."
@@ -235,6 +582,8 @@
                     (redisplay t))))
           (setq rendered-size (buffer-size)))
       (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (set-buffer-modified-p nil))
         (kill-buffer buffer)))
     (pi-coding-agent-large-output-bench--result-plist
      kind size delta-size elapsed rendered-size)))
@@ -263,6 +612,8 @@
                   (redisplay t)))
           (setq rendered-size (buffer-size)))
       (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (set-buffer-modified-p nil))
         (kill-buffer buffer)))
     (pi-coding-agent-large-output-bench--result-plist
      'history size nil elapsed rendered-size)))

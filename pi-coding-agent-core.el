@@ -34,6 +34,10 @@
 (require 'cl-lib)
 (require 'json)
 
+(defvar pi-coding-agent-cross-read-batching-enabled t)
+(defvar pi-coding-agent-cross-read-batching-delay 0.016)
+(defvar pi-coding-agent-cross-read-batching-metrics-functions nil)
+
 ;;;; JSON Parsing
 
 (defun pi-coding-agent--parse-json-line (line)
@@ -459,6 +463,7 @@ Maps request IDs to command type strings."
 
 (defun pi-coding-agent--send-string (process string)
   "Send STRING to PROCESS, or queue it until a remote process is ready."
+  (pi-coding-agent--flush-pending-delta process 'outbound)
   (if (pi-coding-agent--process-awaiting-ready-p process)
       (pi-coding-agent--enqueue-outbound-string process string)
     (process-send-string process string)))
@@ -543,15 +548,132 @@ RIGHT supplies the latest authoritative message snapshot."
      (message "pi-coding-agent: error dispatching process response: %s"
               (error-message-string err)))))
 
+(defun pi-coding-agent--process-chat-buffer (proc)
+  "Return PROC's live Pi chat buffer, or nil."
+  (let ((buffer (process-get proc 'pi-coding-agent-chat-buffer)))
+    (and (buffer-live-p buffer) buffer)))
+
+(defun pi-coding-agent--cross-read-batching-enabled-p (proc)
+  "Return non-nil when cross-read delta batching is enabled for PROC."
+  (when-let* ((buffer (pi-coding-agent--process-chat-buffer proc)))
+    (buffer-local-value 'pi-coding-agent-cross-read-batching-enabled buffer)))
+
+(defun pi-coding-agent--cross-read-batching-delay (proc)
+  "Return the maximum pending delta delay for PROC."
+  (if-let* ((buffer (pi-coding-agent--process-chat-buffer proc)))
+      (buffer-local-value 'pi-coding-agent-cross-read-batching-delay buffer)
+    pi-coding-agent-cross-read-batching-delay))
+
+(defun pi-coding-agent--process-session-generation (proc)
+  "Return PROC's current chat session generation, or nil."
+  (when-let* ((buffer (pi-coding-agent--process-chat-buffer proc)))
+    (when (boundp 'pi-coding-agent--session-transition-generation)
+      (buffer-local-value
+       'pi-coding-agent--session-transition-generation buffer))))
+
+(defun pi-coding-agent--pending-delta-valid-p (proc)
+  "Return non-nil when PROC's pending delta still belongs to its session."
+  (let ((buffer (process-get proc 'pi-coding-agent-pending-delta-buffer))
+        (generation
+         (process-get proc 'pi-coding-agent-pending-delta-generation)))
+    (or (null buffer)
+        (and (buffer-live-p buffer)
+             (eq buffer (pi-coding-agent--process-chat-buffer proc))
+             (or (null generation)
+                 (equal generation
+                        (pi-coding-agent--process-session-generation proc)))))))
+
+(defun pi-coding-agent--clear-pending-delta (proc)
+  "Clear PROC's pending delta state and return EVENT, COUNT, and TIMER."
+  (let ((state
+         (list (process-get proc 'pi-coding-agent-pending-delta)
+               (or (process-get proc 'pi-coding-agent-pending-delta-count) 0)
+               (process-get proc 'pi-coding-agent-pending-delta-timer))))
+    (process-put proc 'pi-coding-agent-pending-delta nil)
+    (process-put proc 'pi-coding-agent-pending-delta-count nil)
+    (process-put proc 'pi-coding-agent-pending-delta-timer nil)
+    (process-put proc 'pi-coding-agent-pending-delta-buffer nil)
+    (process-put proc 'pi-coding-agent-pending-delta-generation nil)
+    state))
+
+(defun pi-coding-agent--flush-pending-delta (proc reason)
+  "Dispatch PROC's valid pending delta, recording flush REASON.
+Return non-nil when an event was dispatched."
+  (when (process-get proc 'pi-coding-agent-pending-delta)
+    (let* ((valid (pi-coding-agent--pending-delta-valid-p proc))
+           (state (pi-coding-agent--clear-pending-delta proc))
+           (event (nth 0 state))
+           (count (nth 1 state))
+           (timer (nth 2 state)))
+      (when (timerp timer)
+        (cancel-timer timer))
+      (when valid
+        (let ((inhibit-redisplay t))
+          (pi-coding-agent--dispatch-process-json proc event))
+        (if-let* ((buffer (pi-coding-agent--process-chat-buffer proc)))
+            (with-current-buffer buffer
+              (run-hook-with-args
+               'pi-coding-agent-cross-read-batching-metrics-functions
+               proc count reason))
+          (run-hook-with-args
+           'pi-coding-agent-cross-read-batching-metrics-functions
+           proc count reason))
+        t))))
+
+(defun pi-coding-agent--cancel-pending-delta (proc)
+  "Discard PROC's pending delta and cancel its timer."
+  (when (process-get proc 'pi-coding-agent-pending-delta)
+    (let ((timer (nth 2 (pi-coding-agent--clear-pending-delta proc))))
+      (when (timerp timer)
+        (cancel-timer timer)))))
+
+(defun pi-coding-agent--flush-pending-delta-from-timer (proc)
+  "Flush PROC's pending delta at its fixed batching deadline."
+  (pi-coding-agent--flush-pending-delta proc 'deadline))
+
+(defun pi-coding-agent--queue-cross-read-delta (proc event)
+  "Merge or enqueue one compatible delta EVENT for PROC."
+  (let ((pending (process-get proc 'pi-coding-agent-pending-delta)))
+    (if (and pending
+             (pi-coding-agent--mergeable-delta-events-p pending event))
+        (progn
+          (process-put
+           proc 'pi-coding-agent-pending-delta
+           (pi-coding-agent--merge-delta-events pending event))
+          (process-put
+           proc 'pi-coding-agent-pending-delta-count
+           (1+ (or
+                (process-get proc 'pi-coding-agent-pending-delta-count)
+                1))))
+      (pi-coding-agent--flush-pending-delta proc 'boundary)
+      (let ((buffer (pi-coding-agent--process-chat-buffer proc)))
+        (process-put proc 'pi-coding-agent-pending-delta event)
+        (process-put proc 'pi-coding-agent-pending-delta-count 1)
+        (process-put proc 'pi-coding-agent-pending-delta-buffer buffer)
+        (process-put
+         proc 'pi-coding-agent-pending-delta-generation
+         (pi-coding-agent--process-session-generation proc))
+        (process-put
+         proc 'pi-coding-agent-pending-delta-timer
+         (run-at-time
+          (pi-coding-agent--cross-read-batching-delay proc) nil
+          #'pi-coding-agent--flush-pending-delta-from-timer proc))))))
+
+(defun pi-coding-agent--mergeable-delta-event-p (event)
+  "Return non-nil when EVENT is eligible for cross-read batching."
+  (pi-coding-agent--mergeable-delta-events-p event event))
+
 (defun pi-coding-agent--process-filter (proc output)
   "Handle OUTPUT from pi PROC.
 Accumulates output and dispatches complete JSON lines.
-Compatible adjacent text or thinking deltas delivered in one process read are
-coalesced before dispatch; every other record remains an ordering boundary."
+Compatible adjacent text or thinking deltas are coalesced.  For real Pi chat
+processes they may remain pending across reads for one bounded display frame;
+every other record remains an ordering boundary."
   (let* ((inhibit-redisplay t)
          (partial (process-get proc 'pi-coding-agent-partial-output-chunks))
          (result (pi-coding-agent--accumulate-line-chunks partial output))
          (lines (car result))
+         (cross-read (pi-coding-agent--cross-read-batching-enabled-p proc))
          pending)
     (process-put proc 'pi-coding-agent-partial-output-chunks (cdr result))
     (cl-labels ((flush-pending ()
@@ -562,20 +684,29 @@ coalesced before dispatch; every other record remains an ordering boundary."
         (if (equal line pi-coding-agent--remote-ready-marker)
             (progn
               (flush-pending)
+              (pi-coding-agent--flush-pending-delta proc 'ready)
               (pi-coding-agent--mark-process-ready proc))
           (if-let* ((json (pi-coding-agent--parse-json-line line)))
-              (if (and pending
-                       (pi-coding-agent--mergeable-delta-events-p pending json))
-                  (setq pending
-                        (pi-coding-agent--merge-delta-events pending json))
-                (flush-pending)
-                (setq pending json))
-            (flush-pending))))
-      (flush-pending))))
+              (if cross-read
+                  (if (pi-coding-agent--mergeable-delta-event-p json)
+                      (pi-coding-agent--queue-cross-read-delta proc json)
+                    (pi-coding-agent--flush-pending-delta proc 'boundary)
+                    (pi-coding-agent--dispatch-process-json proc json))
+                (if (and pending
+                         (pi-coding-agent--mergeable-delta-events-p pending json))
+                    (setq pending
+                          (pi-coding-agent--merge-delta-events pending json))
+                  (flush-pending)
+                  (setq pending json)))
+            (flush-pending)
+            (pi-coding-agent--flush-pending-delta proc 'malformed))))
+      (unless cross-read
+        (flush-pending)))))
 
 (defun pi-coding-agent--process-sentinel (proc event)
   "Handle process state change EVENT for PROC."
   (unless (process-live-p proc)
+    (pi-coding-agent--flush-pending-delta proc 'process-exit)
     (pi-coding-agent--handle-process-exit proc event)))
 
 (defun pi-coding-agent--dispatch-response (proc json)
@@ -663,6 +794,7 @@ Calls only the handler registered for this specific process."
   "Clean up when pi process PROC exits with EVENT.
 Calls pending request callbacks for this process with an error response
 containing EVENT, then clears this process's pending request tables."
+  (pi-coding-agent--flush-pending-delta proc 'process-exit)
   (let* ((pending (process-get proc 'pi-coding-agent-pending-requests))
          (pending-types (process-get proc 'pi-coding-agent-pending-command-types))
          (stderr (pi-coding-agent--process-stderr-excerpt proc))
