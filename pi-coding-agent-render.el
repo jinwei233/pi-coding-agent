@@ -2786,13 +2786,30 @@ if none exists, render the result at point without a live overlay."
           :images (pi-coding-agent--tool-result-images content)
           :detail-locator detail-locator)))
 
+(defun pi-coding-agent--insert-tool-summary-fragment (text)
+  "Insert summary TEXT without exposing Markdown fence delimiters.
+Tool tails are derived display content, but they share the chat buffer's
+Markdown parser.  Hide an inserted escape before fence-like lines so raw tool
+output cannot turn later assistant content into fenced code."
+  (let ((copy-start 0)
+        (search-start 0))
+    (while (string-match
+            "^\\([ ]\\{0,3\\}\\)\\([`~]\\{3,\\}\\)"
+            text search-start)
+      (insert (substring text copy-start (match-beginning 2)))
+      (insert (propertize "\\" 'display ""))
+      (setq copy-start (match-beginning 2)
+            search-start (match-end 2)))
+    (insert (substring text copy-start))))
+
 (defun pi-coding-agent--insert-tool-summary (record)
   "Insert the visible lightweight summary for RECORD."
   (let* ((summary (plist-get record :summary))
          (tool-call-id (plist-get record :tool-call-id))
          (tab-start (or (string-match "TAB details" summary)
                         (length summary))))
-    (insert (substring summary 0 tab-start))
+    (pi-coding-agent--insert-tool-summary-fragment
+     (substring summary 0 tab-start))
     (insert-text-button
      (if (< tab-start (length summary)) "TAB details" "[details]")
      'action #'pi-coding-agent--toggle-tool-summary
@@ -2803,7 +2820,8 @@ if none exists, render the result at point without a live overlay."
      'pi-coding-agent-tool-images (plist-get record :images)
      'pi-coding-agent-expanded nil)
     (when (< (+ tab-start (length "TAB details")) (length summary))
-      (insert (substring summary (+ tab-start (length "TAB details")))))
+      (pi-coding-agent--insert-tool-summary-fragment
+       (substring summary (+ tab-start (length "TAB details")))))
     (insert "\n")
     (pi-coding-agent--insert-output-image-blocks
      (plist-get record :images)

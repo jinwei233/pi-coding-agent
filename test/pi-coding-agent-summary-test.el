@@ -51,6 +51,28 @@
           (should-not (string-match-p hidden text))
           (should (string-match-p "TAB" text)))))))
 
+(ert-deftest pi-coding-agent-test-tool-summary-fence-does-not-swallow-later-table ()
+  "A fence-like line in a tool tail must not poison later Markdown."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (pi-coding-agent--insert-tool-summary
+       '(:tool-call-id "call-fence"
+         :summary "8 lines (3 hidden)\noutput\n```\nTAB details"))
+      (insert "\n| Check | Result |\n|---|---|\n| parser | healthy |\n"))
+    (let ((visible (substring-no-properties
+                    (pi-coding-agent--visible-text (point-min) (point-max))))
+          (regions (pi-coding-agent--treesit-table-regions
+                    (point-min) (point-max))))
+      (should (string-match-p "\n```\\(?:\n\\|$\\)" visible))
+      (should (string-match-p "\n\\\\```\n" (buffer-string)))
+      (should (= 1 (length regions)))
+      (pi-coding-agent--decorate-tables-in-region (point-min) (point-max) 40)
+      (should (seq-some
+               (lambda (overlay)
+                 (overlay-get overlay 'pi-coding-agent-table-display))
+               (overlays-in (point-min) (point-max)))))))
+
 (ert-deftest pi-coding-agent-test-tool-detail-pair-prefers-canonical-and-falls-back-live ()
   "Pair lookup uses canonical data first and live data for a missing id."
   (with-temp-buffer
