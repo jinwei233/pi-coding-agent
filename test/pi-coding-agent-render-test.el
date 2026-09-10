@@ -13525,5 +13525,128 @@ events where the header text hasn't changed."
       (goto-char (marker-position pi-coding-agent--hot-tail-start))
       (should (looking-at "Assistant")))))
 
+(defun pi-coding-agent-test--render-cross-read-transcript (batching)
+  "Render a fixed cross-read transcript with BATCHING and return its state."
+  (let ((buffer (generate-new-buffer " *pi-cross-read-render*"))
+        (process (start-process "cat" nil "cat"))
+        (updates 0)
+        result)
+    (unwind-protect
+        (with-current-buffer buffer
+          (pi-coding-agent-chat-mode)
+          (setq-local pi-coding-agent-cross-read-batching-enabled batching
+                      pi-coding-agent-cross-read-batching-delay 10
+                      pi-coding-agent--session-transition-generation 0
+                      pi-coding-agent--process process)
+          (set-process-buffer process buffer)
+          (set-process-query-on-exit-flag process nil)
+          (process-put process 'pi-coding-agent-chat-buffer buffer)
+          (pi-coding-agent--register-display-handler process)
+          (add-hook 'after-change-functions
+                    (lambda (&rest _arguments)
+                      (setq updates (1+ updates)))
+                    nil t)
+          (dolist
+              (event
+               (list
+                '(:type "agent_start")
+                '(:type "message_start"
+                  :message (:role "assistant" :timestamp 1))
+                '(:type "message_update"
+                  :message (:role "assistant" :timestamp 1)
+                  :assistantMessageEvent
+                  (:type "thinking_delta" :contentIndex 0 :delta "Plan "))
+                '(:type "message_update"
+                  :message (:role "assistant" :timestamp 1)
+                  :assistantMessageEvent
+                  (:type "thinking_delta" :contentIndex 0 :delta "done."))
+                '(:type "message_update"
+                  :message (:role "assistant" :timestamp 1)
+                  :assistantMessageEvent
+                  (:type "text_delta" :contentIndex 1 :delta "Hello "))
+                '(:type "message_update"
+                  :message (:role "assistant" :timestamp 1)
+                  :assistantMessageEvent
+                  (:type "text_delta" :contentIndex 1 :delta "world."))
+                '(:type "message_end"
+                  :message (:role "assistant" :timestamp 1))
+                '(:type "agent_end" :messages [])))
+            (pi-coding-agent--process-filter
+             process (concat (json-encode event) "\n")))
+          (should-not
+           (process-get process 'pi-coding-agent-pending-delta))
+          (setq result
+                (list :text (buffer-string)
+                      :status pi-coding-agent--status
+                      :phase pi-coding-agent--activity-phase
+                      :updates updates)))
+      (pi-coding-agent--cancel-pending-delta process)
+      (when (processp process)
+        (pi-coding-agent--unregister-display-handler process)
+        (when (process-live-p process)
+          (delete-process process)))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq pi-coding-agent--process nil))
+        (kill-buffer buffer)))
+    result))
+
+(ert-deftest pi-coding-agent-test-cross-read-batching-preserves-rendered-result ()
+  "Cross-read batching reduces updates without changing rendered state."
+  (let ((baseline
+         (pi-coding-agent-test--render-cross-read-transcript nil))
+        (batched
+         (pi-coding-agent-test--render-cross-read-transcript t)))
+    (should (equal (plist-get baseline :text)
+                   (plist-get batched :text)))
+    (should (eq (plist-get baseline :status)
+                (plist-get batched :status)))
+    (should (equal (plist-get baseline :phase)
+                   (plist-get batched :phase)))
+    (should (< (plist-get batched :updates)
+               (plist-get baseline :updates)))))
+
+(ert-deftest pi-coding-agent-test-chat-kill-cancels-pending-cross-read-delta ()
+  "Killing a chat buffer cancels its pending delta and deadline timer."
+  (let ((buffer (generate-new-buffer " *pi-cross-read-kill*"))
+        (process (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (pi-coding-agent-chat-mode)
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0
+                        pi-coding-agent--process process))
+          (set-process-buffer process buffer)
+          (set-process-query-on-exit-flag process nil)
+          (process-put process 'pi-coding-agent-chat-buffer buffer)
+          (process-put process 'pi-coding-agent-skip-kill-confirmation t)
+          (pi-coding-agent--register-display-handler process)
+          (pi-coding-agent--process-filter
+           process
+           (concat
+            (json-encode
+             '(:type "message_update"
+               :message (:role "assistant" :timestamp 1)
+               :assistantMessageEvent
+               (:type "text_delta" :contentIndex 0 :delta "pending")))
+            "\n"))
+          (should
+           (timerp
+            (process-get
+             process 'pi-coding-agent-pending-delta-timer)))
+          (kill-buffer buffer)
+          (should-not
+           (process-get process 'pi-coding-agent-pending-delta))
+          (should-not
+           (process-get process 'pi-coding-agent-pending-delta-timer)))
+      (pi-coding-agent--cancel-pending-delta process)
+      (when (process-live-p process) (delete-process process))
+      (when (buffer-live-p buffer)
+        (with-current-buffer buffer
+          (setq pi-coding-agent--process nil))
+        (kill-buffer buffer)))))
+
 (provide 'pi-coding-agent-render-test)
 ;;; pi-coding-agent-render-test.el ends here

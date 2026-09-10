@@ -109,6 +109,316 @@ This ensures all files get code fences for consistent display."
     (should word-wrap)
     (should-not truncate-lines)))
 
+;;;; Local Parser Lifecycle
+
+(defun pi-coding-agent-test--insert-parser-paragraphs (count)
+  "Insert COUNT deterministic Markdown paragraphs in the current buffer."
+  (let ((inhibit-read-only t))
+    (dotimes (index count)
+      (insert (format "Paragraph %04d with **bold** and `code`.\n\n" index)))))
+
+(defun pi-coding-agent-test--reconciled-local-parser-count (paragraphs)
+  "Return retained local parser count after PARAGRAPHS become cold."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 512)
+    (pi-coding-agent-test--insert-parser-paragraphs paragraphs)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (move-marker pi-coding-agent--hot-tail-start (point-min))
+    (pi-coding-agent--reconcile-local-parsers)
+    (length (pi-coding-agent--local-parser-ownership-overlays))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-tags-only-md-ts-owned-overlays ()
+  "Pi ownership tags cover md-ts overlays but exclude a foreign parser overlay."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 2)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (let* ((owned (pi-coding-agent--local-parser-ownership-overlays))
+           (foreign-parser
+            (treesit-parser-create 'markdown-inline nil t))
+           (host (treesit-parser-create 'markdown))
+           (foreign-overlay (make-overlay (point-min) (line-end-position))))
+      (unwind-protect
+          (progn
+            (treesit-parser-set-included-ranges
+             foreign-parser
+             (list (cons (overlay-start foreign-overlay)
+                         (overlay-end foreign-overlay))))
+            (overlay-put foreign-overlay 'treesit-parser foreign-parser)
+            (overlay-put foreign-overlay 'treesit-host-parser host)
+            (overlay-put foreign-overlay 'treesit-parser-ov-timestamp
+                         (buffer-chars-modified-tick))
+            (should (= (length owned) 2))
+            (should
+             (seq-every-p
+              (lambda (overlay)
+                (eq (overlay-get
+                     overlay 'pi-coding-agent-local-parser-owner)
+                    'md-ts))
+              owned))
+            (should-not
+             (memq foreign-overlay
+                   (pi-coding-agent--local-parser-ownership-overlays)))
+            (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+            (move-marker pi-coding-agent--hot-tail-start (point-max))
+            (pi-coding-agent--reconcile-local-parsers)
+            (should (overlay-buffer foreign-overlay))
+            (should (memq foreign-parser
+                          (pi-coding-agent--all-treesit-parsers))))
+        (when (overlay-buffer foreign-overlay)
+          (delete-overlay foreign-overlay))
+        (when (memq foreign-parser (pi-coding-agent--all-treesit-parsers))
+          (treesit-parser-delete foreign-parser))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-preserves-shared-parser ()
+  "A verified local parser stays live while an unknown overlay references it."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 1)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (let* ((owned (car (pi-coding-agent--local-parser-ownership-overlays)))
+           (parser (overlay-get owned 'treesit-parser))
+           (foreign (make-overlay (overlay-start owned) (overlay-end owned))))
+      (unwind-protect
+          (progn
+            (overlay-put foreign 'treesit-parser parser)
+            (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+            (move-marker pi-coding-agent--hot-tail-start (point-max))
+            (should (= 0 (pi-coding-agent--reconcile-local-parsers)))
+            (should (overlay-buffer owned))
+            (should (memq parser (pi-coding-agent--all-treesit-parsers))))
+        (when (overlay-buffer foreign)
+          (delete-overlay foreign))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-bounds-cold-history ()
+  "Doubling cold history does not increase retained local parser count."
+  (let ((short (pi-coding-agent-test--reconciled-local-parser-count 100))
+        (long (pi-coding-agent-test--reconciled-local-parser-count 200)))
+    (should (= short long))
+    (should (< long 20))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-freezes-rendered-properties ()
+  "Reclaiming cold parsers preserves source and rendered text properties."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 4)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (goto-char (point-min))
+    (search-forward "bold")
+    (let* ((position (1- (point)))
+           (source (buffer-string))
+           (face (get-text-property position 'face))
+           (display (get-text-property position 'display))
+           (invisible (get-text-property position 'invisible)))
+      (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+      (move-marker pi-coding-agent--hot-tail-start (point-max))
+      (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+      (should (equal source (buffer-string)))
+      (should (equal face (get-text-property position 'face)))
+      (should (equal display (get-text-property position 'display)))
+      (should (equal invisible (get-text-property position 'invisible)))
+      (should-not (pi-coding-agent--local-parser-ownership-overlays)))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-restores-only-refontified-range ()
+  "Refontifying a cold paragraph recreates only its bounded local parser."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 20)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+    (move-marker pi-coding-agent--hot-tail-start (point-max))
+    (pi-coding-agent--reconcile-local-parsers)
+    (should-not (pi-coding-agent--local-parser-ownership-overlays))
+    (let ((end (save-excursion
+                 (goto-char (point-min))
+                 (forward-paragraph)
+                 (point))))
+      (font-lock-flush (point-min) end)
+      (font-lock-ensure (point-min) end)
+      (pi-coding-agent--cancel-parser-reconciliation)
+      (let ((restored (pi-coding-agent--local-parser-ownership-overlays)))
+        (should (= (length restored) 1))
+        (should (<= (overlay-end (car restored)) end))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-survives-full-fontification-refresh ()
+  "A full refresh restores display state without keeping all history parsers."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 40)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 256)
+    (move-marker pi-coding-agent--hot-tail-start (point-min))
+    (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+    (font-lock-flush (point-min) (point-max))
+    (font-lock-ensure (point-min) (point-max))
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (should (> (length (pi-coding-agent--local-parser-ownership-overlays)) 1))
+    (pi-coding-agent--reconcile-local-parsers)
+    (let ((retained (pi-coding-agent--local-parser-ownership-overlays)))
+      (should retained)
+      (should (< (length retained) 10)))
+    (goto-char (point-min))
+    (search-forward "bold")
+    (let ((face (get-text-property (1- (point)) 'face)))
+      (should (or (eq face 'bold)
+                  (and (listp face) (memq 'bold face)))))))
+
+(ert-deftest pi-coding-agent-test-parser-retained-ranges-merge-windows-and-tail ()
+  "Visible windows, margins, and the bounded tail form merged retained ranges."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (dotimes (index 100)
+        (insert (format "Line %03d\n" index))))
+    (let* ((first-start (save-excursion
+                          (goto-char (point-min)) (forward-line 10) (point)))
+           (first-end (save-excursion
+                        (goto-char (point-min)) (forward-line 20) (point)))
+           (second-start (save-excursion
+                           (goto-char (point-min)) (forward-line 50) (point)))
+           (second-end (save-excursion
+                         (goto-char (point-min)) (forward-line 60) (point)))
+           (pi-coding-agent-parser-visible-margin-heights 1)
+           (pi-coding-agent-parser-hot-tail-max-bytes 20))
+      (move-marker pi-coding-agent--hot-tail-start (point-min))
+      (cl-letf (((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _args) '(first second)))
+                ((symbol-function 'window-live-p) (lambda (_window) t))
+                ((symbol-function 'window-buffer)
+                 (lambda (_window) (current-buffer)))
+                ((symbol-function 'window-start)
+                 (lambda (window)
+                   (if (eq window 'first) first-start second-start)))
+                ((symbol-function 'window-end)
+                 (lambda (window &optional _update)
+                   (if (eq window 'first) first-end second-end)))
+                ((symbol-function 'window-body-height)
+                 (lambda (_window &optional _pixelwise) 2)))
+        (let ((ranges (pi-coding-agent--parser-retained-ranges)))
+          (should (= (length ranges) 3))
+          (should (< (caar ranges) first-start))
+          (should (> (cdar ranges) first-end))
+          (should (= (cdar (last ranges)) (point-max))))))))
+
+(ert-deftest pi-coding-agent-test-parser-retained-ranges-include-live-content ()
+  "Message, thinking, and tool activity retain their bounded parser ranges."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert (make-string 1000 ?x)))
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 20)
+    (move-marker pi-coding-agent--hot-tail-start (point-min))
+    (setq-local pi-coding-agent--message-start-marker (copy-marker 101)
+                pi-coding-agent--streaming-marker (copy-marker 201)
+                pi-coding-agent--thinking-start-marker (copy-marker 301)
+                pi-coding-agent--thinking-marker (copy-marker 401))
+    (let* ((tool-overlay (make-overlay 501 551))
+           (tool-block
+            (pi-coding-agent--make-tool-block
+             :tool-call-id "tool-1" :overlay tool-overlay)))
+      (puthash "tool-1" tool-block pi-coding-agent--live-tool-blocks)
+      (cl-letf (((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _args) nil)))
+        (should
+         (equal (pi-coding-agent--parser-retained-ranges)
+                (list (cons 181 201)
+                      (cons 381 401)
+                      (cons 501 551)
+                      (cons 981 1001))))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-cleanup-cancels-timer ()
+  "Killing lifecycle state invalidates and cancels its pending timer."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((generation pi-coding-agent--parser-lifecycle-generation))
+      (pi-coding-agent--schedule-parser-reconciliation)
+      (should (timerp pi-coding-agent--parser-reconcile-timer))
+      (pi-coding-agent--cleanup-parser-lifecycle)
+      (should-not pi-coding-agent--parser-reconcile-timer)
+      (should (= pi-coding-agent--parser-lifecycle-generation
+                 (1+ generation))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-ignores-stale-generation ()
+  "A delayed reconciliation cannot modify a newer parser lifecycle generation."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (let ((calls 0)
+          (generation pi-coding-agent--parser-lifecycle-generation)
+          (session-generation
+           pi-coding-agent--session-transition-generation))
+      (setq pi-coding-agent--parser-lifecycle-generation (1+ generation))
+      (cl-letf (((symbol-function 'pi-coding-agent--reconcile-local-parsers)
+                 (lambda () (setq calls (1+ calls)))))
+        (pi-coding-agent--run-parser-reconciliation
+         (current-buffer) generation session-generation))
+      (should (= calls 0)))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-error-disables-only-optimization ()
+  "A reconciliation error disables lifecycle work without escaping."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (let ((generation pi-coding-agent--parser-lifecycle-generation)
+          (session-generation
+           pi-coding-agent--session-transition-generation))
+      (cl-letf (((symbol-function 'pi-coding-agent--reconcile-local-parsers)
+                 (lambda () (error "injected parser failure"))))
+        (pi-coding-agent--run-parser-reconciliation
+         (current-buffer) generation session-generation))
+      (should-not pi-coding-agent-parser-lifecycle-enabled))))
+
+(ert-deftest pi-coding-agent-test-parser-delete-error-preserves-ownership ()
+  "A parser deletion error keeps its ownership overlay for a later retry."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 1)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (let ((owned (car (pi-coding-agent--local-parser-ownership-overlays))))
+      (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+      (move-marker pi-coding-agent--hot-tail-start (point-max))
+      (cl-letf (((symbol-function 'treesit-parser-delete)
+                 (lambda (_parser) (error "injected delete failure"))))
+        (should (= 0 (pi-coding-agent--reconcile-local-parsers))))
+      (should (overlay-buffer owned))
+      (should
+       (memq owned (pi-coding-agent--local-parser-ownership-overlays))))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-timers-are-buffer-local ()
+  "Scheduling and cleanup in one chat buffer do not affect another."
+  (let ((first (generate-new-buffer " *pi-parser-first*"))
+        (second (generate-new-buffer " *pi-parser-second*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--schedule-parser-reconciliation))
+          (with-current-buffer second
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--schedule-parser-reconciliation))
+          (let ((second-timer
+                 (buffer-local-value
+                  'pi-coding-agent--parser-reconcile-timer second)))
+            (with-current-buffer first
+              (pi-coding-agent--cleanup-parser-lifecycle))
+            (should-not
+             (buffer-local-value
+              'pi-coding-agent--parser-reconcile-timer first))
+            (should
+             (eq second-timer
+                 (buffer-local-value
+                  'pi-coding-agent--parser-reconcile-timer second)))))
+      (when (buffer-live-p first) (kill-buffer first))
+      (when (buffer-live-p second) (kill-buffer second)))))
+
 (ert-deftest pi-coding-agent-test-chat-mode-disables-hl-line ()
   "pi-coding-agent-chat-mode disables hl-line to prevent scroll oscillation."
   (with-temp-buffer
@@ -126,7 +436,11 @@ This ensures all files get code fences for consistent display."
     (pi-coding-agent-chat-mode)
     (should (local-variable-p 'window-configuration-change-hook))
     (should (memq #'pi-coding-agent--maybe-refresh-hot-tail-tables
-                  window-configuration-change-hook))))
+                  window-configuration-change-hook))
+    (should (memq #'pi-coding-agent--schedule-parser-reconciliation
+                  window-configuration-change-hook))
+    (should (memq #'pi-coding-agent--parser-window-scrolled
+                  window-scroll-functions))))
 
 (ert-deftest pi-coding-agent-test-chat-mode-initializes-with-theme-derived-diff-faces ()
   "Chat mode startup should not depend on diff-mode being loaded elsewhere."

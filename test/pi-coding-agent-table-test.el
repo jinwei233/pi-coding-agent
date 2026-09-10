@@ -1200,6 +1200,60 @@ When fringes like `display-line-numbers-mode' consume columns,
     (should (>= (length (pi-coding-agent-test--display-overlays)) 1))
     (should (null (pi-coding-agent-test--raw-overlays)))))
 
+(ert-deftest pi-coding-agent-test-parser-reclaim-preserves-table-and-link-behavior ()
+  "Cold parser reclamation preserves canonical text, copy, links, and tables."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--set-chat-session-identity "/tmp/session/")
+    (let ((inhibit-read-only t))
+      (insert
+       "See [config](src/config.el:12).\n\n"
+       "> Thinking with **emphasis**.\n\n"
+       "```elisp\n(message \"synthetic\")\n```\n\n"
+       "![image](file:///tmp/nonexistent.png)\n\n"
+       pi-coding-agent-test--wide-table))
+    (font-lock-ensure)
+    (pi-coding-agent-test--decorate-all-tables)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (goto-char (point-min))
+    (search-forward "config")
+    (let* ((link-position (1- (point)))
+           (source (buffer-string))
+           (visible-copy
+            (funcall filter-buffer-substring-function
+                     (point-min) (point-max) nil))
+           (link-before
+            (save-excursion
+              (goto-char link-position)
+              (pi-coding-agent--file-target-at-point)))
+           (table-before
+            (pi-coding-agent-test--table-overlay-displays-in-region
+             (point-min) (point-max))))
+      (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+      (move-marker pi-coding-agent--hot-tail-start (point-max))
+      (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+      (should (equal source (buffer-string)))
+      (should
+       (equal visible-copy
+              (funcall filter-buffer-substring-function
+                       (point-min) (point-max) nil)))
+      (should
+       (equal link-before
+              (save-excursion
+                (goto-char link-position)
+                (pi-coding-agent--file-target-at-point))))
+      (should
+       (equal table-before
+              (pi-coding-agent-test--table-overlay-displays-in-region
+               (point-min) (point-max))))
+      (goto-char (point-min))
+      (search-forward "| Feature")
+      (beginning-of-line)
+      (pi-coding-agent-toggle-table-pretty)
+      (should (= 1 (length (pi-coding-agent-test--raw-overlays))))
+      (pi-coding-agent-toggle-table-pretty)
+      (should (pi-coding-agent-test--display-overlays)))))
+
 (ert-deftest pi-coding-agent-test-toggle-off-table-toggles-all ()
   "Point off-table toggles every table in the buffer."
   (with-temp-buffer

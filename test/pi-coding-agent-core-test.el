@@ -1426,6 +1426,284 @@ redisplay cycle instead of triggering N separate redraws."
             '("a" "b" "c" nil "d"))))
       (delete-process fake-proc))))
 
+(defun pi-coding-agent-test--delta-json-line
+    (delta &optional type content-index timestamp)
+  "Return one Pi delta JSON line for DELTA.
+TYPE defaults to text_delta, CONTENT-INDEX to zero and TIMESTAMP to one."
+  (json-encode
+   (list :type "message_update"
+         :message
+         (list :role "assistant" :timestamp (or timestamp 1))
+         :assistantMessageEvent
+         (list :type (or type "text_delta")
+               :contentIndex (or content-index 0)
+               :delta delta))))
+
+(ert-deftest pi-coding-agent-test-process-filter-batches-deltas-across-reads ()
+  "Compatible deltas share one fixed timer and dispatch once across reads."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-test*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0
+                        pi-coding-agent--process fake-proc))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "Hello ") "\n"))
+          (let ((deadline
+                 (process-get
+                  fake-proc 'pi-coding-agent-pending-delta-timer)))
+            (should (timerp deadline))
+            (should-not events)
+            (pi-coding-agent--process-filter
+             fake-proc
+             (concat (pi-coding-agent-test--delta-json-line "world") "\n"))
+            (should
+             (eq deadline
+                 (process-get
+                  fake-proc 'pi-coding-agent-pending-delta-timer))))
+          (should (pi-coding-agent--flush-pending-delta fake-proc 'test))
+          (should (= (length events) 1))
+          (should
+           (equal
+            (plist-get
+             (plist-get (car events) :assistantMessageEvent) :delta)
+            "Hello world")))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-filter-flushes-before-boundary ()
+  "A non-delta event synchronously flushes an earlier pending delta."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-boundary*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event)
+                         (setq events
+                               (append events (list (plist-get event :type))))))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "a") "\n"))
+          (pi-coding-agent--process-filter
+           fake-proc "{\"type\":\"agent_end\"}\n")
+          (should (equal events '("message_update" "agent_end")))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-filter-cross-read-boundary-matrix ()
+  "Index, delta type, tool, malformed input, and response remain boundaries."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-matrix*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "a") "\n"))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat
+            (pi-coding-agent-test--delta-json-line
+             "b" "text_delta" 1)
+            "\n"))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat
+            (pi-coding-agent-test--delta-json-line
+             "c" "thinking_delta" 1)
+            "\n"))
+          (pi-coding-agent--process-filter
+           fake-proc
+           "{\"type\":\"tool_execution_start\",\"toolCallId\":\"t1\"}\n")
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "d") "\n"))
+          (pi-coding-agent--process-filter fake-proc "not-json\n")
+          (pi-coding-agent--process-filter
+           fake-proc "{\"type\":\"response\",\"id\":\"unknown\"}\n")
+          (setq events (nreverse events))
+          (should
+           (equal
+            (mapcar
+             (lambda (event)
+               (or
+                (plist-get
+                 (plist-get event :assistantMessageEvent) :delta)
+                (plist-get event :type)))
+             events)
+            '("a" "b" "c" "tool_execution_start" "d")))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-filter-batch-deadline-dispatches ()
+  "A single pending delta becomes visible by the configured deadline."
+  (let ((events nil)
+        (redisplay-inhibited nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-deadline*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 0.01
+                        pi-coding-agent--session-transition-generation 0))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event)
+                         (setq redisplay-inhibited inhibit-redisplay)
+                         (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "visible") "\n"))
+          (should-not events)
+          (sleep-for 0.03)
+          (should (= (length events) 1))
+          (should redisplay-inhibited)
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-filter-discards-stale-generation ()
+  "A delayed delta from an old session generation cannot reach the new one."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-stale*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 3))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "stale") "\n"))
+          (with-current-buffer chat-buffer
+            (setq pi-coding-agent--session-transition-generation 4))
+          (should-not
+           (pi-coding-agent--flush-pending-delta fake-proc 'test))
+          (should-not events)
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-filter-batching-can-be-disabled ()
+  "The buffer-local batching switch restores immediate per-read dispatch."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-disabled*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled nil))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "a") "\n"))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "b") "\n"))
+          (should (= (length events) 2))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-outbound-command-flushes-pending-delta ()
+  "Sending an outbound command first exposes an earlier pending delta."
+  (let ((events nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-outbound*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "before") "\n"))
+          (pi-coding-agent--send-string fake-proc "{\"type\":\"abort\"}\n")
+          (should (= (length events) 1))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
+(ert-deftest pi-coding-agent-test-process-exit-flushes-pending-delta ()
+  "A process exit exposes valid pending content before teardown."
+  (let ((events nil)
+        (exit-handled nil)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-exit*"))
+        (fake-proc (start-process "cat" nil "cat")))
+    (unwind-protect
+        (progn
+          (set-process-query-on-exit-flag fake-proc nil)
+          (set-process-sentinel fake-proc #'ignore)
+          (with-current-buffer chat-buffer
+            (setq-local pi-coding-agent-cross-read-batching-enabled t
+                        pi-coding-agent-cross-read-batching-delay 10
+                        pi-coding-agent--session-transition-generation 0))
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (event) (push event events)))
+          (pi-coding-agent--process-filter
+           fake-proc
+           (concat (pi-coding-agent-test--delta-json-line "before-exit") "\n"))
+          (delete-process fake-proc)
+          (cl-letf (((symbol-function 'pi-coding-agent--handle-process-exit)
+                     (lambda (_proc _event) (setq exit-handled t))))
+            (pi-coding-agent--process-sentinel fake-proc "deleted\n"))
+          (should exit-handled)
+          (should (= (length events) 1))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta))
+          (should-not
+           (process-get fake-proc 'pi-coding-agent-pending-delta-timer)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
 (ert-deftest pi-coding-agent-test-process-filter-continues-after-callback-error ()
   "A failing response callback does not drop later complete lines."
   (let ((second-called nil)

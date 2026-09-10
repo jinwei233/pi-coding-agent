@@ -1221,6 +1221,7 @@ Note: This runs from `kill-buffer-hook', which executes AFTER the kill
 decision is made.  For proper cancellation support, use `pi-coding-agent-quit'
 which asks upfront before any buffers are touched."
   (when (derived-mode-p 'pi-coding-agent-chat-mode)
+    (pi-coding-agent--cleanup-parser-lifecycle)
     (pi-coding-agent--cleanup-tool-detail-buffers)
     (pi-coding-agent--cancel-followup-drain-timer)
     (pi-coding-agent--invalidate-prompt-start-wait)
@@ -1228,6 +1229,7 @@ which asks upfront before any buffers are touched."
     (dolist (proc (delete-dups (delq nil (list pi-coding-agent--process
                                                pi-coding-agent--session-transition-process))))
       (when (processp proc)
+        (pi-coding-agent--cancel-pending-delta proc)
         (pi-coding-agent--unregister-display-handler proc)
         (when (process-live-p proc)
           (delete-process proc))))
@@ -1263,6 +1265,7 @@ which asks upfront before any buffers are touched."
 
 (defun pi-coding-agent--unregister-display-handler (process)
   "Unregister display and process-exit handlers for PROCESS."
+  (pi-coding-agent--flush-pending-delta process 'unregister)
   (process-put process 'pi-coding-agent-display-handler nil)
   (process-put process 'pi-coding-agent-exit-handler nil))
 
@@ -1504,7 +1507,8 @@ Updates buffer-local state and renders display updates."
            (clrhash pi-coding-agent--transient-tool-pairs))))
      (pi-coding-agent--display-agent-end)
      (pi-coding-agent--update-hot-tail-boundary)
-     (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail))
+     (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail)
+     (pi-coding-agent--schedule-parser-reconciliation))
     ("auto_retry_start"
      (pi-coding-agent--cancel-followup-drain-timer)
      (pi-coding-agent--display-retry-start event))
@@ -6433,6 +6437,7 @@ Tool calls are rendered with headers, output, overlays, and toggles."
 
 (defun pi-coding-agent--prepare-session-history-display (messages)
   "Prepare the current chat buffer to display canonical MESSAGES."
+  (pi-coding-agent--cancel-parser-reconciliation)
   (pi-coding-agent--set-canonical-messages messages)
   (let ((inhibit-read-only t))
     (pi-coding-agent--clear-render-artifacts)
@@ -6449,7 +6454,8 @@ Tool calls are rendered with headers, output, overlays, and toggles."
   (pi-coding-agent--update-hot-tail-boundary)
   (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail)
   (pi-coding-agent--postprocess-history-buffer)
-  (goto-char (point-max)))
+  (goto-char (point-max))
+  (pi-coding-agent--schedule-parser-reconciliation))
 
 (defun pi-coding-agent--display-session-history (messages &optional chat-buf)
   "Display session history MESSAGES in the chat buffer.
@@ -6473,8 +6479,9 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
         (pi-coding-agent--finish-session-history-display)))))
 
 (defun pi-coding-agent--discard-treesit-state-before-text-swap (buffer)
-  "Remove BUFFER-local tree-sitter state before swapping its text."
+  "Remove local tree-sitter state from BUFFER before swapping its text."
   (with-current-buffer buffer
+    (pi-coding-agent--cancel-parser-reconciliation)
     (let ((parsers (treesit-parser-list nil nil t)))
       (dolist (overlay (overlays-in (point-min) (point-max)))
         (when-let* ((parser (overlay-get overlay 'treesit-parser)))
@@ -6524,6 +6531,8 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
         (set (make-local-variable variable)
              (buffer-local-value variable render-buffer)))
       (pi-coding-agent--restore-treesit-state-after-text-swap))
+    (with-current-buffer target-buffer
+      (pi-coding-agent--schedule-parser-reconciliation))
     (dolist (state window-state)
       (let ((window (nth 0 state))
             (following (nth 1 state))
