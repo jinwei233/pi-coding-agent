@@ -201,6 +201,30 @@ This ensures all files get code fences for consistent display."
     (should (= short long))
     (should (< long 20))))
 
+(ert-deftest pi-coding-agent-test-parser-lifecycle-defers-reclaim-while-streaming ()
+  "Streaming keeps cold parsers warm; the idle pass reclaims them."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent-test--insert-parser-paragraphs 20)
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+    (move-marker pi-coding-agent--hot-tail-start (point-max))
+    (let ((warm (length (pi-coding-agent--local-parser-ownership-overlays))))
+      (should (> warm 0))
+      ;; While the session is producing output, reclaiming is deferred so the
+      ;; next redisplay re-ranges existing parsers instead of recreating them.
+      (setq pi-coding-agent--status 'streaming)
+      (should (pi-coding-agent--parser-reconcile-suppressed-p))
+      (should-not (pi-coding-agent--reconcile-local-parsers))
+      (should (= warm
+                 (length (pi-coding-agent--local-parser-ownership-overlays))))
+      ;; Once the turn ends, the same scheduled pass reclaims cold parsers.
+      (setq pi-coding-agent--status 'idle)
+      (should-not (pi-coding-agent--parser-reconcile-suppressed-p))
+      (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+      (should-not (pi-coding-agent--local-parser-ownership-overlays)))))
+
 (ert-deftest pi-coding-agent-test-parser-lifecycle-freezes-rendered-properties ()
   "Reclaiming cold parsers preserves source and rendered text properties."
   (with-temp-buffer

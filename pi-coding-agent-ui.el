@@ -1095,12 +1095,20 @@ makes the hot region empty by moving the marker to `point-max'."
        (and (< start (cdr range)) (> end (car range))))
      ranges)))
 
+(defun pi-coding-agent--parser-reconcile-suppressed-p ()
+  "Return non-nil while cold local parsers must stay warm.
+Reclaiming local parsers mid-stream lets the next redisplay recreate them
+across cold history (thousands of md-ts inline parsers, seconds of work), so
+reconciliation is deferred until the session returns to idle."
+  (memq pi-coding-agent--status '(sending streaming compacting)))
+
 (defun pi-coding-agent--reconcile-local-parsers ()
   "Reclaim verified local parsers wholly outside retained Pi ranges.
 Return the number of parser objects reclaimed."
   (when (and pi-coding-agent-parser-lifecycle-enabled
              (derived-mode-p 'pi-coding-agent-chat-mode)
-             (not pi-coding-agent--parser-reconciling))
+             (not pi-coding-agent--parser-reconciling)
+             (not (pi-coding-agent--parser-reconcile-suppressed-p)))
     (let* ((pi-coding-agent--parser-reconciling t)
            (ranges (pi-coding-agent--parser-retained-ranges))
            (ownership (pi-coding-agent--local-parser-ownership-overlays))
