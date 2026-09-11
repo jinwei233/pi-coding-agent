@@ -2818,10 +2818,27 @@ Stores the result in CHAT-BUF and emits a minibuffer notice when available."
 (defun pi-coding-agent--shorten-model-name (name)
   "Shorten model NAME for display.
 Removes common prefixes like \"Claude \" and suffixes like \" (latest)\"."
-  (thread-last name
-    (replace-regexp-in-string "^[Cc]laude " "")
-    (replace-regexp-in-string " (latest)$" "")
-    (replace-regexp-in-string "^claude-" "")))
+  (let ((short
+         (cdr (assoc name
+                     '(("DeepSeek V4 Flash" . "V4 Flash")
+                       ("DeepSeek V4 Pro" . "V4 Pro")
+                       ("DeepSeek V4 Flash Vision Exp" . "V4 Vision"))))))
+    (or short
+        (thread-last name
+          (replace-regexp-in-string "^[Cc]laude " "")
+          (replace-regexp-in-string " (latest)$" "")
+          (replace-regexp-in-string "^claude-" "")))))
+
+(defun pi-coding-agent--shorten-model-reference (provider model-id)
+  "Return a compact display reference for PROVIDER and MODEL-ID."
+  (format "[%s/%s]"
+          (or (cdr (assoc provider '(("deepseek" . "ds")))) provider "?")
+          (or (cdr (assoc model-id
+                          '(("deepseek-v4-flash" . "v4-flash")
+                            ("deepseek-v4-pro" . "v4-pro")
+                            ("deepseek-v4-flash-vision-exp" . "v4-vision"))))
+              model-id
+              "?")))
 
 (defun pi-coding-agent--model-reference (model)
   "Return MODEL's (PROVIDER . ID) reference, or nil."

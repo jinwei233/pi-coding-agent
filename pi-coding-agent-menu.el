@@ -971,7 +971,7 @@ The name is displayed in the resume picker and header-line."
          (precision (if (eq pi-coding-agent-price-currency 'cny) 2 3)))
     (list (if current "*" " ")
           (pi-coding-agent--shorten-model-name name)
-          (format "[%s/%s]" provider model-id)
+          (pi-coding-agent--shorten-model-reference provider model-id)
           (if (numberp input)
               (format "%s/M miss"
                       (pi-coding-agent--format-cost input precision))

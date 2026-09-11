@@ -162,6 +162,9 @@
           (should-not (string-match-p "premium" candidate))
           (should (string-match-p "\\$0.28/M miss" candidate))
           (should (string-match-p "\\$0.0028/M cache" candidate))
+          (should (string-match-p "V4 Pro" candidate))
+          (should (string-match-p "\\[ds/v4-pro\\]" candidate))
+          (should-not (string-match-p "DeepSeek V4 Pro" candidate))
           (with-current-buffer chat-buf
             (pi-coding-agent-chat-mode)
             (setq pi-coding-agent--state (list :model model)
@@ -174,6 +177,35 @@
               "premium"
               (substring-no-properties
                (pi-coding-agent--header-line-string))))))
+      (kill-buffer chat-buf)
+      (kill-buffer input-buf))))
+
+(ert-deftest pi-coding-agent-test-model-display-shortens-deepseek-vision ()
+  "DeepSeek Vision names stay compact in Header and model candidates."
+  (let* ((model '(:provider "deepseek"
+                  :id "deepseek-v4-flash-vision-exp"
+                  :name "DeepSeek V4 Flash Vision Exp"
+                  :cost (:input 0.22 :cacheRead 0.007 :output 0.66)))
+         (candidate (pi-coding-agent--model-candidate-label model model))
+         (chat-buf (generate-new-buffer "*pi-model-vision-header-test*"))
+         (input-buf (generate-new-buffer "*pi-model-vision-header-input-test*")))
+    (unwind-protect
+        (progn
+          (should (string-match-p "\\*  V4 Vision" candidate))
+          (should (string-match-p "\\[ds/v4-vision\\]" candidate))
+          (should-not (string-match-p "DeepSeek V4 Flash Vision Exp" candidate))
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--state (list :model model)
+                  pi-coding-agent--activity-phase "idle"))
+          (with-current-buffer input-buf
+            (pi-coding-agent-input-mode)
+            (setq pi-coding-agent--chat-buffer chat-buf)
+            (let ((header (substring-no-properties
+                           (pi-coding-agent--header-line-string))))
+              (should (string-match-p "V4 Vision" header))
+              (should-not
+               (string-match-p "DeepSeek V4 Flash Vision Exp" header)))))
       (kill-buffer chat-buf)
       (kill-buffer input-buf))))
 
