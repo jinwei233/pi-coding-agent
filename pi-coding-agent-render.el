@@ -3388,7 +3388,9 @@ diff annotations."
         (save-excursion
           (goto-char header-end)
           (delete-region header-end ov-end)
-          (insert cold-body)
+          (if summary-p
+              (pi-coding-agent--insert-tool-summary-fragment cold-body)
+            (insert cold-body))
           (pi-coding-agent--ensure-cold-tool-property-nonsticky)
           (add-text-properties
            ov-start (point)

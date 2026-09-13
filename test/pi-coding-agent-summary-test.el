@@ -73,6 +73,42 @@
                  (overlay-get overlay 'pi-coding-agent-table-display))
                (overlays-in (point-min) (point-max)))))))
 
+(ert-deftest pi-coding-agent-test-cooled-summary-fence-keeps-later-markdown ()
+  "Cooling tool summaries must preserve fence isolation and visible text."
+  (dolist (fence '("```bash" "~~~" "   ````"))
+    (pi-coding-agent-summary-test--with-history
+        (pi-coding-agent-summary-test--messages
+         "bash" '(:command "show-doc") (concat "output\n" fence "\ntail"))
+      (let* ((inhibit-read-only t)
+             (overlays (seq-filter
+                        (lambda (ov)
+                          (overlay-get ov 'pi-coding-agent-tool-block))
+                        (overlays-in (point-min) (point-max)))))
+        (should overlays)
+        (goto-char (point-max))
+        (insert "\n## After tool\n\n**Still prose**\n\n"
+                "```\nreal code\n```\n\n"
+                "| Check | Result |\n|---|---|\n| parser | healthy |\n")
+        (let ((visible (pi-coding-agent--visible-text (point-min) (point-max))))
+          (should (= 1 (length (pi-coding-agent--treesit-table-regions
+                                (point-min) (point-max)))))
+          (pi-coding-agent--cool-completed-tool-blocks overlays)
+          (should (equal visible
+                         (pi-coding-agent--visible-text (point-min) (point-max))))
+          (should-not (next-button (point-min)))
+          (should (= 1 (length (pi-coding-agent--treesit-table-regions
+                                (point-min) (point-max)))))
+          (let ((root (treesit-parser-root-node
+                       (pi-coding-agent--markdown-parser))))
+            (should (= 1 (length (treesit-query-capture
+                                  root '((atx_heading) @heading)))))
+            (should (= 1 (length (treesit-query-capture
+                                  root '((fenced_code_block) @code))))))
+          (pi-coding-agent--decorate-tables-in-region (point-min) (point-max) 40)
+          (should (seq-some
+                   (lambda (ov) (overlay-get ov 'pi-coding-agent-table-display))
+                   (overlays-in (point-min) (point-max)))))))))
+
 (ert-deftest pi-coding-agent-test-tool-detail-pair-prefers-canonical-and-falls-back-live ()
   "Pair lookup uses canonical data first and live data for a missing id."
   (with-temp-buffer
