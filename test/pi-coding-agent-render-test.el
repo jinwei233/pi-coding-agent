@@ -18,6 +18,294 @@
 
 ;;; Response Display
 
+(defconst pi-coding-agent-test--wrapped-markdown-response
+  (concat
+   "```markdown\n"
+   "# Title\n\n"
+   "**Important**\n\n"
+   "```\n"
+   "diagram\n"
+   "```\n\n"
+   "| Name | Value |\n"
+   "| --- | --- |\n"
+   "| alpha | 1 |\n"
+   "```")
+  "Assistant response reproducing a Markdown wrapper with nested fences.")
+
+(defun pi-coding-agent-test--markdown-fence-count (&optional beg end)
+  "Return the number of fenced code blocks between BEG and END."
+  (length
+   (treesit-query-capture
+    (treesit-buffer-root-node 'markdown)
+    '((fenced_code_block) @fence)
+    (or beg (point-min))
+    (or end (point-max)))))
+
+(defun pi-coding-agent-test--render-live-assistant-text (chunks)
+  "Render assistant text CHUNKS and return visible message content."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (dolist (chunk chunks)
+      (pi-coding-agent--display-message-delta chunk))
+    (pi-coding-agent--finish-assistant-text)
+    (font-lock-ensure)
+    (substring-no-properties
+     (pi-coding-agent--visible-text
+      (marker-position pi-coding-agent--message-start-marker)
+      (point-max)))))
+
+(defun pi-coding-agent-test--render-history-assistant-text (text)
+  "Render history assistant TEXT and return visible message content."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-history-messages
+     (vector (list :role "assistant" :content text)))
+    (goto-char (point-min))
+    (search-forward "=========\n\n")
+    (string-trim-right
+     (substring-no-properties
+      (pi-coding-agent--visible-text (point) (point-max))))))
+
+(ert-deftest pi-coding-agent-test-project-assistant-markdown-unwraps-wrapper ()
+  "A whole-response Markdown wrapper exposes its body for rendering."
+  (let ((projection
+         (pi-coding-agent--project-assistant-markdown
+          pi-coding-agent-test--wrapped-markdown-response)))
+    (should (plist-get projection :wrapped))
+    (should
+     (equal
+      (plist-get projection :text)
+      (concat
+       "# Title\n\n"
+       "**Important**\n\n"
+       "```\n"
+       "diagram\n"
+       "```\n\n"
+       "| Name | Value |\n"
+       "| --- | --- |\n"
+       "| alpha | 1 |\n")))))
+
+(ert-deftest pi-coding-agent-test-project-assistant-markdown-is-narrow ()
+  "Only explicit whole-response Markdown wrappers are removed."
+  (dolist (text '("```elisp\n(message \"ok\")\n```"
+                  "```\nliteral\n```"
+                  "prose\n```markdown\nnested\n```"
+                  "```markdown\nunclosed"))
+    (let ((projection (pi-coding-agent--project-assistant-markdown text)))
+      (should-not (plist-get projection :wrapped))
+      (should (equal (plist-get projection :text) text)))))
+
+(ert-deftest pi-coding-agent-test-project-assistant-markdown-handles-blanks-and-tilde ()
+  "Wrapper recognition supports blank margins and tilde delimiters."
+  (let* ((text "\n  ~~~~md\n# Title\n\n```text\nbody\n```\n  ~~~~\n\n")
+         (projection (pi-coding-agent--project-assistant-markdown text)))
+    (should (plist-get projection :wrapped))
+    (should (equal (plist-get projection :text)
+                   "\n# Title\n\n```text\nbody\n```\n\n"))))
+
+(ert-deftest pi-coding-agent-test-markdown-fence-scanner-obeys-closing-rules ()
+  "Fence scanning tracks delimiter character, length, and trailing text."
+  (let* ((open (pi-coding-agent--markdown-fence-next-state nil "~~~elisp"))
+         (short (pi-coding-agent--markdown-fence-next-state open "~~"))
+         (text (pi-coding-agent--markdown-fence-next-state open "~~~ later"))
+         (closed (pi-coding-agent--markdown-fence-next-state open "~~~~  ")))
+    (should (equal (plist-get open :char) ?~))
+    (should (= (plist-get open :length) 3))
+    (should (equal short open))
+    (should (equal text open))
+    (should-not closed)
+    (should-not
+     (pi-coding-agent--markdown-fence-next-state nil "    ```elisp"))))
+
+(ert-deftest pi-coding-agent-test-history-normalizes-wrapped-markdown ()
+  "History replay renders wrapped Markdown body instead of alternating code."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-history-messages
+     (vector
+      (list :role "assistant"
+            :content pi-coding-agent-test--wrapped-markdown-response)))
+    (font-lock-ensure)
+    (should-not (string-match-p "```markdown" (buffer-string)))
+    (should (= (pi-coding-agent-test--markdown-fence-count) 1))
+    (should (= (length
+                (pi-coding-agent--treesit-table-regions
+                 (point-min) (point-max)))
+               1))))
+
+(ert-deftest pi-coding-agent-test-normalized-history-survives-parser-reclamation ()
+  "Parser reclamation and restoration preserve normalized Markdown structure."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-history-messages
+     (vector
+      (list :role "assistant"
+            :content pi-coding-agent-test--wrapped-markdown-response)))
+    (font-lock-ensure)
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+    (move-marker pi-coding-agent--hot-tail-start (point-max))
+    (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+    (should-not (pi-coding-agent--local-parser-ownership-overlays))
+    (font-lock-flush (point-min) (point-max))
+    (font-lock-ensure (point-min) (point-max))
+    (pi-coding-agent--cancel-parser-reconciliation)
+    (should-not (string-match-p "```markdown" (buffer-string)))
+    (should (= (pi-coding-agent-test--markdown-fence-count) 1))
+    (should (= (length
+                (pi-coding-agent--treesit-table-regions
+                 (point-min) (point-max)))
+               1))
+    (should (> (pi-coding-agent--reconcile-local-parsers) 0))
+    (should-not (pi-coding-agent--local-parser-ownership-overlays))))
+
+(ert-deftest pi-coding-agent-test-live-normalizes-wrapped-markdown ()
+  "Completed live rendering matches wrapped Markdown history projection."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (dolist (chunk '("``" "`mark" "down\n# Title\n\n**Important**\n\n```"
+                     "\ndiagram\n```\n\n| Name | Value |\n| --- | --- |\n"
+                     "| alpha | 1 |\n```"))
+      (pi-coding-agent--display-message-delta chunk))
+    (pi-coding-agent--finish-assistant-text)
+    (font-lock-ensure)
+    (should-not (string-match-p "```markdown" (buffer-string)))
+    (should (= (pi-coding-agent-test--markdown-fence-count) 1))
+    (should (= (length
+                (pi-coding-agent--treesit-table-regions
+                 (point-min) (point-max)))
+               1))))
+
+(ert-deftest pi-coding-agent-test-live-wrapper-is-split-point-independent ()
+  "Every two-chunk partition produces the same wrapped presentation."
+  (let* ((text pi-coding-agent-test--wrapped-markdown-response)
+         (expected
+          (pi-coding-agent-test--render-live-assistant-text (list text))))
+    (dotimes (split (1+ (length text)))
+      (should
+       (equal
+        (pi-coding-agent-test--render-live-assistant-text
+         (list (substring text 0 split) (substring text split)))
+        expected)))))
+
+(ert-deftest pi-coding-agent-test-live-and-history-wrapper-converge ()
+  "Live and history rendering expose identical wrapped assistant text."
+  (should
+   (equal
+    (string-trim-right
+     (pi-coding-agent-test--render-live-assistant-text
+      (list pi-coding-agent-test--wrapped-markdown-response)))
+    (pi-coding-agent-test--render-history-assistant-text
+     pi-coding-agent-test--wrapped-markdown-response))))
+
+(ert-deftest pi-coding-agent-test-history-normalization-preserves-canonical-message ()
+  "Presentation projection never mutates canonical history messages."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((messages
+           (vector
+            (list :role "assistant"
+                  :content pi-coding-agent-test--wrapped-markdown-response))))
+      (pi-coding-agent--display-session-history messages)
+      (should
+       (equal
+        (plist-get (aref pi-coding-agent--canonical-messages 0) :content)
+        pi-coding-agent-test--wrapped-markdown-response)))))
+
+(ert-deftest pi-coding-agent-test-normal-markdown-presentation-is-unchanged ()
+  "Ordinary history Markdown keeps its existing raw presentation."
+  (let ((text "# Heading\n\nProse with **bold**.\n\n```elisp\n(+ 1 2)\n```"))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--display-history-messages
+       (vector (list :role "assistant" :content text)))
+      (should (string-match-p
+               (regexp-quote (concat "\n" text "\n"))
+               (buffer-string))))))
+
+(ert-deftest pi-coding-agent-test-unclosed-assistant-fence-is-message-local ()
+  "An unclosed assistant fence cannot own the following user table."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-history-messages
+     [(:role "assistant" :content "```text\nunfinished")
+      (:role "user"
+       :content [(:type "text"
+                  :text "| Name | Value |\n| --- | --- |\n| next | 1 |")])])
+    (font-lock-ensure)
+    (should (= (length
+                (pi-coding-agent--treesit-table-regions
+                 (point-min) (point-max)))
+               1))
+    (goto-char (point-min))
+    (should (re-search-forward "unfinished" nil t))
+    (let ((boundary
+           (text-property-any
+            (point-min) (point-max)
+            'pi-coding-agent-markdown-boundary t)))
+      (should boundary)
+      (should (equal
+               (pi-coding-agent--visible-text
+                boundary
+                (next-single-property-change
+                 boundary 'pi-coding-agent-markdown-boundary nil
+                 (point-max)))
+               "")))))
+
+(ert-deftest pi-coding-agent-test-live-unclosed-markdown-wrapper-is-preserved ()
+  "An unclosed Markdown opener remains a code block and gets isolated."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (dolist (chunk '("```mark" "down\n# still code"))
+      (pi-coding-agent--display-message-delta chunk))
+    (pi-coding-agent--finish-assistant-text)
+    (should (string-match-p
+             "```markdown\n# still code"
+             (buffer-string)))
+    (should (= (pi-coding-agent-test--markdown-fence-count) 1))
+    (should
+     (text-property-any
+      (point-min) (point-max)
+      'pi-coding-agent-markdown-boundary t))))
+
+(ert-deftest pi-coding-agent-test-markdown-wrapper-normalization-can-be-disabled ()
+  "The feature switch preserves outer wrappers in live and history output."
+  (let ((pi-coding-agent-normalize-markdown-wrappers nil))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--display-agent-start)
+      (pi-coding-agent--display-message-delta
+       pi-coding-agent-test--wrapped-markdown-response)
+      (pi-coding-agent--finish-assistant-text)
+      (should (string-match-p "```markdown" (buffer-string))))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--display-history-messages
+       (vector
+        (list :role "assistant"
+              :content pi-coding-agent-test--wrapped-markdown-response)))
+      (should (string-match-p "```markdown" (buffer-string))))))
+
+(ert-deftest pi-coding-agent-test-clear-render-artifacts-removes-markdown-boundary ()
+  "History rebuild cleanup deletes presentation-only fence boundaries."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert
+       "before"
+       (pi-coding-agent--markdown-boundary-string
+        '(:char 96 :length 3))
+       "after"))
+    (pi-coding-agent--clear-render-artifacts)
+    (should (equal (buffer-string) "beforeafter"))
+    (should-not
+     (text-property-any
+      (point-min) (point-max)
+      'pi-coding-agent-markdown-boundary t))))
+
 (ert-deftest pi-coding-agent-test-append-to-chat-inserts-text ()
   "pi-coding-agent--append-to-chat inserts text at end of chat buffer."
   (with-temp-buffer

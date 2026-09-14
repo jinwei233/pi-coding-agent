@@ -312,6 +312,14 @@ When nil (the default), only the visible text is copied."
   :type 'boolean
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-normalize-markdown-wrappers t
+  "Whether to normalize whole-response Markdown fences in Agent Output.
+When non-nil, an assistant text response beginning with a `markdown' or `md'
+fence is presented as Markdown rather than as one outer code block.  Canonical
+messages and persisted session data are never changed."
+  :type 'boolean
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-extension-status-faces nil
   "Alist mapping extension status keys to faces in the header line.
 Keys are exact `statusKey' strings sent by extension `setStatus' requests,

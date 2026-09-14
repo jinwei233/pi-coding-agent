@@ -128,6 +128,30 @@ current message with tree-sitter.  Most assistant text is not table content, so
 we track whether a pipe has appeared since the last decoration attempt and skip
 the query when no table can be present.")
 
+(defvar-local pi-coding-agent--markdown-fence-state nil
+  "Opening fence metadata for the current projected assistant text.")
+
+(defvar-local pi-coding-agent--markdown-line-buffer ""
+  "Incomplete logical line retained by the streaming Markdown scanner.")
+
+(defvar-local pi-coding-agent--assistant-projection-mode 'probe
+  "Current assistant wrapper projection mode: `probe', `plain', or `wrapped'.")
+
+(defvar-local pi-coding-agent--assistant-projection-pending ""
+  "Assistant text withheld while classifying or closing a Markdown wrapper.")
+
+(defvar-local pi-coding-agent--assistant-wrapper-fence nil
+  "Opening fence metadata for the current whole-response Markdown wrapper.")
+
+(defvar-local pi-coding-agent--assistant-text-seen-input nil
+  "Non-nil after the current assistant text unit receives its first delta.")
+
+(defvar-local pi-coding-agent--assistant-wrapper-raw-chunks nil
+  "Raw delta strings retained only while a Markdown wrapper is being probed.")
+
+(defvar-local pi-coding-agent--assistant-text-start-marker nil
+  "Start marker for the current live assistant text unit.")
+
 (defconst pi-coding-agent--history-render-state-variables
   '(pi-coding-agent--canonical-messages
     pi-coding-agent--hot-tail-start
@@ -141,6 +165,14 @@ the query when no table can be present.")
     pi-coding-agent--thinking-pending-chars
     pi-coding-agent--thinking-stream-started
     pi-coding-agent--line-parse-state
+    pi-coding-agent--markdown-fence-state
+    pi-coding-agent--markdown-line-buffer
+    pi-coding-agent--assistant-projection-mode
+    pi-coding-agent--assistant-projection-pending
+    pi-coding-agent--assistant-wrapper-fence
+    pi-coding-agent--assistant-text-seen-input
+    pi-coding-agent--assistant-wrapper-raw-chunks
+    pi-coding-agent--assistant-text-start-marker
     pi-coding-agent--message-start-marker
     pi-coding-agent--streaming-scroll-generation
     pi-coding-agent--streaming-scroll-anchor-marker
@@ -194,88 +226,379 @@ Note: status is set to `streaming' by the event handler."
   (pi-coding-agent--set-message-start-marker (copy-marker (point-max) nil))
   (pi-coding-agent--set-streaming-marker (copy-marker (point-max) t))
   ;; Reset streaming parse state - content starts at line beginning, outside code/thinking block
-  (setq pi-coding-agent--line-parse-state 'line-start)
-  (setq pi-coding-agent--in-code-block nil)
+  (pi-coding-agent--reset-assistant-markdown-state)
   (setq pi-coding-agent--in-thinking-block nil)
   (setq pi-coding-agent--streaming-table-candidate nil)
   (pi-coding-agent--set-activity-phase "thinking"))
 
-(defun pi-coding-agent--process-streaming-char (char state in-block)
-  "Process CHAR with current STATE and IN-BLOCK flag.
-Returns (NEW-STATE . NEW-IN-BLOCK).
-STATE is one of: `line-start', `fence-1', `fence-2', `mid-line'."
-  (pcase state
-    ('line-start
-     (cond
-      ((eq char ?`) (cons 'fence-1 in-block))
-      ((eq char ?\n) (cons 'line-start in-block))
-      (t (cons 'mid-line in-block))))
-    ('fence-1
-     (cond
-      ((eq char ?`) (cons 'fence-2 in-block))
-      ((eq char ?\n) (cons 'line-start in-block))
-      (t (cons 'mid-line in-block))))
-    ('fence-2
-     (cond
-      ((eq char ?`) (cons 'mid-line (not in-block)))  ; Toggle code block!
-      ((eq char ?\n) (cons 'line-start in-block))     ; Was just ``
-      (t (cons 'mid-line in-block))))                 ; Was inline ``x
-    ('mid-line
-     (if (eq char ?\n)
-         (cons 'line-start in-block)
-       (cons 'mid-line in-block)))))
+(defun pi-coding-agent--markdown-fence-line-info (line)
+  "Return Markdown fence metadata for LINE, or nil.
+The returned plist contains `:char', `:length', and `:info'.  Only fences
+indented by at most three spaces are recognized."
+  (when (string-match
+         "\\`[ ]\\{0,3\\}\\([`~]\\{3,\\}\\)\\(.*\\)\\'"
+         line)
+    (let ((run (match-string 1 line))
+          (info (match-string 2 line)))
+      (when (or (eq (aref run 0) ?~)
+                (not (string-match-p "`" info)))
+        (list :char (aref run 0)
+              :length (length run)
+              :info (string-trim info))))))
+
+(defun pi-coding-agent--markdown-fence-next-state (state line)
+  "Return fence STATE after consuming complete Markdown LINE.
+STATE is nil outside a fence or the opening fence metadata returned by
+`pi-coding-agent--markdown-fence-line-info'."
+  (let ((info (pi-coding-agent--markdown-fence-line-info line)))
+    (cond
+     ((null state) info)
+     ((and info
+           (eq (plist-get info :char) (plist-get state :char))
+           (>= (plist-get info :length) (plist-get state :length))
+           (string-empty-p (plist-get info :info)))
+      nil)
+     (t state))))
+
+(defun pi-coding-agent--markdown-wrapper-info (line)
+  "Return fence metadata when LINE opens a Markdown presentation wrapper."
+  (when-let* ((info (pi-coding-agent--markdown-fence-line-info line))
+              (language (downcase (plist-get info :info)))
+              ((member language '("markdown" "md"))))
+    info))
+
+(defun pi-coding-agent--markdown-closing-line-p (line opening)
+  "Return non-nil when LINE closes the fence described by OPENING."
+  (let ((info (pi-coding-agent--markdown-fence-line-info line)))
+    (and info
+         (eq (plist-get info :char) (plist-get opening :char))
+         (>= (plist-get info :length) (plist-get opening :length))
+         (string-empty-p (plist-get info :info)))))
+
+(defun pi-coding-agent--project-assistant-markdown (text)
+  "Return presentation projection metadata for assistant TEXT.
+An explicit whole-response Markdown wrapper is removed without modifying TEXT.
+The result is a plist containing `:text' and `:wrapped'."
+  (let ((source (pi-coding-agent--render-safe-string text)))
+    (with-temp-buffer
+      (insert source)
+      (goto-char (point-min))
+      (skip-chars-forward " \t\n")
+      (let* ((opening-start (line-beginning-position))
+             (opening-end (line-end-position))
+             (opening-line
+              (buffer-substring-no-properties opening-start opening-end))
+             (opening (pi-coding-agent--markdown-wrapper-info opening-line)))
+        (if (not opening)
+            (list :text source :wrapped nil)
+          (goto-char (point-max))
+          (skip-chars-backward " \t\n")
+          (let* ((closing-end (line-end-position))
+                 (closing-start (line-beginning-position))
+                 (closing-line
+                  (buffer-substring-no-properties closing-start closing-end)))
+            (if (and (> closing-start opening-end)
+                     (pi-coding-agent--markdown-closing-line-p
+                      closing-line opening))
+                (let ((body-start
+                       (if (and (< opening-end (point-max))
+                                (eq (char-after opening-end) ?\n))
+                           (1+ opening-end)
+                         opening-end))
+                      (suffix-start
+                       (if (and (< closing-end (point-max))
+                                (eq (char-after closing-end) ?\n))
+                           (1+ closing-end)
+                         closing-end)))
+                  (list :text
+                        (concat
+                         (buffer-substring-no-properties
+                          (point-min) opening-start)
+                         (buffer-substring-no-properties
+                          body-start closing-start)
+                         (buffer-substring-no-properties
+                          suffix-start (point-max)))
+                        :wrapped t
+                        :fence opening))
+              (list :text source :wrapped nil))))))))
+
+(defun pi-coding-agent--transform-complete-assistant-markdown (text)
+  "Demote headings in complete assistant TEXT using isolated fence state."
+  (let ((pi-coding-agent--line-parse-state 'line-start)
+        (pi-coding-agent--in-code-block nil)
+        (pi-coding-agent--markdown-fence-state nil)
+        (pi-coding-agent--markdown-line-buffer ""))
+    (pi-coding-agent--transform-delta text)))
+
+(defun pi-coding-agent--reset-assistant-markdown-state ()
+  "Reset streaming assistant Markdown projection and fence state."
+  (setq pi-coding-agent--line-parse-state 'line-start
+        pi-coding-agent--in-code-block nil
+        pi-coding-agent--markdown-fence-state nil
+        pi-coding-agent--markdown-line-buffer ""
+        pi-coding-agent--assistant-projection-mode 'probe
+        pi-coding-agent--assistant-projection-pending ""
+        pi-coding-agent--assistant-wrapper-fence nil
+        pi-coding-agent--assistant-text-seen-input nil
+        pi-coding-agent--assistant-wrapper-raw-chunks nil)
+  (when (markerp pi-coding-agent--assistant-text-start-marker)
+    (set-marker pi-coding-agent--assistant-text-start-marker nil))
+  (setq pi-coding-agent--assistant-text-start-marker nil))
+
+(defun pi-coding-agent--finish-markdown-line-state ()
+  "Commit the current incomplete line to streaming fence state."
+  (unless (string-empty-p pi-coding-agent--markdown-line-buffer)
+    (setq pi-coding-agent--markdown-fence-state
+          (pi-coding-agent--markdown-fence-next-state
+           pi-coding-agent--markdown-fence-state
+           pi-coding-agent--markdown-line-buffer)
+          pi-coding-agent--in-code-block
+          (and pi-coding-agent--markdown-fence-state t)
+          pi-coding-agent--markdown-line-buffer "")))
 
 (defun pi-coding-agent--transform-delta (delta)
   "Transform DELTA for display, handling code blocks and heading levels.
 Uses and updates buffer-local state variables for parse state.
-Returns the transformed string.
+Returns the transformed string.  Fence recognition is line-oriented and keeps
+enough state to remain independent of process-delta boundaries."
+  (let ((start 0)
+        (result nil))
+    (while (string-match "\n" delta start)
+      (let* ((end (match-beginning 0))
+             (next-start (match-end 0))
+             (fragment (substring delta start end))
+             (line-start-p (eq pi-coding-agent--line-parse-state 'line-start))
+             (transformed
+              (if (and line-start-p
+                       (not pi-coding-agent--markdown-fence-state)
+                       (string-prefix-p "#" fragment))
+                  (concat "#" fragment)
+                fragment))
+             (line (concat pi-coding-agent--markdown-line-buffer fragment)))
+        (push transformed result)
+        (push "\n" result)
+        (setq pi-coding-agent--markdown-fence-state
+              (pi-coding-agent--markdown-fence-next-state
+               pi-coding-agent--markdown-fence-state line)
+              pi-coding-agent--in-code-block
+              (and pi-coding-agent--markdown-fence-state t)
+              pi-coding-agent--markdown-line-buffer ""
+              pi-coding-agent--line-parse-state 'line-start
+              start next-start)))
+    (let* ((fragment (substring delta start))
+           (line-start-p (eq pi-coding-agent--line-parse-state 'line-start))
+           (transformed
+            (if (and line-start-p
+                     (not pi-coding-agent--markdown-fence-state)
+                     (string-prefix-p "#" fragment))
+                (concat "#" fragment)
+              fragment)))
+      (unless (string-empty-p fragment)
+        (setq pi-coding-agent--markdown-line-buffer
+              (concat pi-coding-agent--markdown-line-buffer fragment)
+              pi-coding-agent--line-parse-state 'mid-line))
+      (push transformed result))
+    (apply #'concat (nreverse result))))
 
-Performance: Uses a two-pass approach.  First checks if transformation
-is needed (rare), then only does the work when necessary.  The common
-case of no headings is O(n) with no allocations."
-  (let ((state pi-coding-agent--line-parse-state)
-        (in-block pi-coding-agent--in-code-block)
-        (len (length delta))
-        (needs-transform nil)
-        (i 0))
-    ;; First pass: check if any transformation is needed and track state
-    ;; Also collect positions where we need to insert extra #
-    (let ((insert-positions nil))
-      (while (< i len)
-        (let ((char (aref delta i)))
-          ;; Check if we need to add # at this position
-          (when (and (eq state 'line-start)
-                     (not in-block)
-                     (eq char ?#))
-            (push i insert-positions)
-            (setq needs-transform t))
-          ;; Update state
-          (let ((new-state (pi-coding-agent--process-streaming-char char state in-block)))
-            (setq state (car new-state))
-            (setq in-block (cdr new-state)))
-          (setq i (1+ i))))
-      ;; Save final state
-      (setq pi-coding-agent--line-parse-state state)
-      (setq pi-coding-agent--in-code-block in-block)
-      ;; Fast path: no transformation needed
-      (if (not needs-transform)
-          delta
-        ;; Slow path: build result with extra # at marked positions
-        ;; insert-positions is in reverse order (last position first)
-        (let ((positions (nreverse insert-positions))
-              (result nil)
-              (prev-pos 0))
-          (dolist (pos positions)
-            ;; Add content before this position
-            (when (< prev-pos pos)
-              (push (substring delta prev-pos pos) result))
-            ;; Add the extra #
-            (push "#" result)
-            (setq prev-pos pos))
-          ;; Add remaining content
-          (when (< prev-pos len)
-            (push (substring delta prev-pos) result))
-          (apply #'concat (nreverse result)))))))
+(defun pi-coding-agent--wrapper-prefix-possible-p (text)
+  "Return non-nil when incomplete TEXT may become a Markdown wrapper opener."
+  (and (not (string-match-p "\n" text))
+       (string-match "\\`\\( *\\)\\(.*\\)\\'" text)
+       (<= (length (match-string 1 text)) 3)
+       (let ((rest (match-string 2 text)))
+         (or (string-empty-p rest)
+             (let* ((char (aref rest 0))
+                    (run-end 0))
+               (and (memq char '(?` ?~))
+                    (progn
+                      (while (and (< run-end (length rest))
+                                  (eq (aref rest run-end) char))
+                        (setq run-end (1+ run-end)))
+                      (if (< run-end 3)
+                          (= run-end (length rest))
+                        (let ((info (downcase (substring rest run-end))))
+                          (or (string-prefix-p info "markdown")
+                              (string-prefix-p info "md")))))))))))
+
+(defun pi-coding-agent--last-nonblank-line-start (text)
+  "Return the start of the last nonblank line in TEXT, or zero."
+  (let ((end (length text)))
+    (while (and (> end 0)
+                (memq (aref text (1- end)) '(?\s ?\t ?\n ?\r)))
+      (setq end (1- end)))
+    (if (zerop end)
+        0
+      (1+ (or (cl-position ?\n text :end end :from-end t) -1)))))
+
+(defun pi-coding-agent--project-wrapped-stream-tail (text)
+  "Split wrapped streaming TEXT into `(EMIT . RETAIN)'.
+RETAIN holds the last nonblank logical line and trailing whitespace so a final
+wrapper delimiter can be consumed at text end."
+  (let ((keep-start (pi-coding-agent--last-nonblank-line-start text)))
+    (cons (substring text 0 keep-start)
+          (substring text keep-start))))
+
+(defun pi-coding-agent--project-assistant-stream-delta (delta)
+  "Return the presentable part of assistant DELTA and retain wrapper look-behind."
+  (if (not pi-coding-agent-normalize-markdown-wrappers)
+      (progn
+        (setq pi-coding-agent--assistant-projection-mode 'plain)
+        delta)
+    (let ((text (concat pi-coding-agent--assistant-projection-pending delta)))
+      (pcase pi-coding-agent--assistant-projection-mode
+        ('plain
+         (setq pi-coding-agent--assistant-projection-pending "")
+         text)
+        ('wrapped
+         (let ((parts (pi-coding-agent--project-wrapped-stream-tail text)))
+           (setq pi-coding-agent--assistant-projection-pending (cdr parts))
+           (car parts)))
+        (_
+         (cond
+          ((string-match "\n" text)
+           (let* ((line-end (match-beginning 0))
+                  (line (substring text 0 line-end))
+                  (opening (pi-coding-agent--markdown-wrapper-info line))
+                  (rest (substring text (1+ line-end))))
+             (if opening
+                 (let ((parts
+                        (pi-coding-agent--project-wrapped-stream-tail rest)))
+                   (setq pi-coding-agent--assistant-projection-mode 'wrapped
+                         pi-coding-agent--assistant-wrapper-fence opening
+                         pi-coding-agent--assistant-projection-pending
+                         (cdr parts))
+                   (car parts))
+               (setq pi-coding-agent--assistant-projection-mode 'plain
+                     pi-coding-agent--assistant-projection-pending "")
+               text)))
+          ((pi-coding-agent--wrapper-prefix-possible-p text)
+           (setq pi-coding-agent--assistant-projection-pending text)
+           "")
+          (t
+           (setq pi-coding-agent--assistant-projection-mode 'plain
+                 pi-coding-agent--assistant-projection-pending "")
+           text)))))))
+
+(defun pi-coding-agent--remove-final-wrapper-line (text opening)
+  "Remove a final wrapper delimiter described by OPENING from TEXT.
+Return `(RESULT . CLOSED)' while preserving whitespace outside that line."
+  (with-temp-buffer
+    (insert text)
+    (goto-char (point-max))
+    (skip-chars-backward " \t\n")
+    (let ((closing-end (line-end-position))
+          (closing-start (line-beginning-position)))
+      (if (and (> closing-end closing-start)
+               (pi-coding-agent--markdown-closing-line-p
+                (buffer-substring-no-properties closing-start closing-end)
+                opening))
+          (let ((suffix-start
+                 (if (and (< closing-end (point-max))
+                          (eq (char-after closing-end) ?\n))
+                     (1+ closing-end)
+                   closing-end)))
+            (cons
+             (concat
+              (buffer-substring-no-properties (point-min) closing-start)
+              (buffer-substring-no-properties suffix-start (point-max)))
+             t))
+        (cons text nil)))))
+
+(defun pi-coding-agent--insert-message-fragment (text)
+  "Transform and insert assistant TEXT at the streaming marker."
+  (unless (string-empty-p text)
+    (let ((transformed (pi-coding-agent--transform-delta text))
+          (inhibit-read-only t))
+      (pi-coding-agent--with-scroll-preservation
+        (save-excursion
+          (goto-char (marker-position pi-coding-agent--streaming-marker))
+          (insert transformed)
+          (set-marker pi-coding-agent--streaming-marker (point))))
+      (when (string-match-p "|" text)
+        (setq pi-coding-agent--streaming-table-candidate t))
+      (when (and pi-coding-agent--streaming-table-candidate
+                 (string-match-p "\n" text))
+        (setq pi-coding-agent--streaming-table-candidate nil)
+        (pi-coding-agent--maybe-decorate-streaming-table)))))
+
+(defun pi-coding-agent--insert-markdown-boundary (fence)
+  "Insert an invisible parser boundary closing FENCE at the streaming marker."
+  (when (and fence pi-coding-agent--streaming-marker)
+    (let ((start (marker-position pi-coding-agent--streaming-marker))
+          (inhibit-read-only t))
+      (save-excursion
+        (goto-char start)
+        (insert "\n"
+                (make-string (plist-get fence :length)
+                             (plist-get fence :char))
+                "\n")
+        (add-text-properties
+         start (point)
+         '(display ""
+           pi-coding-agent-markdown-boundary t
+           rear-nonsticky (display pi-coding-agent-markdown-boundary)))
+        (set-marker pi-coding-agent--streaming-marker (point))))))
+
+(defun pi-coding-agent--markdown-open-fence (text)
+  "Return unmatched opening fence metadata after scanning TEXT."
+  (let ((state nil))
+    (dolist (line (split-string text "\n"))
+      (setq state (pi-coding-agent--markdown-fence-next-state state line)))
+    state))
+
+(defun pi-coding-agent--markdown-boundary-string (fence)
+  "Return invisible presentation text that closes FENCE."
+  (when fence
+    (propertize
+     (concat "\n"
+             (make-string (plist-get fence :length)
+                          (plist-get fence :char))
+             "\n")
+     'display ""
+     'pi-coding-agent-markdown-boundary t
+     'rear-nonsticky '(display pi-coding-agent-markdown-boundary))))
+
+(defun pi-coding-agent--finish-assistant-text ()
+  "Flush pending assistant projection state and isolate an open fence."
+  (when (memq pi-coding-agent--assistant-projection-mode
+              '(probe plain wrapped))
+    (let ((pending pi-coding-agent--assistant-projection-pending)
+          (wrapper-closed nil))
+      (when (eq pi-coding-agent--assistant-projection-mode 'wrapped)
+        (let ((result
+               (pi-coding-agent--remove-final-wrapper-line
+                pending pi-coding-agent--assistant-wrapper-fence)))
+          (setq pending (car result)
+                wrapper-closed (cdr result))))
+      (if (and (eq pi-coding-agent--assistant-projection-mode 'wrapped)
+               (not wrapper-closed)
+               (markerp pi-coding-agent--assistant-text-start-marker))
+          (let ((raw
+                 (apply #'concat
+                        (nreverse
+                         pi-coding-agent--assistant-wrapper-raw-chunks)))
+                (start
+                 (marker-position
+                  pi-coding-agent--assistant-text-start-marker))
+                (inhibit-read-only t))
+            (delete-region
+             start (marker-position pi-coding-agent--streaming-marker))
+            (set-marker pi-coding-agent--streaming-marker start)
+            (pi-coding-agent--reset-assistant-markdown-state)
+            (pi-coding-agent--insert-message-fragment raw))
+        (pi-coding-agent--insert-message-fragment pending))
+      (pi-coding-agent--finish-markdown-line-state)
+      (pi-coding-agent--insert-markdown-boundary
+       pi-coding-agent--markdown-fence-state))
+    (setq pi-coding-agent--assistant-projection-mode nil
+          pi-coding-agent--assistant-projection-pending ""
+          pi-coding-agent--assistant-wrapper-fence nil
+          pi-coding-agent--assistant-text-seen-input nil
+          pi-coding-agent--assistant-wrapper-raw-chunks nil
+          pi-coding-agent--markdown-fence-state nil
+          pi-coding-agent--markdown-line-buffer ""
+          pi-coding-agent--in-code-block nil
+          pi-coding-agent--line-parse-state 'line-start)))
 
 (defun pi-coding-agent--display-message-delta (delta)
   "Display streaming message DELTA at the streaming marker.
@@ -284,29 +607,27 @@ to keep our setext H1 separators as the top-level document structure.
 Modification hooks fire normally so jit-lock marks inserted text for
 fontification; tree-sitter re-parses at the C level on each insert."
   (when (and delta pi-coding-agent--streaming-marker)
-    (let* ((inhibit-read-only t)
-           (delta (pi-coding-agent--render-safe-string delta))
+    (let* ((delta (pi-coding-agent--render-safe-string delta))
            ;; Strip leading newlines from first content after header
-           (delta (if (and pi-coding-agent--message-start-marker
-                          (= (marker-position pi-coding-agent--message-start-marker)
-                             (marker-position pi-coding-agent--streaming-marker)))
-                     (string-trim-left delta "\n+")
-                   delta))
-           (transformed (pi-coding-agent--transform-delta delta)))
-      (pi-coding-agent--with-scroll-preservation
-        (save-excursion
-          (goto-char (marker-position pi-coding-agent--streaming-marker))
-          (insert transformed)
-          (set-marker pi-coding-agent--streaming-marker (point))))
-      ;; After inserting text with completed lines, check for active tables only
-      ;; if recent streaming text contained a pipe.  This avoids a tree-sitter
-      ;; table query on every non-table newline in long assistant messages.
-      (when (string-match-p "|" delta)
-        (setq pi-coding-agent--streaming-table-candidate t))
-      (when (and pi-coding-agent--streaming-table-candidate
-                 (string-match-p "\n" delta))
-        (setq pi-coding-agent--streaming-table-candidate nil)
-        (pi-coding-agent--maybe-decorate-streaming-table)))))
+           (delta (if pi-coding-agent--assistant-text-seen-input
+                      delta
+                    (setq pi-coding-agent--assistant-text-seen-input t)
+                    (setq pi-coding-agent--assistant-text-start-marker
+                          (copy-marker
+                           (marker-position
+                            pi-coding-agent--streaming-marker)
+                           nil))
+                    (string-trim-left delta "\n+"))))
+      (unless pi-coding-agent--assistant-projection-mode
+        (setq pi-coding-agent--assistant-projection-mode 'probe))
+      (when (memq pi-coding-agent--assistant-projection-mode
+                  '(probe wrapped))
+        (push delta pi-coding-agent--assistant-wrapper-raw-chunks))
+      (let ((projected
+             (pi-coding-agent--project-assistant-stream-delta delta)))
+        (when (eq pi-coding-agent--assistant-projection-mode 'plain)
+          (setq pi-coding-agent--assistant-wrapper-raw-chunks nil))
+        (pi-coding-agent--insert-message-fragment projected)))))
 
 (defun pi-coding-agent--thinking-insert-position ()
   "Return insertion position for thinking text.
@@ -743,6 +1064,7 @@ follow-up as a fresh prompt.")
 
 (defun pi-coding-agent--display-agent-end ()
   "Finalize agent turn: normalize whitespace, handle abort, schedule queue."
+  (pi-coding-agent--finish-assistant-text)
   ;; Reset per-turn state for clean next turn.
   (setq pi-coding-agent--local-user-message nil)
   (setq pi-coding-agent--in-thinking-block nil)
@@ -1333,6 +1655,7 @@ Updates buffer-local state and renders display updates."
     ("message_start"
      (let* ((message (plist-get event :message))
             (role (plist-get message :role)))
+       (pi-coding-agent--finish-assistant-text)
        ;; A new message starts a fresh rendering context.
        (setq pi-coding-agent--in-thinking-block nil)
        (pi-coding-agent--reset-thinking-state)
@@ -1363,9 +1686,8 @@ Updates buffer-local state and renders display updates."
              (plist-get message :content))))
          (_
           ;; Assistant message - show header if needed, reset markers
-          (setq pi-coding-agent--line-parse-state 'line-start
-                pi-coding-agent--in-code-block nil
-                pi-coding-agent--streaming-table-candidate nil)
+          (pi-coding-agent--reset-assistant-markdown-state)
+          (setq pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
             (pi-coding-agent--begin-streaming-scroll-anchor)
             (pi-coding-agent--append-to-chat
@@ -1378,6 +1700,8 @@ Updates buffer-local state and renders display updates."
                  (event-type (plist-get msg-event :type)))
        (pcase event-type
          ("text_start"
+          (pi-coding-agent--finish-assistant-text)
+          (pi-coding-agent--reset-assistant-markdown-state)
           (pi-coding-agent--begin-streaming-scroll-anchor))
          ("text_delta"
           (pi-coding-agent--set-activity-phase "replying")
@@ -1385,9 +1709,11 @@ Updates buffer-local state and renders display updates."
          ("text_end"
           ;; Text block ended — finalize any active table that may have
           ;; a trailing row without newline (backstop for streaming).
+          (pi-coding-agent--finish-assistant-text)
           (pi-coding-agent--maybe-decorate-streaming-table)
           (setq pi-coding-agent--streaming-table-candidate nil))
          ("thinking_start"
+          (pi-coding-agent--finish-assistant-text)
           (pi-coding-agent--begin-streaming-scroll-anchor)
           (pi-coding-agent--display-thinking-start))
          ("thinking_delta"
@@ -1398,6 +1724,8 @@ Updates buffer-local state and renders display updates."
           ;; Preview reconciliation follows the authoritative assistant
           ;; message content.  The current contentIndex decides which
           ;; generic tool header is still streaming or complete.
+          (when (equal event-type "toolcall_start")
+            (pi-coding-agent--finish-assistant-text))
           (pi-coding-agent--set-activity-phase "running")
           (pi-coding-agent--reconcile-toolcall-previews
            (plist-get event :message)
@@ -1405,10 +1733,13 @@ Updates buffer-local state and renders display updates."
            (plist-get msg-event :contentIndex)))
          ("error"
           ;; Error during streaming (e.g., API error)
+          (pi-coding-agent--finish-assistant-text)
           (pi-coding-agent--display-error (plist-get msg-event :reason))))))
     ("message_end"
      (let* ((message (plist-get event :message))
             (assistant-p (equal (plist-get message :role) "assistant")))
+       (when assistant-p
+         (pi-coding-agent--finish-assistant-text))
        ;; Display error if message ended with error (e.g., API error)
        (when (equal (plist-get message :stopReason) "error")
          (pi-coding-agent--display-error (plist-get message :errorMessage)))
@@ -1431,6 +1762,7 @@ Updates buffer-local state and renders display updates."
          (pi-coding-agent--refresh-header)))
      (pi-coding-agent--render-complete-message))
     ("tool_execution_start"
+     (pi-coding-agent--finish-assistant-text)
      (pi-coding-agent--set-activity-phase "running")
      (let* ((tool-call-id (plist-get event :toolCallId))
             (args (plist-get event :args))
@@ -1611,6 +1943,17 @@ left alone."
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-tool-block t)
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-diff-overlay t)
   (let ((inhibit-read-only t))
+    (let ((position (point-max)))
+      (while (setq position
+                   (text-property-any
+                    (point-min) position
+                    'pi-coding-agent-markdown-boundary t))
+        (let ((end
+               (next-single-property-change
+                position 'pi-coding-agent-markdown-boundary nil
+                (point-max))))
+          (delete-region position end)
+          (setq position (point-max)))))
     (remove-text-properties
      (point-min) (point-max) '(pi-coding-agent-cold-tool-block nil)))
   (setq pi-coding-agent--pending-tool-overlay nil
@@ -6122,8 +6465,23 @@ is a grid immediately, without waiting for a redisplay."
 Ensures markdown structures don't leak to subsequent content.
 Display-only table decoration is applied after deferred history insertion."
   (when (and text (not (string-empty-p text)))
-    (let ((start (with-current-buffer (pi-coding-agent--get-chat-buffer) (point-max))))
-      (pi-coding-agent--append-to-chat text)
+    (let* ((projection
+            (if pi-coding-agent-normalize-markdown-wrappers
+                (pi-coding-agent--project-assistant-markdown text)
+              (list :text text :wrapped nil)))
+           (presented
+            (if (plist-get projection :wrapped)
+                (pi-coding-agent--transform-complete-assistant-markdown
+                 (plist-get projection :text))
+              (plist-get projection :text)))
+           (boundary
+            (pi-coding-agent--markdown-boundary-string
+             (pi-coding-agent--markdown-open-fence presented)))
+           (start
+            (with-current-buffer
+                (pi-coding-agent--get-chat-buffer)
+              (point-max))))
+      (pi-coding-agent--append-to-chat (concat presented boundary))
       (with-current-buffer (pi-coding-agent--get-chat-buffer)
         ;; History replay should keep rendering even if markdown
         ;; fontification trips over a tree-sitter/runtime mismatch.
