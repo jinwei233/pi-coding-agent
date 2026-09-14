@@ -118,6 +118,105 @@
     (should-not
      (pi-coding-agent--markdown-fence-next-state nil "    ```elisp"))))
 
+(ert-deftest pi-coding-agent-test-markdown-review-mixed-fence-runs ()
+  "Only a homogeneous fence run can open or close a code block."
+  (dolist (line '("`~~" "~~`" "`~`"))
+    (should-not (pi-coding-agent--markdown-fence-line-info line)))
+  (dolist (pair '(("```" . "```~~~") ("~~~" . "~~~```")))
+    (let ((opening (pi-coding-agent--markdown-fence-line-info (car pair))))
+      (should-not
+       (pi-coding-agent--markdown-closing-line-p (cdr pair) opening))
+      (should (equal
+               (pi-coding-agent--markdown-fence-next-state opening (cdr pair))
+               opening)))))
+
+(ert-deftest pi-coding-agent-test-markdown-review-mixed-close-isolation ()
+  "An invalid mixed closer must not let a fence own the following table."
+  (dolist (live '(nil t))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (let ((text "```text\nbody\n```~~~"))
+        (if live
+            (progn
+              (pi-coding-agent--display-agent-start)
+              (pi-coding-agent--display-message-delta text)
+              (pi-coding-agent--finish-assistant-text))
+          (pi-coding-agent--render-history-text text)))
+      (pi-coding-agent--display-user-message
+       "| Name | Value |\n| --- | --- |\n| next | 1 |")
+      (should (= (length
+                  (pi-coding-agent--treesit-table-regions
+                   (point-min) (point-max)))
+                 1)))))
+
+(ert-deftest pi-coding-agent-test-markdown-review-wrapper-whitespace-splits ()
+  "Blank margins and padded info strings survive every delta split."
+  (dolist (text '("\n\n```md\n# Title\n```\n\n"
+                  " \t\n    \n  ~~~~ MD \t\n# Title\n~~~~\n"
+                  "``` markdown \t\n# Title\n```\n"
+                  "```md \n# Title\n```"))
+    (let ((expected
+           (pi-coding-agent--transform-complete-assistant-markdown
+            (plist-get (pi-coding-agent--project-assistant-markdown text)
+                       :text))))
+      (dotimes (split (1+ (length text)))
+        (ert-info ((format "split=%s text=%S" split text))
+          (with-temp-buffer
+            (pi-coding-agent-chat-mode)
+            (pi-coding-agent--display-agent-start)
+            (pi-coding-agent--display-message-delta (substring text 0 split))
+            (pi-coding-agent--display-message-delta (substring text split))
+            (pi-coding-agent--finish-assistant-text)
+            (should
+             (equal (buffer-substring-no-properties
+                     pi-coding-agent--message-start-marker (point-max))
+                    expected))))))))
+
+(ert-deftest pi-coding-agent-test-markdown-review-plain-leading-newline-splits ()
+  "Ordinary responses keep legacy leading-newline trimming for every split."
+  (let ((text "\n\nplain\n"))
+    (dotimes (split (1+ (length text)))
+      (should
+       (equal (pi-coding-agent-test--render-live-assistant-text
+               (list (substring text 0 split) (substring text split)))
+              "plain\n")))))
+
+(ert-deftest pi-coding-agent-test-markdown-review-process-exit-flushes-tail ()
+  "Process exit flushes pending wrapper text before rendering its error."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((process (make-pipe-process :name "pi-markdown-exit-test"
+                                     :noquery t)))
+      (unwind-protect
+          (progn
+            (pi-coding-agent--set-process process)
+            (pi-coding-agent--display-agent-start)
+            (pi-coding-agent--display-message-delta "```md\nretained tail")
+            (pi-coding-agent--mark-process-exited
+             process '(:error "test exit" :exitCode 1))
+            (should-not pi-coding-agent--assistant-projection-mode)
+            (goto-char (point-min))
+            (should (search-forward "retained tail" nil t))
+            (let ((tail-end (point)))
+              (should (search-forward "test exit" nil t))
+              (should (text-property-any
+                       tail-end (point) 'pi-coding-agent-markdown-boundary t))))
+        (delete-process process)))))
+
+(ert-deftest pi-coding-agent-test-markdown-review-replay-discards-pending-text ()
+  "Replacing history must discard projection state from the previous stream."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-message-delta "```md\nobsolete tail")
+    (pi-coding-agent--display-session-history
+     [(:role "assistant" :content "replacement")])
+    (let ((expected (buffer-string)))
+      (pi-coding-agent--finish-assistant-text)
+      (should (equal (buffer-string) expected))
+      (should-not pi-coding-agent--assistant-wrapper-raw-chunks)
+      (should-not pi-coding-agent--assistant-text-start-marker))))
+
 (ert-deftest pi-coding-agent-test-history-normalizes-wrapped-markdown ()
   "History replay renders wrapped Markdown body instead of alternating code."
   (with-temp-buffer

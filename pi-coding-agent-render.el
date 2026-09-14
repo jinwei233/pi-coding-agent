@@ -236,7 +236,7 @@ Note: status is set to `streaming' by the event handler."
 The returned plist contains `:char', `:length', and `:info'.  Only fences
 indented by at most three spaces are recognized."
   (when (string-match
-         "\\`[ ]\\{0,3\\}\\([`~]\\{3,\\}\\)\\(.*\\)\\'"
+         "\\`[ ]\\{0,3\\}\\(`\\{3,\\}\\|~\\{3,\\}\\)\\(.*\\)\\'"
          line)
     (let ((run (match-string 1 line))
           (info (match-string 2 line)))
@@ -416,9 +416,14 @@ enough state to remain independent of process-delta boundaries."
                         (setq run-end (1+ run-end)))
                       (if (< run-end 3)
                           (= run-end (length rest))
-                        (let ((info (downcase (substring rest run-end))))
+                        (let ((info (downcase
+                                     (string-trim-left
+                                      (substring rest run-end) "[ \t]+"))))
                           (or (string-prefix-p info "markdown")
-                              (string-prefix-p info "md")))))))))))
+                              (string-prefix-p info "md")
+                              (string-match-p
+                               "\\`\\(?:markdown\\|md\\)[ \t]*\\'"
+                               info)))))))))))
 
 (defun pi-coding-agent--last-nonblank-line-start (text)
   "Return the start of the last nonblank line in TEXT, or zero."
@@ -454,30 +459,35 @@ wrapper delimiter can be consumed at text end."
            (setq pi-coding-agent--assistant-projection-pending (cdr parts))
            (car parts)))
         (_
-         (cond
-          ((string-match "\n" text)
-           (let* ((line-end (match-beginning 0))
-                  (line (substring text 0 line-end))
-                  (opening (pi-coding-agent--markdown-wrapper-info line))
-                  (rest (substring text (1+ line-end))))
-             (if opening
-                 (let ((parts
-                        (pi-coding-agent--project-wrapped-stream-tail rest)))
-                   (setq pi-coding-agent--assistant-projection-mode 'wrapped
-                         pi-coding-agent--assistant-wrapper-fence opening
-                         pi-coding-agent--assistant-projection-pending
-                         (cdr parts))
-                   (car parts))
-               (setq pi-coding-agent--assistant-projection-mode 'plain
-                     pi-coding-agent--assistant-projection-pending "")
-               text)))
-          ((pi-coding-agent--wrapper-prefix-possible-p text)
-           (setq pi-coding-agent--assistant-projection-pending text)
-           "")
-          (t
-           (setq pi-coding-agent--assistant-projection-mode 'plain
-                 pi-coding-agent--assistant-projection-pending "")
-           text)))))))
+         ;; Probe the first nonblank line without dropping its blank margin.
+         (string-match "\\`\\(?:[ \t]*\n\\)*" text)
+         (let* ((line-start (match-end 0))
+                (partial (substring text line-start)))
+           (cond
+            ((string-match "\n" text line-start)
+             (let* ((line-end (match-beginning 0))
+                    (line (substring text line-start line-end))
+                    (opening (pi-coding-agent--markdown-wrapper-info line))
+                    (rest (substring text (1+ line-end))))
+               (if opening
+                   (let ((parts
+                          (pi-coding-agent--project-wrapped-stream-tail rest)))
+                     (setq pi-coding-agent--assistant-projection-mode 'wrapped
+                           pi-coding-agent--assistant-wrapper-fence opening
+                           pi-coding-agent--assistant-projection-pending
+                           (cdr parts))
+                     (concat (substring text 0 line-start) (car parts)))
+                 (setq pi-coding-agent--assistant-projection-mode 'plain
+                       pi-coding-agent--assistant-projection-pending "")
+                 (string-trim-left text "\n+"))))
+            ((or (string-match-p "\\`[ \t]*\\'" partial)
+                 (pi-coding-agent--wrapper-prefix-possible-p partial))
+             (setq pi-coding-agent--assistant-projection-pending text)
+             "")
+            (t
+             (setq pi-coding-agent--assistant-projection-mode 'plain
+                   pi-coding-agent--assistant-projection-pending "")
+             (string-trim-left text "\n+")))))))))
 
 (defun pi-coding-agent--remove-final-wrapper-line (text opening)
   "Remove a final wrapper delimiter described by OPENING from TEXT.
@@ -564,6 +574,8 @@ Return `(RESULT . CLOSED)' while preserving whitespace outside that line."
               '(probe plain wrapped))
     (let ((pending pi-coding-agent--assistant-projection-pending)
           (wrapper-closed nil))
+      (when (eq pi-coding-agent--assistant-projection-mode 'probe)
+        (setq pending (string-trim-left pending "\n+")))
       (when (eq pi-coding-agent--assistant-projection-mode 'wrapped)
         (let ((result
                (pi-coding-agent--remove-final-wrapper-line
@@ -608,16 +620,18 @@ Modification hooks fire normally so jit-lock marks inserted text for
 fontification; tree-sitter re-parses at the C level on each insert."
   (when (and delta pi-coding-agent--streaming-marker)
     (let* ((delta (pi-coding-agent--render-safe-string delta))
-           ;; Strip leading newlines from first content after header
-           (delta (if pi-coding-agent--assistant-text-seen-input
+           ;; Wrapper probing owns blank margins; plain output keeps trimming.
+           (delta (if (or pi-coding-agent-normalize-markdown-wrappers
+                          pi-coding-agent--assistant-text-seen-input)
                       delta
-                    (setq pi-coding-agent--assistant-text-seen-input t)
-                    (setq pi-coding-agent--assistant-text-start-marker
-                          (copy-marker
-                           (marker-position
-                            pi-coding-agent--streaming-marker)
-                           nil))
                     (string-trim-left delta "\n+"))))
+      (unless pi-coding-agent--assistant-text-seen-input
+        (when (markerp pi-coding-agent--assistant-text-start-marker)
+          (set-marker pi-coding-agent--assistant-text-start-marker nil))
+        (setq pi-coding-agent--assistant-text-start-marker
+              (copy-marker pi-coding-agent--streaming-marker nil)
+              pi-coding-agent--assistant-text-seen-input
+              (not (string-empty-p delta))))
       (unless pi-coding-agent--assistant-projection-mode
         (setq pi-coding-agent--assistant-projection-mode 'probe))
       (when (memq pi-coding-agent--assistant-projection-mode
@@ -1617,6 +1631,7 @@ which asks upfront before any buffers are touched."
             (plist-put pi-coding-agent--state :last-error error-msg))
       (unwind-protect
           (unless (process-get process 'pi-coding-agent-exit-error-rendered)
+            (pi-coding-agent--finish-assistant-text)
             (pi-coding-agent--display-process-exit-error
              error-msg
              (plist-get response :stderr)
@@ -1940,6 +1955,8 @@ cold-tool metadata before buffer reset or history rebuild, then clears keyed
 live-tool state, cached execution args, and the compatibility pending overlay
 slot so buffer and render state stay consistent.  Tree-sitter overlays are
 left alone."
+  (pi-coding-agent--reset-assistant-markdown-state)
+  (setq pi-coding-agent--assistant-projection-mode nil)
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-tool-block t)
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-diff-overlay t)
   (let ((inhibit-read-only t))
