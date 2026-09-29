@@ -13711,6 +13711,32 @@ invisible, or markdown face properties."
         (should (eq (get-text-property pos 'face)
                     'pi-coding-agent-tool-command))))))
 
+(ert-deftest pi-coding-agent-test-generic-tool-finalize-restores-header-style ()
+  "Completing a generic tool repairs Markdown damage in its JSON header."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let* ((args '(:expression
+                   "paths ~/.emacs.d and ~/um870; [[id:x][label]] <branch>"))
+           (block (pi-coding-agent--display-tool-start
+                   "emacs_eval" args "call-style")))
+      ;; Reproduce the primary fontifier stage before the registered restore
+      ;; pass gets a chance to repair the generic JSON header.
+      (font-lock-fontify-region (point-min) (point-max))
+      (goto-char (point-min))
+      (search-forward "branch")
+      (should (eq (get-text-property (match-beginning 0) 'face)
+                  'font-lock-function-name-face))
+      (pi-coding-agent--display-tool-end
+       "emacs_eval" args '((:type "text" :text "ok")) nil nil block)
+      (dolist (pattern '("~/.emacs" "[[id" "branch"))
+        (goto-char (point-min))
+        (search-forward pattern)
+        (let ((pos (match-beginning 0)))
+          (should-not (get-text-property pos 'display))
+          (should-not (get-text-property pos 'invisible))
+          (should (eq (get-text-property pos 'face)
+                      'pi-coding-agent-tool-command)))))))
+
 (ert-deftest pi-coding-agent-test-restore-tool-properties-restores-all-live-tool-headers ()
   "restore-tool-properties repairs every overlapping live tool header."
   (with-temp-buffer

@@ -2559,13 +2559,20 @@ until an authoritative tool execution/history event supplies it."
     (pi-coding-agent--tool-block-register block)))
 
 (defun pi-coding-agent--tool-block-finalize (block face)
-  "Finalize BLOCK with FACE and remove it from the live keyed registry."
+  "Finalize BLOCK with FACE and remove it from the live keyed registry.
+Restore its header after any direct Markdown fontification that ran without
+the registered jit-lock cleanup pass."
   (when-let* ((block block)
               (ov (pi-coding-agent--tool-block-overlay block)))
     (when-let* ((end-marker (pi-coding-agent--tool-block-end-marker block)))
       (set-marker-insertion-type end-marker nil))
     (overlay-put ov 'face face)
     (pi-coding-agent--tool-block-refresh-overlay block)
+    (when-let* ((header-end
+                 (marker-position
+                  (pi-coding-agent--tool-block-header-end block))))
+      (pi-coding-agent--restore-tool-properties
+       (overlay-start ov) header-end))
     (pi-coding-agent--tool-block-unregister block)
     (when (eq pi-coding-agent--pending-tool-overlay ov)
       (setq pi-coding-agent--pending-tool-overlay nil)))
