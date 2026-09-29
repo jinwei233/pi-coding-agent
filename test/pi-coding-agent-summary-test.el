@@ -73,6 +73,68 @@
                  (overlay-get overlay 'pi-coding-agent-table-display))
                (overlays-in (point-min) (point-max)))))))
 
+(ert-deftest pi-coding-agent-test-tool-summary-html-openers-do-not-swallow-later-markdown ()
+  "Unclosed raw HTML openers in tool tails must remain parser-inert."
+  (dolist (opener '("<script src=\"x.js\">"
+                    "<PRE>"
+                    "<style>"
+                    "<textarea>"
+                    "<!--"
+                    "<?xml version=\"1.0\""
+                    "<!DOCTYPE html"
+                    "<![CDATA["))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (let ((inhibit-read-only t))
+        (pi-coding-agent--insert-tool-summary
+         (list :tool-call-id "call-html"
+               :summary (format "3 lines (0 hidden)\n%s\nTAB details"
+                                opener)))
+        (insert "\n## After tool\n\n"
+                "```\nreal code\n```\n\n"
+                "| Check | Result |\n|---|---|\n| parser | healthy |\n"))
+      (let ((visible (substring-no-properties
+                      (pi-coding-agent--visible-text
+                       (point-min) (point-max))))
+            (root (treesit-parser-root-node
+                   (pi-coding-agent--markdown-parser))))
+        (should (string-match-p (regexp-quote opener) visible))
+        (should (string-match-p
+                 (concat "\n\\\\" (regexp-quote opener) "\n")
+                 (buffer-string)))
+        (should (= 1 (length (treesit-query-capture
+                              root '((atx_heading) @heading)))))
+        (should (= 1 (length (treesit-query-capture
+                              root '((fenced_code_block) @code)))))
+        (should (= 1 (length (pi-coding-agent--treesit-table-regions
+                              (point-min) (point-max)))))))))
+
+(ert-deftest pi-coding-agent-test-cooled-summary-html-opener-keeps-later-markdown ()
+  "Cooling a tool summary must retain raw HTML opener isolation."
+  (pi-coding-agent-summary-test--with-history
+      (pi-coding-agent-summary-test--messages
+       "bash" '(:command "show-html")
+       "output\n<script src=\"x.js\">\ntail")
+    (let* ((inhibit-read-only t)
+           (overlays (seq-filter
+                      (lambda (ov)
+                        (overlay-get ov 'pi-coding-agent-tool-block))
+                      (overlays-in (point-min) (point-max)))))
+      (should overlays)
+      (goto-char (point-max))
+      (insert "\n## After tool\n\n"
+              "```\nreal code\n```\n\n"
+              "| Check | Result |\n|---|---|\n| parser | healthy |\n")
+      (let ((visible (pi-coding-agent--visible-text (point-min) (point-max))))
+        (should (= 1 (length (pi-coding-agent--treesit-table-regions
+                              (point-min) (point-max)))))
+        (pi-coding-agent--cool-completed-tool-blocks overlays)
+        (should (equal visible
+                       (pi-coding-agent--visible-text
+                        (point-min) (point-max))))
+        (should (= 1 (length (pi-coding-agent--treesit-table-regions
+                              (point-min) (point-max)))))))))
+
 (ert-deftest pi-coding-agent-test-cooled-summary-fence-keeps-later-markdown ()
   "Cooling tool summaries must preserve fence isolation and visible text."
   (dolist (fence '("```bash" "~~~" "   ````"))

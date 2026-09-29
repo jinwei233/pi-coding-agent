@@ -3151,14 +3151,19 @@ if none exists, render the result at point without a live overlay."
           :detail-locator detail-locator)))
 
 (defun pi-coding-agent--insert-tool-summary-fragment (text)
-  "Insert summary TEXT without exposing Markdown fence delimiters.
+  "Insert summary TEXT without exposing open Markdown block delimiters.
 Tool tails are derived display content, but they share the chat buffer's
-Markdown parser.  Hide an inserted escape before fence-like lines so raw tool
-output cannot turn later assistant content into fenced code."
-  (let ((copy-start 0)
+Markdown parser.  Hide an inserted escape before fence-like lines and raw HTML
+openers that could consume later assistant content."
+  (let ((case-fold-search t)
+        (copy-start 0)
         (search-start 0))
     (while (string-match
-            "^\\([ ]\\{0,3\\}\\)\\([`~]\\{3,\\}\\)"
+            (concat
+             "^\\([ ]\\{0,3\\}\\)"
+             "\\([`~]\\{3,\\}"
+             "\\|<\\(?:script\\|pre\\|style\\|textarea\\)\\(?:[ \t>]\\|$\\)"
+             "\\|<!--\\|<\\?\\|<![A-Z]\\|<!\\[CDATA\\[\\)")
             text search-start)
       (insert (substring text copy-start (match-beginning 2)))
       (insert (propertize "\\" 'display ""))
