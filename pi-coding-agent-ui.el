@@ -960,14 +960,45 @@ makes the hot region empty by moving the marker to `point-max'."
        (nth 3 arguments) (nth 4 arguments))
       (pi-coding-agent--schedule-parser-reconciliation))))
 
+(defun pi-coding-agent--observe-native-local-range-update
+    (original host-parser &rest arguments)
+  "Call ORIGINAL with HOST-PARSER and ARGUMENTS and tag native local ownership."
+  (let ((touched (apply original host-parser arguments)))
+    (when (and (derived-mode-p 'pi-coding-agent-chat-mode)
+               (not pi-coding-agent--semantic-link-resolver-parsers)
+               (eq (treesit-parser-language host-parser) 'markdown))
+      (let ((tick (buffer-chars-modified-tick))
+            (touched-set (make-hash-table :test #'eq)))
+        (dolist (parser touched)
+          (puthash parser t touched-set))
+        (dolist (overlay (overlays-in
+                         (or (nth 4 arguments) (point-min))
+                         (or (nth 5 arguments) (point-max))))
+          (when (and
+                 (overlay-get overlay 'treesit-parser-local-p)
+                 (eq (overlay-get overlay 'treesit-host-parser) host-parser)
+                 (gethash (overlay-get overlay 'treesit-parser) touched-set)
+                 (eql (overlay-get overlay 'treesit-parser-ov-timestamp) tick)
+                 (pi-coding-agent--local-parser-overlay-metadata-p overlay nil))
+            (overlay-put overlay 'pi-coding-agent-local-parser-owner 'md-ts))))
+      (pi-coding-agent--schedule-parser-reconciliation))
+    touched))
+
 (defun pi-coding-agent--ensure-parser-ownership-advice ()
-  "Install the idempotent md-ts ownership observation advice."
+  "Install idempotent ownership observers for Markdown local parser updates."
   (unless (advice-member-p
            #'pi-coding-agent--observe-md-ts-local-range-update
            'md-ts--treesit--update-ranges-local)
     (advice-add
      'md-ts--treesit--update-ranges-local :around
-     #'pi-coding-agent--observe-md-ts-local-range-update)))
+     #'pi-coding-agent--observe-md-ts-local-range-update))
+  (when (and (>= emacs-major-version 31)
+             (fboundp 'treesit--update-ranges-local)
+             (not (advice-member-p
+                   #'pi-coding-agent--observe-native-local-range-update
+                   'treesit--update-ranges-local)))
+    (advice-add 'treesit--update-ranges-local :around
+                #'pi-coding-agent--observe-native-local-range-update)))
 
 (defun pi-coding-agent--local-parser-ownership-overlay-p (overlay parsers)
   "Return non-nil when OVERLAY proves Pi-tagged local ownership in PARSERS."

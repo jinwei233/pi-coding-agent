@@ -111,6 +111,56 @@ This ensures all files get code fences for consistent display."
 
 ;;;; Local Parser Lifecycle
 
+(ert-deftest pi-coding-agent-test-parser-lifecycle-native-emacs31 ()
+  "The actual Emacs 31 updater tags and reclaims its cold local parsers."
+  (skip-unless (>= emacs-major-version 31))
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (unwind-protect
+        (progn
+          (let ((inhibit-read-only t))
+            (dotimes (index 12)
+              (insert (format "Paragraph %d with **bold**.\n\n" index))))
+          (treesit-update-ranges (point-min) (point-max))
+          (let ((owned (pi-coding-agent--local-parser-ownership-overlays)))
+            (should (= 12 (length owned)))
+            (should (cl-every
+                     (lambda (overlay)
+                       (overlay-get overlay 'treesit-parser-local-p))
+                     owned))
+            (setq-local pi-coding-agent-parser-hot-tail-max-bytes 0)
+            (move-marker pi-coding-agent--hot-tail-start (point-max))
+            (dolist (status '(sending streaming compacting))
+              (setq pi-coding-agent--status status)
+              (should-not (pi-coding-agent--reconcile-local-parsers))
+              (should (= 12 (length (pi-coding-agent--local-parser-ownership-overlays)))))
+            (setq pi-coding-agent--status 'idle)
+            (should (= 12 (pi-coding-agent--reconcile-local-parsers)))
+            (should-not (pi-coding-agent--local-parser-ownership-overlays))))
+      (pi-coding-agent--cancel-parser-reconciliation))))
+
+(ert-deftest pi-coding-agent-test-parser-lifecycle-native-rejects-untouched-overlay ()
+  "Matching native metadata alone does not establish foreign ownership."
+  (skip-unless (>= emacs-major-version 31))
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let* ((host (treesit-parser-create 'markdown))
+           (foreign (treesit-parser-create 'markdown-inline nil t))
+           (overlay (make-overlay (point-min) (point-max))))
+      (unwind-protect
+          (progn
+            (overlay-put overlay 'treesit-parser foreign)
+            (overlay-put overlay 'treesit-parser-local-p t)
+            (overlay-put overlay 'treesit-host-parser host)
+            (overlay-put overlay 'treesit-parser-ov-timestamp
+                         (buffer-chars-modified-tick))
+            (pi-coding-agent--observe-native-local-range-update
+             (lambda (&rest _) nil) host nil nil nil nil)
+            (should-not (overlay-get overlay 'pi-coding-agent-local-parser-owner)))
+        (pi-coding-agent--cancel-parser-reconciliation)
+        (delete-overlay overlay)
+        (treesit-parser-delete foreign)))))
+
 (defun pi-coding-agent-test--insert-parser-paragraphs (count)
   "Insert COUNT deterministic Markdown paragraphs in the current buffer."
   (let ((inhibit-read-only t))

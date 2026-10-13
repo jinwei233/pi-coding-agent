@@ -118,6 +118,73 @@
     (should-not
      (pi-coding-agent--markdown-fence-next-state nil "    ```elisp"))))
 
+(ert-deftest pi-coding-agent-test-markdown-long-line-retains-fragments ()
+  "Long lines retain each delta once and release fragments at a newline."
+  (with-temp-buffer
+    (let ((chunk (make-string 128 ?x)))
+      (dotimes (_ 2048)
+        (should (equal chunk (pi-coding-agent--transform-delta chunk))))
+      (should (= 2048 (length pi-coding-agent--markdown-line-buffer)))
+      (should (cl-every (lambda (part) (= 128 (length part)))
+                        pi-coding-agent--markdown-line-buffer))
+      (should (equal "\n## next"
+                     (pi-coding-agent--transform-delta "\n# next")))
+      (pi-coding-agent--finish-markdown-line-state)
+      (should-not pi-coding-agent--markdown-line-buffer)
+      (should-not pi-coding-agent--markdown-fence-state))))
+
+(ert-deftest pi-coding-agent-test-markdown-line-fragments-preserve-split-fences ()
+  "Fragmented code fences preserve heading conversion at every delta split."
+  (dolist (text '("```elisp\n# literal\n```\n# heading\n"
+                  "  ~~~~text\n# literal\n~~~~  \n# heading\n"
+                  "```text\nbody\n```~~~\n# literal\n"))
+    (let ((expected (pi-coding-agent--transform-complete-assistant-markdown text)))
+      (dotimes (split (1+ (length text)))
+        (with-temp-buffer
+          (should (equal expected
+                         (concat
+                          (pi-coding-agent--transform-delta (substring text 0 split))
+                          (pi-coding-agent--transform-delta (substring text split))))))))))
+
+(ert-deftest pi-coding-agent-test-markdown-wrapped-long-line-retains-fragments ()
+  "Wrapped look-behind retains small fragments and finalizes correct output."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-message-delta "```md\n")
+    (let ((chunk (make-string 128 ?x)))
+      (dotimes (_ 2048)
+        (pi-coding-agent--display-message-delta chunk))
+      (should (listp pi-coding-agent--assistant-projection-pending))
+      (should (= 2049 (length pi-coding-agent--assistant-projection-pending)))
+      (should (cl-every (lambda (part) (<= (length part) 128))
+                        pi-coding-agent--assistant-projection-pending))
+      (pi-coding-agent--display-message-delta "\n```")
+      (pi-coding-agent--finish-assistant-text)
+      (should (equal
+               (buffer-substring-no-properties
+                pi-coding-agent--message-start-marker (point-max))
+               (concat (make-string (* 128 2048) ?x) "\n")))
+      (should-not pi-coding-agent--markdown-line-buffer)
+      (should (equal pi-coding-agent--assistant-projection-pending "")))))
+
+(ert-deftest pi-coding-agent-test-markdown-fragments-reset-between-text-units ()
+  "Discarded logical-line and wrapper fragments cannot leak into a new unit."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-message-delta "```el")
+    (should pi-coding-agent--markdown-line-buffer)
+    (pi-coding-agent--reset-assistant-markdown-state)
+    (should-not pi-coding-agent--markdown-line-buffer)
+    (should (equal "## next\n" (pi-coding-agent--transform-delta "# next\n")))
+    (pi-coding-agent--project-assistant-stream-delta "```md\n")
+    (pi-coding-agent--project-assistant-stream-delta "discarded")
+    (should (listp pi-coding-agent--assistant-projection-pending))
+    (pi-coding-agent--reset-assistant-markdown-state)
+    (should (equal pi-coding-agent--assistant-projection-pending ""))
+    (should (equal "fresh" (pi-coding-agent--project-assistant-stream-delta "fresh")))))
+
 (ert-deftest pi-coding-agent-test-markdown-review-mixed-fence-runs ()
   "Only a homogeneous fence run can open or close a code block."
   (dolist (line '("`~~" "~~`" "`~`"))

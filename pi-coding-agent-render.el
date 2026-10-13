@@ -131,14 +131,14 @@ the query when no table can be present.")
 (defvar-local pi-coding-agent--markdown-fence-state nil
   "Opening fence metadata for the current projected assistant text.")
 
-(defvar-local pi-coding-agent--markdown-line-buffer ""
-  "Incomplete logical line retained by the streaming Markdown scanner.")
+(defvar-local pi-coding-agent--markdown-line-buffer nil
+  "Fragments of the incomplete Markdown logical line, stored newest first.")
 
 (defvar-local pi-coding-agent--assistant-projection-mode 'probe
   "Current assistant wrapper projection mode: `probe', `plain', or `wrapped'.")
 
 (defvar-local pi-coding-agent--assistant-projection-pending ""
-  "Assistant text withheld while classifying or closing a Markdown wrapper.")
+  "Withheld wrapper text: a probe string or newest-first wrapped line fragments.")
 
 (defvar-local pi-coding-agent--assistant-wrapper-fence nil
   "Opening fence metadata for the current whole-response Markdown wrapper.")
@@ -327,7 +327,7 @@ The result is a plist containing `:text' and `:wrapped'."
   (let ((pi-coding-agent--line-parse-state 'line-start)
         (pi-coding-agent--in-code-block nil)
         (pi-coding-agent--markdown-fence-state nil)
-        (pi-coding-agent--markdown-line-buffer ""))
+        (pi-coding-agent--markdown-line-buffer nil))
     (pi-coding-agent--transform-delta text)))
 
 (defun pi-coding-agent--reset-assistant-markdown-state ()
@@ -335,7 +335,7 @@ The result is a plist containing `:text' and `:wrapped'."
   (setq pi-coding-agent--line-parse-state 'line-start
         pi-coding-agent--in-code-block nil
         pi-coding-agent--markdown-fence-state nil
-        pi-coding-agent--markdown-line-buffer ""
+        pi-coding-agent--markdown-line-buffer nil
         pi-coding-agent--assistant-projection-mode 'probe
         pi-coding-agent--assistant-projection-pending ""
         pi-coding-agent--assistant-wrapper-fence nil
@@ -347,14 +347,14 @@ The result is a plist containing `:text' and `:wrapped'."
 
 (defun pi-coding-agent--finish-markdown-line-state ()
   "Commit the current incomplete line to streaming fence state."
-  (unless (string-empty-p pi-coding-agent--markdown-line-buffer)
+  (when pi-coding-agent--markdown-line-buffer
     (setq pi-coding-agent--markdown-fence-state
           (pi-coding-agent--markdown-fence-next-state
            pi-coding-agent--markdown-fence-state
-           pi-coding-agent--markdown-line-buffer)
+           (apply #'concat (nreverse pi-coding-agent--markdown-line-buffer)))
           pi-coding-agent--in-code-block
           (and pi-coding-agent--markdown-fence-state t)
-          pi-coding-agent--markdown-line-buffer "")))
+          pi-coding-agent--markdown-line-buffer nil)))
 
 (defun pi-coding-agent--transform-delta (delta)
   "Transform DELTA for display, handling code blocks and heading levels.
@@ -374,7 +374,12 @@ enough state to remain independent of process-delta boundaries."
                        (string-prefix-p "#" fragment))
                   (concat "#" fragment)
                 fragment))
-             (line (concat pi-coding-agent--markdown-line-buffer fragment)))
+             (line (if pi-coding-agent--markdown-line-buffer
+                       (apply #'concat
+                              (nreverse
+                               (cons fragment
+                                     pi-coding-agent--markdown-line-buffer)))
+                     fragment)))
         (push transformed result)
         (push "\n" result)
         (setq pi-coding-agent--markdown-fence-state
@@ -382,7 +387,7 @@ enough state to remain independent of process-delta boundaries."
                pi-coding-agent--markdown-fence-state line)
               pi-coding-agent--in-code-block
               (and pi-coding-agent--markdown-fence-state t)
-              pi-coding-agent--markdown-line-buffer ""
+              pi-coding-agent--markdown-line-buffer nil
               pi-coding-agent--line-parse-state 'line-start
               start next-start)))
     (let* ((fragment (substring delta start))
@@ -394,9 +399,8 @@ enough state to remain independent of process-delta boundaries."
                 (concat "#" fragment)
               fragment)))
       (unless (string-empty-p fragment)
-        (setq pi-coding-agent--markdown-line-buffer
-              (concat pi-coding-agent--markdown-line-buffer fragment)
-              pi-coding-agent--line-parse-state 'mid-line))
+        (push fragment pi-coding-agent--markdown-line-buffer)
+        (setq pi-coding-agent--line-parse-state 'mid-line))
       (push transformed result))
     (apply #'concat (nreverse result))))
 
@@ -441,7 +445,7 @@ RETAIN holds the last nonblank logical line and trailing whitespace so a final
 wrapper delimiter can be consumed at text end."
   (let ((keep-start (pi-coding-agent--last-nonblank-line-start text)))
     (cons (substring text 0 keep-start)
-          (substring text keep-start))))
+          (list (substring text keep-start)))))
 
 (defun pi-coding-agent--project-assistant-stream-delta (delta)
   "Return the presentable part of assistant DELTA and retain wrapper look-behind."
@@ -449,16 +453,23 @@ wrapper delimiter can be consumed at text end."
       (progn
         (setq pi-coding-agent--assistant-projection-mode 'plain)
         delta)
-    (let ((text (concat pi-coding-agent--assistant-projection-pending delta)))
-      (pcase pi-coding-agent--assistant-projection-mode
-        ('plain
-         (setq pi-coding-agent--assistant-projection-pending "")
-         text)
-        ('wrapped
-         (let ((parts (pi-coding-agent--project-wrapped-stream-tail text)))
+    (pcase pi-coding-agent--assistant-projection-mode
+      ('plain delta)
+      ('wrapped
+       (if (not (string-search "\n" delta))
+           (progn
+             (unless (string-empty-p delta)
+               (push delta pi-coding-agent--assistant-projection-pending))
+             "")
+         (let* ((text
+                 (apply #'concat
+                        (nreverse
+                         (cons delta pi-coding-agent--assistant-projection-pending))))
+                (parts (pi-coding-agent--project-wrapped-stream-tail text)))
            (setq pi-coding-agent--assistant-projection-pending (cdr parts))
-           (car parts)))
-        (_
+           (car parts))))
+      (_
+       (let ((text (concat pi-coding-agent--assistant-projection-pending delta)))
          ;; Probe the first nonblank line without dropping its blank margin.
          (string-match "\\`\\(?:[ \t]*\n\\)*" text)
          (let* ((line-start (match-end 0))
@@ -572,7 +583,11 @@ Return `(RESULT . CLOSED)' while preserving whitespace outside that line."
   "Flush pending assistant projection state and isolate an open fence."
   (when (memq pi-coding-agent--assistant-projection-mode
               '(probe plain wrapped))
-    (let ((pending pi-coding-agent--assistant-projection-pending)
+    (let ((pending
+           (if (listp pi-coding-agent--assistant-projection-pending)
+               (apply #'concat
+                      (nreverse pi-coding-agent--assistant-projection-pending))
+             pi-coding-agent--assistant-projection-pending))
           (wrapper-closed nil))
       (when (eq pi-coding-agent--assistant-projection-mode 'probe)
         (setq pending (string-trim-left pending "\n+")))
@@ -608,7 +623,7 @@ Return `(RESULT . CLOSED)' while preserving whitespace outside that line."
           pi-coding-agent--assistant-text-seen-input nil
           pi-coding-agent--assistant-wrapper-raw-chunks nil
           pi-coding-agent--markdown-fence-state nil
-          pi-coding-agent--markdown-line-buffer ""
+          pi-coding-agent--markdown-line-buffer nil
           pi-coding-agent--in-code-block nil
           pi-coding-agent--line-parse-state 'line-start)))
 
