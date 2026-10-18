@@ -372,12 +372,16 @@ rebuilds, reloads, or whole-chat display-mode changes."
 
 (defcustom pi-coding-agent-thinking-hidden-preview t
   "Whether hidden completed thinking should preview its first line.
-When non-nil, collapsed completed thinking shows the first non-empty trimmed
-line when the normalized thinking spans more than one line, is at least
-3 characters long, and shorter than 72 characters. Otherwise the hidden block
-falls back to a generic line-count label."
+This option is obsolete and ignored: collapsed completed thinking always
+shows a one-line `Think · <preview>' stub truncated to the shared
+display-column budget.  Keep the variable so existing init files that set
+it keep loading without error."
   :type 'boolean
   :group 'pi-coding-agent)
+
+(make-obsolete-variable 'pi-coding-agent-thinking-hidden-preview
+                        "collapsed thinking always previews its first line"
+                        "pi-coding-agent 1.0")
 
 (defcustom pi-coding-agent-model-allowlist nil
   "Provider/model pairs exposed by the interactive model selector.
@@ -1442,6 +1446,10 @@ This is a read-only buffer showing the conversation history."
   ;; Hide markdown markup (**, `, ```) for cleaner display
   (setq-local md-ts-hide-markup t)
   (md-ts--set-hide-markup t)
+  ;; Hidden turn structure must not be revealed by incremental search.
+  ;; Emacs 31 defaults `search-invisible' to `open', which would reopen
+  ;; text-property hidden headings if this buffer inherited it.
+  (setq-local search-invisible nil)
   ;; Strip hidden markup from copy operations (M-w, C-w)
   (setq-local filter-buffer-substring-function
               #'pi-coding-agent--filter-buffer-substring)
@@ -1470,6 +1478,10 @@ This is a read-only buffer showing the conversation history."
 
   ;; Run after font-lock to undo markdown damage in tool overlays.
   (jit-lock-register #'pi-coding-agent--restore-tool-properties)
+
+  ;; Structural turn headings are hidden with `invisible', which md-ts
+  ;; fontification clears.  Restore them after every fontification pass.
+  (jit-lock-register #'pi-coding-agent--restore-hidden-turn-structure)
 
   ;; Decorate pipe tables lazily as they scroll into view.  History replay
   ;; eagerly decorates only the hot tail; this jit-lock pass renders older
@@ -2527,6 +2539,89 @@ turn markers as H1 while LLM ATX headings are leveled down to H2+."
          (underline-len (max 3 (length header-line)))
          (underline (make-string underline-len ?=)))
     (concat header-line "\n" underline "\n")))
+
+;;;; Quiet Transcript Structure
+
+(defconst pi-coding-agent--turn-marker "❯"
+  "Visible marker that opens a user turn in the chat transcript.")
+
+(defconst pi-coding-agent--single-line-preview-columns 72
+  "Display-column budget for one-line transcript previews.
+Ellipsis characters count toward this budget.")
+
+(defconst pi-coding-agent--hidden-turn-structure-property
+  'pi-coding-agent-hidden-turn-structure
+  "Text property recording turn structure that must stay invisible.
+`md-ts-mode' registers `invisible' in `font-lock-extra-managed-props',
+so tree-sitter fontification clears the visibility property.  This
+property is not font-lock managed and lets
+`pi-coding-agent--restore-hidden-turn-structure' put `invisible' back
+after every fontification pass.")
+
+(defun pi-coding-agent--hide-turn-structure (start end)
+  "Hide turn structure text between START and END.
+START..END keeps its buffer text so turn navigation, fork-at-point,
+hot-tail boundaries and outline scanning still find the original
+headings.  Newlines inside the range get an empty `display' property
+because `invisible' does not remove line breaks."
+  (when (< start end)
+    (let ((inhibit-read-only t))
+      (add-text-properties start end
+                           (list pi-coding-agent--hidden-turn-structure-property t
+                                 'invisible t))
+      (save-excursion
+        (goto-char start)
+        (while (search-forward "\n" end t)
+          (put-text-property (1- (point)) (point) 'display ""))))))
+
+(defun pi-coding-agent--restore-hidden-turn-structure (beg end)
+  "Restore invisibility for hidden turn structure in BEG..END.
+Runs as a `jit-lock-register' pass so tree-sitter markdown
+fontification cannot reveal the structural headings."
+  (let ((inhibit-read-only t)
+        (pos beg))
+    (while (< pos end)
+      (let ((next (next-single-char-property-change
+                   pos pi-coding-agent--hidden-turn-structure-property
+                   nil end)))
+        (when (eq t (get-text-property
+                     pos pi-coding-agent--hidden-turn-structure-property))
+          (put-text-property pos next 'invisible t))
+        (setq pos next)))))
+
+(defun pi-coding-agent--insert-turn-heading (label &optional timestamp)
+  "Insert a hidden setext LABEL heading at the end of the chat buffer.
+The heading keeps its text for navigation but is invisible, and its line
+breaks are folded so it adds no blank line.  TIMESTAMP is kept in the
+heading text only, never in visible output."
+  (let* ((start (1+ (point-max)))
+         (heading (pi-coding-agent--make-separator label timestamp)))
+    (pi-coding-agent--append-to-chat (concat "\n" heading))
+    (pi-coding-agent--hide-turn-structure start (point-max))))
+
+(defun pi-coding-agent--insert-user-turn-marker (&optional timestamp)
+  "Insert the visible user turn marker and its folded paragraph separator.
+The buffer keeps `❯' plus an empty paragraph line so the following user
+text still starts a fresh Markdown block, while the empty line's newline
+is folded so the visible result stays two adjacent lines.  TIMESTAMP is
+exposed only through the marker's `help-echo'."
+  (let* ((help (if timestamp
+                   (format "You · %s"
+                           (pi-coding-agent--format-message-timestamp timestamp))
+                 "You"))
+         (start (point-max)))
+    (pi-coding-agent--append-to-chat
+     (propertize pi-coding-agent--turn-marker 'help-echo help))
+    (pi-coding-agent--append-to-chat "\n\n")
+    (let ((inhibit-read-only t))
+      (put-text-property (+ start 2) (+ start 3) 'display ""))))
+
+(defun pi-coding-agent--single-line-preview (text &optional columns)
+  "Return TEXT truncated to COLUMNS display columns with an ellipsis.
+COLUMNS defaults to `pi-coding-agent--single-line-preview-columns', and
+the ellipsis counts toward the budget."
+  (let ((columns (or columns pi-coding-agent--single-line-preview-columns)))
+    (truncate-string-to-width (or text "") columns nil nil "…")))
 
 ;;;; Formatting Utilities
 

@@ -474,14 +474,16 @@ logical block and should not start following later streamed output."
     (pi-coding-agent-gui-test-send "Use the fake read tool")
     (should (pi-coding-agent-gui-test-chat-contains "read /tmp/fake-tool.txt"))
     (should (pi-coding-agent-gui-test-chat-text-in-tool-block-p
-             "2 lines · TAB details"))
+             "2 lines"))
     (should-not (pi-coding-agent-gui-test-chat-contains "fake tool output"))
+    (should-not (pi-coding-agent-gui-test-chat-contains "TAB details"))
     (with-current-buffer (plist-get pi-coding-agent-gui-test--session
                                     :chat-buffer)
       (goto-char (point-min))
-      (search-forward "TAB details")
+      (search-forward "2 lines")
+      ;; The whole summary line is the toggle button now.
       (pi-coding-agent--toggle-tool-output
-       (button-at (match-beginning 0))))
+       (button-at (1- (point)))))
     (should (pi-coding-agent-gui-test-chat-text-in-tool-block-p
              "fake tool output"))
     (should (pi-coding-agent-gui-test-chat-contains "Tool finished"))))
@@ -495,7 +497,7 @@ rear-advance overlay before assistant text continues after the tool block."
     (pi-coding-agent-gui-test-send "Use the fake read tool")
     (with-current-buffer (plist-get pi-coding-agent-gui-test--session :chat-buffer)
       (goto-char (point-min))
-      (search-forward "2 lines · TAB details")
+      (search-forward "2 lines")
       (let* ((tool-pos (match-beginning 0))
              (tool-overlay (seq-find
                             (lambda (ov) (overlay-get ov 'pi-coding-agent-tool-block))

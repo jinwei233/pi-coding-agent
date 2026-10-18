@@ -201,12 +201,14 @@ the query when no table can be present.")
 
 (defun pi-coding-agent--display-user-message (text &optional timestamp)
   "Display user message TEXT in the chat buffer.
-If TIMESTAMP (Emacs time value) is provided, display it in the header."
+The turn opens with a visible `❯' marker line.  The structural `You'
+setext heading stays in the buffer for navigation but is hidden, and
+TIMESTAMP reaches the user only through the marker's `help-echo'."
   (let ((start (with-current-buffer (pi-coding-agent--get-chat-buffer) (point-max))))
-    (pi-coding-agent--append-to-chat
-     (concat "\n" (pi-coding-agent--make-separator "You" timestamp) "\n"
-             text "\n"))
     (with-current-buffer (pi-coding-agent--get-chat-buffer)
+      (pi-coding-agent--insert-turn-heading "You" timestamp)
+      (pi-coding-agent--insert-user-turn-marker timestamp)
+      (pi-coding-agent--append-to-chat (concat text "\n"))
       (pi-coding-agent--decorate-tables-unless-deferred start (point-max)))))
 
 (defun pi-coding-agent--display-agent-start ()
@@ -217,8 +219,7 @@ Note: status is set to `streaming' by the event handler."
   ;; Only show header if not already shown for this prompt.
   (unless pi-coding-agent--assistant-header-shown
     (pi-coding-agent--begin-streaming-scroll-anchor)
-    (pi-coding-agent--append-to-chat
-     (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n"))
+    (pi-coding-agent--insert-turn-heading "Assistant")
     (setq pi-coding-agent--assistant-header-shown t))
   ;; Create markers at current end position
   ;; message-start-marker: where content begins (for later replacement)
@@ -689,37 +690,15 @@ at most one empty paragraph separator while preserving indentation."
       ""
     (concat "> " (replace-regexp-in-string "\n" "\n> " text))))
 
-(defun pi-coding-agent--thinking-line-count-label (count)
-  "Return COUNT formatted as a singular or plural line label."
-  (format "%d line%s" count (if (= count 1) "" "s")))
-
-(defun pi-coding-agent--thinking-more-lines-label (count)
-  "Return COUNT formatted as a singular or plural hidden-line label."
-  (format "%d more line%s" count (if (= count 1) "" "s")))
-
-(defun pi-coding-agent--thinking-first-content-line (normalized)
-  "Return the first non-empty trimmed line from NORMALIZED, or nil."
-  (catch 'first
-    (dolist (line (split-string normalized "\n" nil))
-      (let ((trimmed (string-trim line)))
-        (unless (string-empty-p trimmed)
-          (throw 'first trimmed))))))
-
 (defun pi-coding-agent--thinking-hidden-stub (normalized)
-  "Return the collapsed completed-thinking stub for NORMALIZED."
-  (let* ((line-count (length (split-string normalized "\n" nil)))
-         (first-line (pi-coding-agent--thinking-first-content-line normalized))
-         (previewable (and pi-coding-agent-thinking-hidden-preview
-                           (> line-count 1)
-                           first-line
-                           (>= (length first-line) 3)
-                           (< (length first-line) 72))))
-    (if previewable
-        (format "> Thinking: %s… (%s)"
-                first-line
-                (pi-coding-agent--thinking-more-lines-label (1- line-count)))
-      (format "> Thinking hidden… (%s)"
-              (pi-coding-agent--thinking-line-count-label line-count)))))
+  "Return the collapsed completed-thinking stub for NORMALIZED.
+The stub is always a single `Think · <preview>' line.  The preview comes
+from the first non-empty physical line and is truncated to the shared
+display-column budget, so single-line thinking previews too."
+  (let ((line (pi-coding-agent--first-nonempty-line normalized)))
+    (if line
+        (format "Think · %s" (pi-coding-agent--single-line-preview line))
+      "Think")))
 
 (defun pi-coding-agent--next-thinking-block-order ()
   "Return the next monotonically increasing completed-thinking block order."
@@ -1720,8 +1699,7 @@ Updates buffer-local state and renders display updates."
           (setq pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
             (pi-coding-agent--begin-streaming-scroll-anchor)
-            (pi-coding-agent--append-to-chat
-             (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n"))
+            (pi-coding-agent--insert-turn-heading "Assistant")
             (setq pi-coding-agent--assistant-header-shown t))
           (pi-coding-agent--set-message-start-marker (copy-marker (point-max) nil))
           (pi-coding-agent--set-streaming-marker (copy-marker (point-max) t))))))
@@ -2186,11 +2164,8 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
 (defconst pi-coding-agent--tool-inline-detail-byte-limit (* 64 1024)
   "Largest tool detail that may be expanded inline in a hot block.")
 
-(defconst pi-coding-agent--tool-summary-tail-lines 5
-  "Number of trailing output lines retained in a completed tool summary.")
-
-(defconst pi-coding-agent--tool-summary-tail-bytes 2048
-  "Maximum bytes retained for a completed tool output tail.")
+(defconst pi-coding-agent--tool-summary-error-bytes 2048
+  "Maximum prefix size scanned for a one-line completed tool summary.")
 
 (defun pi-coding-agent--tool-text-line-count (text)
   "Return the physical line count of TEXT without splitting it."
@@ -2228,18 +2203,19 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
                 (length diff)))))
     (cons added removed)))
 
-(defun pi-coding-agent--tool-summary-tail (text)
-  "Return a bounded trailing summary of TEXT."
-  (let* ((text (or text ""))
-         (tail (car (pi-coding-agent--get-tail-lines
-                     text pi-coding-agent--tool-summary-tail-lines)))
-         (bytes (string-bytes tail)))
-    (if (<= bytes pi-coding-agent--tool-summary-tail-bytes)
-        tail
-      (let* ((start (max 0 (- (length tail)
-                              pi-coding-agent--tool-summary-tail-bytes)))
-             (bounded (substring tail start)))
-        (concat "..." bounded)))))
+(defun pi-coding-agent--first-nonempty-line (text &optional limit)
+  "Return the first non-empty physical line of TEXT within LIMIT chars.
+Only a bounded prefix is examined and no full filtered or split copy of
+TEXT is allocated, so the summary path stays cheap on large payloads.
+The returned line is trimmed and escaped for one-line display."
+  (when (stringp text)
+    (let* ((limit (or limit pi-coding-agent--tool-summary-error-bytes))
+           (prefix (if (> (length text) limit) (substring text 0 limit) text))
+           (start (string-match "[^ \t\r\n]" prefix)))
+      (when start
+        (let ((line-end (or (string-match "\n" prefix start) (length prefix))))
+          (pi-coding-agent--escape-control-chars-for-display
+           (string-trim (substring prefix start line-end))))))))
 
 (defun pi-coding-agent--tool-result-text (content)
   "Extract raw text from vector or list tool result CONTENT."
@@ -3117,51 +3093,48 @@ if none exists, render the result at point without a live overlay."
          (lines (pi-coding-agent--tool-text-line-count raw))
          (path (pi-coding-agent--tool-path-string
                 (pi-coding-agent--tool-arg-path args)))
+         (first-line (pi-coding-agent--first-nonempty-line raw))
          (detail-locator (list :tool-call-id tool-call-id))
          summary)
     (setq summary
-          (if error-p
-              (if (<= (string-bytes raw) pi-coding-agent--tool-summary-tail-bytes)
-                  (format "failed · %s · TAB details" raw)
-                (format "failed · %d lines (%d hidden)\n%s\nTAB details"
-                        lines
-                        (max 0 (- lines pi-coding-agent--tool-summary-tail-lines))
-                        (pi-coding-agent--tool-summary-tail raw)))
-            (pcase tool-name
-              ("edit"
-               (let* ((diff (pi-coding-agent--tool-arg-get details :diff))
-                      (counts (pi-coding-agent--tool-diff-counts diff)))
-                 (format "+%d -%d · TAB details" (car counts) (cdr counts))))
-              ("write"
-               (let ((written (or (pi-coding-agent--tool-arg-get args :content)
-                                  "")))
-                 (format "%d lines · %s · TAB details"
-                         (pi-coding-agent--tool-text-line-count written)
-                         (pi-coding-agent--tool-byte-label written))))
-              ("read"
-               (let* ((offset (pi-coding-agent--tool-arg-get args :offset))
-                      (end (and offset (> lines 0) (+ offset lines -1))))
-                 (format "%s%d lines · TAB details"
-                         (if offset
-                             (format "L%d-L%d · " offset (or end offset))
-                           "")
-                         lines)))
-              ("bash"
-               (format "%d lines (%d hidden)\n%s\nTAB details"
-                       lines
-                       (max 0 (- lines pi-coding-agent--tool-summary-tail-lines))
-                       (pi-coding-agent--tool-summary-tail raw)))
-              (_
-               (let ((args-summary (pi-coding-agent--tool-generic-summary args))
-                     (details-summary
-                      (pi-coding-agent--tool-generic-summary details)))
-                 (string-join
-                  (delq nil
-                        (list (unless (string-empty-p args-summary) args-summary)
-                              (unless (string-empty-p details-summary)
-                                (concat "result " details-summary))
-                              "TAB details"))
-                  " · "))))))
+          (pi-coding-agent--single-line-preview
+           (if error-p
+               (if first-line
+                   (format "failed · %s" first-line)
+                 (format "failed · %d lines" lines))
+             (pcase tool-name
+               ("edit"
+                (let* ((diff (pi-coding-agent--tool-arg-get details :diff))
+                       (counts (pi-coding-agent--tool-diff-counts diff)))
+                  (format "+%d -%d" (car counts) (cdr counts))))
+               ("write"
+                (let ((written (or (pi-coding-agent--tool-arg-get args :content)
+                                   "")))
+                  (format "%d lines · %s"
+                          (pi-coding-agent--tool-text-line-count written)
+                          (pi-coding-agent--tool-byte-label written))))
+               ("read"
+                (let* ((offset (pi-coding-agent--tool-arg-get args :offset))
+                       (end (and offset (> lines 0) (+ offset lines -1))))
+                  (format "%s%d lines"
+                          (if offset
+                              (format "L%d-L%d · " offset (or end offset))
+                            "")
+                          lines)))
+               ("bash"
+                (if first-line
+                    (format "%d lines · %s" lines first-line)
+                  (format "%d lines" lines)))
+               (_
+                (let ((args-summary (pi-coding-agent--tool-generic-summary args))
+                      (details-summary
+                       (pi-coding-agent--tool-generic-summary details)))
+                  (string-join
+                   (delq nil
+                         (list (unless (string-empty-p args-summary) args-summary)
+                               (unless (string-empty-p details-summary)
+                                 (concat "result " details-summary))))
+                   " · ")))))))
     (list :tool-call-id tool-call-id
           :tool-name tool-name
           :error error-p
@@ -3194,26 +3167,27 @@ openers that could consume later assistant content."
     (insert (substring text copy-start))))
 
 (defun pi-coding-agent--insert-tool-summary (record)
-  "Insert the visible lightweight summary for RECORD."
-  (let* ((summary (plist-get record :summary))
-         (tool-call-id (plist-get record :tool-call-id))
-         (tab-start (or (string-match "TAB details" summary)
-                        (length summary))))
-    (pi-coding-agent--insert-tool-summary-fragment
-     (substring summary 0 tab-start))
-    (insert-text-button
-     (if (< tab-start (length summary)) "TAB details" "[details]")
-     'action #'pi-coding-agent--toggle-tool-summary
-     'follow-link t
-     'pi-coding-agent-tool-toggle t
-     'pi-coding-agent-tool-call-id tool-call-id
-     'pi-coding-agent-summary summary
-     'pi-coding-agent-tool-images (plist-get record :images)
-     'pi-coding-agent-expanded nil)
-    (when (< (+ tab-start (length "TAB details")) (length summary))
-      (pi-coding-agent--insert-tool-summary-fragment
-       (substring summary (+ tab-start (length "TAB details")))))
-    (insert "\n")
+  "Insert the visible one-line summary for RECORD as a whole-line button.
+The button carries the toggle metadata that TAB dispatch, RET activation and
+cold-history collapsed detection rely on.  It has no visible expand label and
+no button face: discoverability comes from `help-echo' only."
+  (let* ((summary (or (plist-get record :summary) ""))
+         (tool-call-id (plist-get record :tool-call-id)))
+    (let ((inhibit-read-only t)
+          (start (point)))
+      (pi-coding-agent--insert-tool-summary-fragment summary)
+      (insert "\n")
+      (make-text-button
+       start (point)
+       'action #'pi-coding-agent--toggle-tool-summary
+       'follow-link t
+       'face nil
+       'help-echo "TAB/click: expand tool detail"
+       'pi-coding-agent-tool-toggle t
+       'pi-coding-agent-tool-call-id tool-call-id
+       'pi-coding-agent-summary summary
+       'pi-coding-agent-tool-images (plist-get record :images)
+       'pi-coding-agent-expanded nil))
     (pi-coding-agent--insert-output-image-blocks
      (plist-get record :images)
      pi-coding-agent--defer-history-postprocessing)))
@@ -6809,8 +6783,7 @@ IDs to their result messages."
        "user")
       ("assistant"
        (unless (equal previous-role "assistant")
-         (pi-coding-agent--append-to-chat
-          (concat "\n" (pi-coding-agent--make-separator "Assistant") "\n")))
+         (pi-coding-agent--insert-turn-heading "Assistant"))
        (pi-coding-agent--render-history-assistant-content message results)
        "assistant")
       ("custom"

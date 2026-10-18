@@ -62,7 +62,7 @@
     (pi-coding-agent--display-history-messages
      (vector (list :role "assistant" :content text)))
     (goto-char (point-min))
-    (search-forward "=========\n\n")
+    (search-forward "=========\n")
     (string-trim-right
      (substring-no-properties
       (pi-coding-agent--visible-text (point) (point-max))))))
@@ -625,21 +625,26 @@ as the top-level structure."
     (should (string-suffix-p "response\n" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-spacing-blank-line-after-user-header ()
-  "User header has a blank line after setext underline."
+  "User turn keeps its structural heading hidden behind the marker line."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-user-message "Hello")
-    ;; Pattern: setext heading (You + underline), blank line, content
-    (should (string-match-p "You\n=+\n\nHello" (buffer-string)))))
+    ;; Buffer keeps "You" + underline for navigation, then the folded
+    ;; paragraph break before the user body.
+    (should (equal "\nYou\n===\n\u276f\n\nHello\n" (buffer-string)))
+    (should (equal "\n\u276f\nHello\n"
+                   (pi-coding-agent--visible-text (point-min) (point-max))))))
 
 (ert-deftest pi-coding-agent-test-spacing-blank-line-after-assistant-header ()
-  "Assistant header has a blank line after setext underline."
+  "Assistant header stays hidden and its content follows directly."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-message-delta "Hi")
-    ;; Pattern: setext heading (Assistant + underline), blank line, content
-    (should (string-match-p "Assistant\n=+\n\nHi" (buffer-string)))))
+    ;; Hidden heading keeps its text; the folded newline removes the
+    ;; blank line that used to sit after the underline.
+    (should (string-match-p "\nAssistant\n=+\nHi" (buffer-string)))
+    (should (equal "\nHi" (pi-coding-agent--visible-text (point-min) (point-max))))))
 
 (ert-deftest pi-coding-agent-test-spacing-delta-leading-newlines-stripped ()
   "Leading newlines from first text delta are stripped.
@@ -649,8 +654,8 @@ extra blank lines after the setext header."
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-message-delta "\n\nHi")
-    ;; The blank line comes from the separator; delta leading newlines are stripped
-    (should (string-match-p "Assistant\n=+\n\nHi" (buffer-string)))))
+    ;; Delta leading newlines are stripped; the hidden heading adds no blank line
+    (should (string-match-p "Assistant\n=+\nHi" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-spacing-thinking-leading-newlines-stripped ()
   "Leading newlines before thinking block are stripped.
@@ -659,8 +664,8 @@ Models may send \\n\\n before thinking content too."
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
-    ;; Blank line after header, then thinking blockquote
-    (should (string-match-p "Assistant\n=+\n\n>" (buffer-string)))))
+    ;; Hidden header adds no blank line before the thinking blockquote
+    (should (string-match-p "Assistant\n=+\n>" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-thinking-empty-lifecycle-no-visible-blockquote ()
   "Empty thinking start/end should not leave a visible blank blockquote."
@@ -687,7 +692,7 @@ Models may send \\n\\n before thinking content too."
       (should-not (re-search-forward "^>\\s-*$" nil t)))))
 
 (ert-deftest pi-coding-agent-test-hidden-thinking-shows-live-then-collapses-to-preview-line ()
-  "Hidden mode still shows live thinking, then collapses it to a summary line."
+  "Hidden mode still shows live thinking, then collapses it to one preview line."
   (let ((pi-coding-agent-thinking-display 'hidden))
     (with-temp-buffer
       (pi-coding-agent-chat-mode)
@@ -699,15 +704,16 @@ Models may send \\n\\n before thinking content too."
       (pi-coding-agent--display-thinking-end "")
       (let ((text (buffer-string)))
         (should (string-match-p
-                 (regexp-quote
-                  "> Thinking: Crafting response style… (2 more lines)")
+                 (regexp-quote "Think · Crafting response style")
                  text))
-        (should-not (string-match-p "> Crafting response style" text))))))
+        (should-not (string-match-p "> Crafting response style" text))
+        (should-not (string-match-p "Thinking hidden" text))
+        (should-not (string-match-p "more line" text))))))
 
-(ert-deftest pi-coding-agent-test-hidden-thinking-falls-back-when-first-line-is-too-long ()
-  "Collapsed thinking falls back to the generic hidden label for long first lines."
+(ert-deftest pi-coding-agent-test-hidden-thinking-truncates-long-first-line ()
+  "Collapsed thinking truncates an over-budget first line instead of hiding it."
   (let ((pi-coding-agent-thinking-display 'hidden)
-        (long-line (make-string 72 ?x)))
+        (long-line (make-string 120 ?x)))
     (with-temp-buffer
       (pi-coding-agent-chat-mode)
       (pi-coding-agent--display-agent-start)
@@ -715,14 +721,18 @@ Models may send \\n\\n before thinking content too."
       (pi-coding-agent--display-thinking-delta
        (concat long-line "\nSecond line"))
       (pi-coding-agent--display-thinking-end "")
-      (let ((text (buffer-string)))
-        (should (string-match-p
-                 (regexp-quote "> Thinking hidden… (2 lines)")
-                 text))
-        (should-not (string-match-p long-line text))))))
+      (let ((text (buffer-string))
+            (stub (pi-coding-agent-test--collapsed-thinking-stub
+                   (concat long-line "\nSecond line"))))
+        (should (string-match-p (regexp-quote stub) text))
+        (should (string-suffix-p "…" stub))
+        (should (<= (string-width stub)
+                    (+ 8 pi-coding-agent--single-line-preview-columns)))
+        (should-not (string-match-p long-line text))
+        (should-not (string-match-p "Thinking hidden" text))))))
 
-(ert-deftest pi-coding-agent-test-hidden-thinking-falls-back-when-first-line-is-too-short ()
-  "Collapsed thinking falls back when the first line is shorter than 3 chars."
+(ert-deftest pi-coding-agent-test-hidden-thinking-preview-shows-short-first-line ()
+  "Collapsed thinking previews a short single-line body instead of a generic label."
   (let ((pi-coding-agent-thinking-display 'hidden))
     (with-temp-buffer
       (pi-coding-agent-chat-mode)
@@ -731,11 +741,11 @@ Models may send \\n\\n before thinking content too."
       (pi-coding-agent--display-thinking-delta "ok\nSecond line")
       (pi-coding-agent--display-thinking-end "")
       (should (string-match-p
-               (regexp-quote "> Thinking hidden… (2 lines)")
+               (regexp-quote "Think · ok")
                (buffer-string))))))
 
-(ert-deftest pi-coding-agent-test-hidden-thinking-preview-can-be-disabled ()
-  "Collapsed thinking can always use the generic hidden label when configured."
+(ert-deftest pi-coding-agent-test-hidden-thinking-preview-ignores-obsolete-option ()
+  "Setting the obsolete preview option no longer changes collapsed output."
   (let ((pi-coding-agent-thinking-display 'hidden)
         (pi-coding-agent-thinking-hidden-preview nil))
     (with-temp-buffer
@@ -747,9 +757,10 @@ Models may send \\n\\n before thinking content too."
       (pi-coding-agent--display-thinking-end "")
       (let ((text (buffer-string)))
         (should (string-match-p
-                 (regexp-quote "> Thinking hidden… (3 lines)")
+                 (regexp-quote "Think · Crafting response style")
                  text))
-        (should-not (string-match-p "Thinking: Crafting response style" text))))))
+        (should-not (string-match-p "Thinking hidden" text))
+        (should-not (string-match-p "Thinking: Crafting" text))))))
 
 (ert-deftest pi-coding-agent-test-visible-thinking-stays-expanded-on-end ()
   "Visible mode keeps the completed thinking block expanded."
@@ -1896,7 +1907,7 @@ and DISPLAY controls how completed thinking is rendered."
           (should (string-match-p "Answer first\\." text))
           (should (string-match-p "Final answer\\." text))
           (should (string-match-p "^> Need to double-check\\.$" text))
-          (should (string-match-p "read example\\.txt\n12 lines · TAB details"
+          (should (string-match-p "read example\\.txt\n12 lines"
                                   text))
           (should-not (string-match-p "L12" text)))))))
 
@@ -2019,7 +2030,7 @@ and DISPLAY controls how completed thinking is rendered."
           (let ((visible (buffer-substring-no-properties
                           (window-start win)
                           (window-end win t))))
-            (should (string-match-p "Thinking:" visible))
+            (should (string-match-p "Think · thinking line 001" visible))
             (should (pi-coding-agent-test--window-mostly-filled-p win))))))))
 
 (ert-deftest pi-coding-agent-test-chat-thinking-display-preserves-window-after-earlier-block ()
@@ -2239,7 +2250,7 @@ and DISPLAY controls how completed thinking is rendered."
       (should (< git-pos read-pos)))
     (should (string-match-p "On branch master" (buffer-string)))
     (should-not (string-match-p "import sys" (buffer-string)))
-    (should (string-match-p "read src/main\\.py\n1 lines · TAB details"
+    (should (string-match-p "read src/main\\.py\n1 lines"
                             (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tools-across-assistant-messages ()
@@ -2272,7 +2283,7 @@ and DISPLAY controls how completed thinking is rendered."
     (should (string-match-p "/home/user" (buffer-string)))
     (should (string-match-p "read foo\\.el" (buffer-string)))
     (should-not (string-match-p "(defun foo ())" (buffer-string)))
-    (should (string-match-p "read foo\\.el\n1 lines · TAB details"
+    (should (string-match-p "read foo\\.el\n1 lines"
                             (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tool-error ()
@@ -3560,9 +3571,7 @@ See https://github.com/dnouri/pi-coding-agent/issues/176."
       (search-forward "[image attachment]")
       (should (get-text-property (1- (point))
                                  'pi-coding-agent-output-image))
-      (goto-char (point-min))
-      (search-forward "TAB details")
-      (let ((button (button-at (1- (point)))))
+      (let ((button (next-button (point-min))))
         (let ((inhibit-read-only t))
           (button-put button 'pi-coding-agent-expanded t))
         (pi-coding-agent--toggle-tool-summary button))
@@ -4396,12 +4405,12 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
       (let ((text (buffer-string)))
         ;; Older write block is a cold summary.
         (should (string-match-p
-                 "write /tmp/old\\.py\n7 lines · 50 B · TAB details"
+                 "write /tmp/old\\.py\n7 lines · 50 B"
                  text))
         (should-not (string-match-p "\nline4\n" text))
         ;; Newer read block stays as an interactive summary.
         (should (string-match-p
-                 "read /tmp/new\\.py\n2 lines · TAB details"
+                 "read /tmp/new\\.py\n2 lines"
                  text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))
@@ -4443,11 +4452,11 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
       (pi-coding-agent--display-session-history messages (current-buffer))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 "write /tmp/old\\.py\n7 lines · 50 B · TAB details"
+                 "write /tmp/old\\.py\n7 lines · 50 B"
                  text))
         (should-not (string-match-p "\nline4\n" text))
         (should (string-match-p
-                 "read /tmp/new\\.py\n2 lines · TAB details"
+                 "read /tmp/new\\.py\n2 lines"
                  text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
                       'pi-coding-agent-tool-block)))
@@ -4477,7 +4486,7 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "def three():\n    return 3")))
       ;; First turn cooled, last two still hot
       (should (string-match-p
-               "read /tmp/one\\.py\n2 lines · TAB details"
+               "read /tmp/one\\.py\n2 lines"
                (buffer-string)))
       (should (= 2 (pi-coding-agent-test--count-overlays-with-prop
                     'pi-coding-agent-tool-block)))
@@ -4526,7 +4535,7 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
       (pi-coding-agent--handle-display-event '(:type "agent_end"))
       ;; Old turn cooled; both new tool summaries stay hot.
       (should (string-match-p
-               "read /tmp/old\\.py\n2 lines · TAB details"
+               "read /tmp/old\\.py\n2 lines"
                (buffer-string)))
       (should (string-match-p "read /tmp/new-one.py\n2 lines" (buffer-string)))
       (should (string-match-p "read /tmp/new-two.py\n2 lines" (buffer-string)))
@@ -4654,7 +4663,7 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "def ok():\n    return 0")))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 "\\$ false\nfailed · exit code 1 · TAB details"
+                 "\\$ false\nfailed · exit code 1"
                  text))
         (should (string-match-p "read /tmp/ok\\.py\n2 lines" text))
         (should (= 1 (pi-coding-agent-test--count-overlays-with-prop
@@ -4673,7 +4682,7 @@ With hot-tail-turn-count 1, only the most recent headed turn stays hot."
        '((:type "text" :text "wrote file")))
       (let ((text (buffer-string)))
         (should (string-match-p
-                 "write /tmp/readme\\.md\n7 lines · 40 B · TAB details"
+                 "write /tmp/readme\\.md\n7 lines · 40 B"
                  text))
         (should-not (string-match-p "print(42)" text))
         (should (= 0 (pi-coding-agent-test--count-overlays-with-prop
@@ -10756,10 +10765,7 @@ Edit diffs include unchanged context rows with a leading space marker."
          :toolName "write"
          :result (:content [(:type "text" :text "wrote file")])
          :isError nil))
-      (goto-char (point-min))
-      (search-forward "TAB details")
-      (pi-coding-agent--toggle-tool-output
-       (button-at (match-beginning 0)))
+      (pi-coding-agent--toggle-tool-output (next-button (point-min)))
       (goto-char (point-min))
       (search-forward "line2")
       (beginning-of-line)
@@ -11070,7 +11076,7 @@ Edit diffs include unchanged context rows with a leading space marker."
        (error nil)))
     (let ((content (buffer-substring-no-properties (point-min) (point-max))))
       (should (string-match-p "edit /tmp/edit\\.txt" content))
-      (should (string-match-p "\\+0 -0 · TAB details" content))
+      (should (string-match-p "\\+0 -0" content))
       (should-not (string-match-p "fallback" content)))))
 
 (ert-deftest pi-coding-agent-test-nul-tool-path-renders-safely ()
@@ -11618,9 +11624,7 @@ When full output is visible, line numbers must follow rendered blank lines."
          :toolName "write"
          :result (:content [(:type "text" :text "done")])
          :isError :json-false))
-      (goto-char (point-min))
-      (search-forward "TAB details")
-      (let ((btn (button-at (match-beginning 0))))
+      (let ((btn (next-button (point-min))))
         (should btn)
         (pi-coding-agent--toggle-tool-output btn))
       (goto-char (point-min))
@@ -11945,9 +11949,9 @@ Regression test: streaming output with no newlines should still be capped."
     (let ((content (buffer-substring-no-properties (point-min) (point-max))))
       (should (equal content
                      (concat "$ echo one\n"
-                             "1 lines (0 hidden)\nfinal alpha\nTAB details\n\n"
+                             "1 lines · final alpha\n\n"
                              "$ echo two\n"
-                             "1 lines (0 hidden)\nfinal bravo\nTAB details\n\n")))
+                             "1 lines · final bravo\n\n")))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo one" content)))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo two" content))))
     (should (= 0 (hash-table-count pi-coding-agent--live-tool-blocks)))))
@@ -12735,7 +12739,7 @@ Multiple deltas should replace the preview instead of appending forever."
     (let ((content (buffer-string)))
       (should (= 1 (pi-coding-agent-test--count-matches
                       "write /tmp/foo\\.py" content)))
-      (should (string-match-p "1 lines · 13 B · TAB details" content))
+      (should (string-match-p "1 lines · 13 B" content))
       (should-not (string-match-p "final content" content)))))
 
 (ert-deftest pi-coding-agent-test-toolcall-non-write-shows-header-only ()
@@ -13482,9 +13486,7 @@ are only present in tool_execution_start, not tool_execution_end."
            :toolName "read"
            :result (list :content '((:type "text" :text "def hello():\n    pass")))
            :isError nil))
-    (goto-char (point-min))
-    (search-forward "TAB details")
-    (pi-coding-agent--toggle-tool-output (button-at (match-beginning 0)))
+    (pi-coding-agent--toggle-tool-output (next-button (point-min)))
     ;; Should have python markdown code fence
     (should (string-match-p "```python" (buffer-string)))))
 
@@ -13670,9 +13672,7 @@ which is just a success message."
            :toolName "write"
            :result (list :content '((:type "text" :text "Successfully wrote 42 bytes")))
            :isError nil))
-    (goto-char (point-min))
-    (search-forward "TAB details")
-    (pi-coding-agent--toggle-tool-output (button-at (match-beginning 0)))
+    (pi-coding-agent--toggle-tool-output (next-button (point-min)))
     ;; Should have rust markdown code fence (from args content, not result)
     (should (string-match-p "```rust" (buffer-string)))
     ;; Should show the actual code, not the success message

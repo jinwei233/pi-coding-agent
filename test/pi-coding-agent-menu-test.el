@@ -927,7 +927,7 @@ BINDING-SPEC is (DIR CHAT-NAME INPUT-NAME PROC).  DIR is evaluated once."
               (should (string-match-p "Answer first\\." text))
               (should (string-match-p "> Need to double-check\\." text))
               (should (string-match-p "read foo\\.el" text))
-              (should (string-match-p "1 lines · TAB details" text))
+              (should (string-match-p "1 lines" text))
               (should-not (string-match-p "(defun foo ())" text)))
             (let ((detail (pi-coding-agent--open-tool-detail-buffer "tc1")))
               (unwind-protect

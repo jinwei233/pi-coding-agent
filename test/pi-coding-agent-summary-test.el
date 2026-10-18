@@ -41,7 +41,7 @@
               ,(concat (mapconcat (lambda (n) (format "old-%d" n))
                                   (number-sequence 1 20) "\n")
                        "\nTAIL_BASH")
-              nil "\nold-1\n" "hidden")))
+              nil "\nold-1\n" "21 lines · old-1")))
     (pcase-let ((`(,name ,args ,content ,details ,hidden ,summary) case))
       (pi-coding-agent-summary-test--with-history
           (pi-coding-agent-summary-test--messages
@@ -49,7 +49,8 @@
         (let ((text (buffer-substring-no-properties (point-min) (point-max))))
           (should (string-match-p summary text))
           (should-not (string-match-p hidden text))
-          (should (string-match-p "TAB" text)))))))
+          (should-not (string-match-p "TAB details" text))
+          (should-not (string-search "[details]" text)))))))
 
 (ert-deftest pi-coding-agent-test-tool-summary-fence-does-not-swallow-later-table ()
   "A fence-like line in a tool tail must not poison later Markdown."
@@ -263,19 +264,23 @@
         (should cold)
         (should-not (string-search secret (format "%S" metadata)))))))
 
-(ert-deftest pi-coding-agent-test-tool-errors-use-full-short-and-tail-long ()
-  "Short errors remain visible while long errors use a tail summary."
+(ert-deftest pi-coding-agent-test-tool-errors-collapse-to-one-line ()
+  "Short and long errors both collapse to one line of key error text."
   (pi-coding-agent-summary-test--with-history
       (pi-coding-agent-summary-test--messages
        "bash" '(:command "false") "short failure" nil t)
-    (should (string-match-p "short failure" (buffer-string))))
-  (let ((long-error (concat "HIDDEN_ERROR\n" (make-string 10000 ?x)
+    (should (string-match-p "failed · short failure" (buffer-string))))
+  (let ((long-error (concat "FIRST_ERROR line\n" (make-string 10000 ?x)
                             "\nvisible error tail")))
     (pi-coding-agent-summary-test--with-history
         (pi-coding-agent-summary-test--messages
          "bash" '(:command "false") long-error nil t)
-      (should-not (string-match-p "HIDDEN_ERROR" (buffer-string)))
-      (should (string-match-p "visible error tail" (buffer-string))))))
+      (let ((text (buffer-string)))
+        (should (string-match-p "failed · FIRST_ERROR line" text))
+        (should-not (string-match-p "visible error tail" text))
+        (should-not (string-match-p "hidden" text))
+        (should-not (string-match-p "TAB details" text))
+        (should (< (buffer-size) 2000))))))
 
 (ert-deftest pi-coding-agent-test-generic-summary-is-fixed-and-conservative ()
   "Generic summaries show bounded scalar fields and hide large fields."
