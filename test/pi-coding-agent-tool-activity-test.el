@@ -103,6 +103,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent-tool-activity-test--render-tool
      "c2" "edit" '(:path "/tmp/pi-tool-activity/a.el") "done"
      '(:diff "+ 1 new\n- 1 old"))
+    (pi-coding-agent--handle-display-event '(:type "agent_end"))
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
       (should (string-match-p "1 file" visible))
@@ -147,27 +148,37 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (should-not (string-match-p
                  "Tools" (pi-coding-agent-tool-activity-test--visible)))))
 
-(ert-deftest pi-coding-agent-test-tool-activity-running-updates-in-place ()
-  "Running and completed states rewrite one local row."
+(ert-deftest pi-coding-agent-test-tool-activity-live-folded-row-is-stable ()
+  "A folded live row stays unchanged until the agent turn settles."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent--display-user-message "run")
     (pi-coding-agent--handle-display-event
      '(:type "tool_execution_start" :toolCallId "c1"
        :toolName "bash" :args (:command "make test")))
-    (should (string-match-p
-             "running bash" (pi-coding-agent-tool-activity-test--visible)))
-    (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
-    (pi-coding-agent--handle-display-event
-     '(:type "tool_execution_update" :toolCallId "c1"
-       :partialResult (:content [(:type "text" :text "half")])))
-    (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
-    (pi-coding-agent--handle-display-event
-     '(:type "tool_execution_end" :toolCallId "c1" :toolName "bash"
-       :result (:content [(:type "text" :text "done")])
-       :isError nil))
-    (should-not (string-match-p
-                 "running" (pi-coding-agent-tool-activity-test--visible)))
-    (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))))
+    (let ((live-row (pi-coding-agent-tool-activity-test--visible)))
+      (should (string-match-p "Tools · working" live-row))
+      (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
+      (pi-coding-agent--handle-display-event
+       '(:type "tool_execution_update" :toolCallId "c1"
+         :partialResult (:content [(:type "text" :text "half")])))
+      (pi-coding-agent--handle-display-event
+       '(:type "tool_execution_end" :toolCallId "c1" :toolName "bash"
+         :result (:content [(:type "text" :text "done")])
+         :isError nil))
+      (pi-coding-agent--handle-display-event
+       '(:type "tool_execution_start" :toolCallId "c2"
+         :toolName "read" :args (:path "/tmp/pi-tool-activity/a.el")))
+      (pi-coding-agent--handle-display-event
+       '(:type "tool_execution_end" :toolCallId "c2" :toolName "read"
+         :result (:content [(:type "text" :text "contents")])
+         :isError nil))
+      (should (equal live-row
+                     (pi-coding-agent-tool-activity-test--visible))))
+    (pi-coding-agent--handle-display-event '(:type "agent_end"))
+    (let ((settled (pi-coding-agent-tool-activity-test--visible)))
+      (should-not (string-match-p "working" settled))
+      (should (string-match-p "1 file" settled))
+      (should (string-match-p "2 calls" settled)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-failure-has-priority ()
   "Failures remain visible in the folded group."

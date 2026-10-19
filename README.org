@@ -206,6 +206,11 @@ Markdown/outline behavior.  The old =hidden= value maps to =grouped= for one
 compatibility cycle; =summary= retains the previous header-plus-summary
 presentation.
 
+During a live agent turn, the folded row stays at =Tools · working= across
+consecutive tool start, update, and end events.  It changes to the final
+result-first summary once at agent end.  Expanding the row intentionally keeps
+the per-tool list live.
+
 Grouped history is rendered directly from lightweight per-turn records.  It
 does not materialize hidden tool headers, outputs, or overlays, and live
 updates rewrite only the current turn's activity region.

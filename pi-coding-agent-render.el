@@ -1132,6 +1132,7 @@ follow-up as a fresh prompt.")
   (let ((was-aborted pi-coding-agent--aborted))
     (let ((inhibit-read-only t))
       (pi-coding-agent--finalize-live-tool-blocks 'pi-coding-agent-tool-block-error)
+      (pi-coding-agent--activity-finalize-live-turn)
       (when pi-coding-agent--tool-args-cache
         (clrhash pi-coding-agent--tool-args-cache))
       ;; Abort stops Pi-owned work, but local follow-ups were never accepted
@@ -1832,7 +1833,7 @@ Updates buffer-local state and renders display updates."
          (puthash tool-call-id args pi-coding-agent--tool-args-cache))
        (if (pi-coding-agent--tool-activity-grouped-mode-p)
            (pi-coding-agent--activity-start-tool
-            tool-call-id (plist-get event :toolName) args)
+            tool-call-id (plist-get event :toolName) args t)
          ;; Reuse the keyed preview block when it already exists.
          (unless block
            (setq block (pi-coding-agent--display-tool-start
@@ -1872,7 +1873,8 @@ Updates buffer-local state and renders display updates."
             tool-call-id tool-name args
             (plist-get result :content)
             (plist-get result :details)
-            (plist-get event :isError))
+            (plist-get event :isError)
+            t)
          (pi-coding-agent--display-tool-end tool-name
                                             args
                                             (plist-get result :content)
@@ -2885,7 +2887,8 @@ streaming state changed."
             (pi-coding-agent--activity-start-tool
              (plist-get tool-call :id)
              (plist-get tool-call :name)
-             (plist-get tool-call :arguments))))
+             (plist-get tool-call :arguments)
+             t)))
       (pi-coding-agent--prune-stale-toolcall-previews tool-call-ids)
       (dolist (entry entries)
         (pi-coding-agent--reconcile-toolcall-preview-block
@@ -3244,6 +3247,7 @@ if none exists, render the result at point without a live overlay."
   start-marker
   end-marker
   expanded
+  live
   detail-tool-call-id
   tools
   calls
@@ -3296,6 +3300,7 @@ The former `hidden' value is a compatibility alias for `grouped'."
                (pi-coding-agent--make-activity-record
                 :turn-id turn-id
                 :expanded nil
+                :live nil
                 :detail-tool-call-id nil
                 :tools nil
                 :calls 0
@@ -3557,7 +3562,12 @@ canonical or transient pair storage; IS-ERROR records completion status."
                   (propertize "Tools"
                               'font-lock-face
                               'pi-coding-agent-activity-label)))
-         (parts (pi-coding-agent--activity-summary-parts record))
+         (parts
+          (if (pi-coding-agent--activity-record-live record)
+              (list (propertize "working"
+                                'font-lock-face
+                                'pi-coding-agent-activity-summary))
+            (pi-coding-agent--activity-summary-parts record)))
          (budget (pi-coding-agent--activity-line-budget))
          (result prefix))
     (dolist (part parts)
@@ -3702,22 +3712,46 @@ canonical or transient pair storage; IS-ERROR records completion status."
                   (pi-coding-agent--activity-insert-detail record tool)))))
           (set-marker end-marker (point)))))))
 
-(defun pi-coding-agent--activity-start-tool (tool-call-id tool-name args)
-  "Add or update grouped TOOL-CALL-ID with TOOL-NAME and ARGS."
+(defun pi-coding-agent--activity-record-rendered-p (record)
+  "Return non-nil when RECORD owns a live projection region."
+  (let ((start (pi-coding-agent--activity-record-start-marker record))
+        (end (pi-coding-agent--activity-record-end-marker record)))
+    (and (markerp start)
+         (marker-position start)
+         (markerp end)
+         (marker-position end))))
+
+(defun pi-coding-agent--activity-render-live-update (record)
+  "Render RECORD when its current live projection needs visible refresh.
+Folded live groups remain byte-for-byte stable after their first display.
+Expanded groups continue to refresh their per-tool rows."
+  (when (or (pi-coding-agent--activity-record-expanded record)
+            (not (pi-coding-agent--activity-record-rendered-p record)))
+    (pi-coding-agent--activity-render-record record)))
+
+(defun pi-coding-agent--activity-start-tool
+    (tool-call-id tool-name args &optional live)
+  "Add or update grouped TOOL-CALL-ID with TOOL-NAME and ARGS.
+When LIVE is non-nil, keep a folded projection stable until agent end."
   (when (pi-coding-agent--tool-activity-grouped-mode-p)
     (let* ((turn-id (pi-coding-agent--activity-current-turn))
            (record (pi-coding-agent--activity-record-for-turn turn-id t)))
+      (when live
+        (setf (pi-coding-agent--activity-record-live record) t))
       (pi-coding-agent--activity-put-tool
        record
        (pi-coding-agent--activity-running-tool-record
         tool-call-id tool-name args))
-      (pi-coding-agent--activity-render-record record)
+      (if live
+          (pi-coding-agent--activity-render-live-update record)
+        (pi-coding-agent--activity-render-record record))
       record)))
 
 (defun pi-coding-agent--activity-finish-tool
-    (tool-call-id tool-name args content details is-error)
+    (tool-call-id tool-name args content details is-error &optional live)
   "Complete TOOL-CALL-ID with TOOL-NAME, ARGS, CONTENT, and DETAILS.
-IS-ERROR non-nil records a failed completion."
+IS-ERROR non-nil records a failed completion.  When LIVE is non-nil,
+keep a folded projection stable until agent end."
   (let* ((record
           (or (pi-coding-agent--activity-record-for-tool tool-call-id)
               (pi-coding-agent--activity-record-for-turn
@@ -3725,9 +3759,24 @@ IS-ERROR non-nil records a failed completion."
          (tool
           (pi-coding-agent--activity-completed-tool-record
            tool-call-id tool-name args content details is-error)))
+    (when live
+      (setf (pi-coding-agent--activity-record-live record) t))
     (pi-coding-agent--activity-put-tool record tool)
-    (pi-coding-agent--activity-render-record record)
+    (if live
+        (pi-coding-agent--activity-render-live-update record)
+      (pi-coding-agent--activity-render-record record))
     record))
+
+(defun pi-coding-agent--activity-finalize-live-turn ()
+  "Finalize the current live activity group with one local rewrite."
+  (when (and (pi-coding-agent--tool-activity-grouped-mode-p)
+             pi-coding-agent--current-activity-turn)
+    (when-let* ((record
+                 (pi-coding-agent--activity-record-for-turn
+                  pi-coding-agent--current-activity-turn)))
+      (when (pi-coding-agent--activity-record-live record)
+        (setf (pi-coding-agent--activity-record-live record) nil)
+        (pi-coding-agent--activity-render-record record)))))
 
 (defun pi-coding-agent--activity-record-at-point ()
   "Return the grouped activity record at point."

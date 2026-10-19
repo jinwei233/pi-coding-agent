@@ -579,6 +579,7 @@ Each read, edit, and bash result carries a deterministic PAYLOAD-SIZE body."
         replay
         expand
         live-end
+        live-finalize
         metrics)
     (with-temp-buffer
       (pi-coding-agent-chat-mode)
@@ -610,6 +611,12 @@ Each read, edit, and bash result carries a deterministic PAYLOAD-SIZE body."
                  :toolName "bash"
                  :result (:content [(:type "text" :text "done")])
                  :isError nil))))
+      (garbage-collect)
+      (setq live-finalize
+            (benchmark-run
+              1
+              (pi-coding-agent--handle-display-event
+               '(:type "agent_end"))))
       (setq metrics
             (list :kind 'grouped-tool-activity
                   :turns turn-count
@@ -622,6 +629,8 @@ Each read, edit, and bash result carries a deterministic PAYLOAD-SIZE body."
                   :expand-gc-count (nth 1 expand)
                   :live-end-seconds (nth 0 live-end)
                   :live-end-gc-count (nth 1 live-end)
+                  :live-finalize-seconds (nth 0 live-finalize)
+                  :live-finalize-gc-count (nth 1 live-finalize)
                   :buffer-bytes (buffer-size)
                   :activity-records
                   (hash-table-count pi-coding-agent--activity-table)
