@@ -355,6 +355,46 @@ Cells with no inline syntax characters are returned as-is."
 
 ;;;; Cell Rendering
 
+(defun pi-coding-agent--wrap-visible-table-cell (text width)
+  "Wrap already-extracted visible TEXT to WIDTH without reparsing Markdown.
+Visible cells no longer contain active Markdown delimiters, so punctuation such
+as the opening bracket in `[ssoForwardProxy]' must remain attached to its
+token.  Text properties are preserved by substring-based splitting."
+  (if (or (<= width 0) (string-empty-p text))
+      (list (or text ""))
+    (let ((words (split-string text "[ \t]+" t))
+          lines
+          (current-line "")
+          (current-width 0))
+      (dolist (word words)
+        (let ((word-width (markdown-table-wrap-visible-width word)))
+          (cond
+           ((> word-width width)
+            (when (> current-width 0)
+              (push current-line lines)
+              (setq current-line ""
+                    current-width 0))
+            (dolist (fragment
+                     (markdown-table-wrap--force-break-plain word width))
+              (unless (string-empty-p current-line)
+                (push current-line lines))
+              (setq current-line fragment
+                    current-width
+                    (markdown-table-wrap-visible-width fragment))))
+           ((zerop current-width)
+            (setq current-line word
+                  current-width word-width))
+           ((<= (+ current-width 1 word-width) width)
+            (setq current-line (concat current-line " " word)
+                  current-width (+ current-width 1 word-width)))
+           (t
+            (push current-line lines)
+            (setq current-line word
+                  current-width word-width)))))
+      (when (> current-width 0)
+        (push current-line lines))
+      (or (nreverse lines) (list "")))))
+
 (defun pi-coding-agent--render-table-row-lines (cells col-widths aligns)
   "Render table CELLS into display lines using COL-WIDTHS and ALIGNS.
 When `pi-coding-agent-prettify-tables' is non-nil, emits Unicode
@@ -365,7 +405,8 @@ box-drawing verticals instead of markdown pipes."
                          (make-list (max 0 (- num-cols (length aligns))) nil)))
          (wrapped-cells
           (cl-mapcar (lambda (cell column-width)
-                       (markdown-table-wrap-cell (or cell "") column-width))
+                       (pi-coding-agent--wrap-visible-table-cell
+                        (or cell "") column-width))
                      padded col-widths))
          (max-height (apply #'max (mapcar #'length wrapped-cells)))
          (pretty pi-coding-agent-prettify-tables)
@@ -509,11 +550,12 @@ character are copied to the inserted selector."
    (append headers (apply #'append rows))))
 
 (defun pi-coding-agent--table-cell-min-content-width
-    (raw-cell display-cell header-p)
-  "Return atomic minimum width for RAW-CELL rendered as DISPLAY-CELL.
-Headers and inline code spans stay whole.  Other cells may wrap at whitespace,
-but never force-break an individual technical or otherwise unbroken token."
-  (if (or header-p (string-match-p "`" raw-cell))
+    (_raw-cell display-cell header-p)
+  "Return atomic minimum width for DISPLAY-CELL.
+Headers stay whole.  Data cells may wrap at whitespace, including whitespace
+inside inline code, but never force-break an individual technical or otherwise
+unbroken token."
+  (if header-p
       (markdown-table-wrap-visible-width display-cell)
     (let ((minimum 0))
       (dolist (token (split-string display-cell "[[:space:]]+" t))

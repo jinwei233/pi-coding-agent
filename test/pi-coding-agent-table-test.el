@@ -1380,6 +1380,18 @@ When fringes like `display-line-numbers-mode' consume columns,
    "| 1 | 1 | 2 | U+270F+FE0F | ArialUnicodeMS.ttf | 16px |\n")
   "A dense table whose technical tokens must never be force-broken.")
 
+(defconst pi-coding-agent-test--mixed-inline-log-table
+  (concat
+   "| 时间 | Pod | 版本 | 日志 |\n"
+   "|---|---|---|---|\n"
+   "| 2026-10-19T11:49:44.136Z | "
+   "`dp-251ffd178e-6cbf4c8f85-dk7zs`（canary） | v1(7) | "
+   "`[ssoForwardProxy] setup failed, stage=configuration` |\n"
+   "| 同上 logid 的 access 日志 | 同上 | | "
+   "`GET /oauth2/callback` → **http.status_code=200**，"
+   "host `vsop.byteintl.net`，state 里 `platform=bytedance` |\n")
+  "A realistic log table mixing prose and inline technical tokens.")
+
 (ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()
   "Only the explicit same-base allowlist receives one VS16."
   (dolist (base '(#x1f6e0 #x2699 #x26a0))
@@ -1471,6 +1483,39 @@ When fringes like `display-line-numbers-mode' consume columns,
     (dolist (token '("char-width" "string-width" "wrapper width"
                      "U+270F+FE0F" "ArialUnicodeMS.ttf" "16px"))
       (should (string-search token text)))))
+
+(ert-deftest pi-coding-agent-test-table-min-content-wraps-mixed-inline-code ()
+  "Inline code may wrap at spaces while each technical token stays whole."
+  (let* ((raw-lines
+          (split-string
+           (string-trim-right
+            pi-coding-agent-test--mixed-inline-log-table)
+           "\n"))
+         (projection
+          (pi-coding-agent--table-display-projection raw-lines 120))
+         (display-lines
+          (and projection
+               (apply #'append (plist-get projection :groups))))
+         (text (and display-lines
+                    (mapconcat #'identity display-lines "\n"))))
+    (should projection)
+    (should (> (length display-lines) (length raw-lines)))
+    (dolist (token
+             '("2026-10-19T11:49:44.136Z"
+               "dp-251ffd178e-6cbf4c8f85-dk7zs（canary）"
+               "[ssoForwardProxy]"
+               "stage=configuration"
+               "/oauth2/callback"
+               "http.status_code=200"
+               "vsop.byteintl.net"
+               "platform=bytedance"))
+      (should (string-search token text)))
+    (should-not (string-search "[ ssoForwardProxy]" text))
+    (should
+     (cl-every
+      (lambda (line)
+        (= (markdown-table-wrap-visible-width line) 120))
+      display-lines))))
 
 (ert-deftest pi-coding-agent-test-table-min-content-falls-back-when-too-narrow ()
   "Dense tables stay raw instead of force-breaking atomic tokens."
