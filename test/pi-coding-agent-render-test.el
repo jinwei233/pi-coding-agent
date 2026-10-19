@@ -719,6 +719,75 @@ Models may send \\n\\n before thinking content too."
         (should-not (string-match-p "Thinking hidden" text))
         (should-not (string-match-p "more line" text))))))
 
+(ert-deftest pi-coding-agent-test-thinking-equal-rerender-restores-face-ranges ()
+  "An equal completed-thinking rewrite restores each rendered face interval."
+  (let* ((pi-coding-agent-activity-icon-style 'emoji)
+         (rendered
+          (pi-coding-agent--completed-thinking-rendered-from-normalized
+           "preview" 7 'hidden))
+         (plain (substring-no-properties rendered)))
+    (with-temp-buffer
+      (insert plain)
+      (setq-local pi-coding-agent--thinking-start-marker
+                  (copy-marker (point-min) nil)
+                  pi-coding-agent--thinking-marker
+                  (copy-marker (point-max) t))
+      (should (pi-coding-agent--replace-thinking-region rendered))
+      (should (eq 'pi-coding-agent-activity-label
+                  (get-text-property (point-min) 'font-lock-face)))
+      (let ((separator (+ (point-min) (string-match " · " plain)))
+            (preview (+ (point-min) (string-match "preview" plain))))
+        (should (eq 'pi-coding-agent-activity-summary
+                    (get-text-property separator 'font-lock-face)))
+        (should (eq 'pi-coding-agent-activity-summary
+                    (get-text-property preview 'font-lock-face))))
+      (should (= 7
+                 (get-text-property
+                  (point-min) 'pi-coding-agent-thinking-block))))))
+
+(ert-deftest pi-coding-agent-test-thinking-marker-face-consistent-across-paths ()
+  "Live, completed, equal rerender, and replay keep the marker face."
+  (let ((pi-coding-agent-activity-icon-style 'emoji)
+        (pi-coding-agent-thinking-display 'hidden)
+        faces)
+    (dolist (rendered
+             (list
+              (pi-coding-agent--thinking-live-stub)
+              (pi-coding-agent--completed-thinking-rendered-from-normalized
+               "preview" 1 'hidden)))
+      (let ((marker (string-match "💭" rendered)))
+        (push (get-text-property marker 'font-lock-face rendered) faces)))
+    (with-temp-buffer
+      (let* ((rendered
+              (pi-coding-agent--completed-thinking-rendered-from-normalized
+               "preview" 2 'hidden))
+             (plain (substring-no-properties rendered)))
+        (insert plain)
+        (setq-local pi-coding-agent--thinking-start-marker
+                    (copy-marker (point-min) nil)
+                    pi-coding-agent--thinking-marker
+                    (copy-marker (point-max) t))
+        (pi-coding-agent--replace-thinking-region rendered)
+        (goto-char (point-min))
+        (search-forward "💭")
+        (push (get-text-property
+               (match-beginning 0) 'font-lock-face)
+              faces)))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (setq-local pi-coding-agent--thinking-display 'hidden)
+      (pi-coding-agent--display-session-history
+       [(:role "assistant"
+         :content [(:type "thinking" :thinking "preview")])]
+       (current-buffer))
+      (goto-char (point-min))
+      (search-forward "💭")
+      (push (get-text-property
+             (match-beginning 0) 'font-lock-face)
+            faces))
+    (should (equal faces
+                   (make-list 4 'pi-coding-agent-activity-label)))))
+
 (ert-deftest pi-coding-agent-test-live-thinking-tab-expands-and-streams ()
   "TAB on live thinking opts into realtime expanded content."
   (with-temp-buffer

@@ -84,6 +84,17 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (search-forward text)
   (goto-char (match-beginning 0)))
 
+(defun pi-coding-agent-tool-activity-test--goto-group ()
+  "Move point to the current activity group by structural metadata."
+  (goto-char (point-min))
+  (let ((position
+         (text-property-any
+          (point-min) (point-max)
+          'pi-coding-agent-activity-group t)))
+    (unless position
+      (ert-fail "No grouped activity row found"))
+    (goto-char position)))
+
 (defun pi-coding-agent-tool-activity-test--count (regexp)
   "Count visible matches of REGEXP."
   (let ((text (pi-coding-agent-tool-activity-test--visible))
@@ -205,13 +216,13 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent-tool-activity-test--render-history
      '(("bash" (:command "make test") "alpha")
        ("read" (:path "/tmp/pi-tool-activity/a.el") "beta")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent-toggle-tool-section)
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should (string-match-p "▾ Tools" visible))
       (should (string-match-p "\n    bash" visible))
       (should (string-match-p "\n    read" visible)))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent-toggle-tool-section)
     (should-not (string-match-p
                  "\n    bash" (pi-coding-agent-tool-activity-test--visible)))))
@@ -221,7 +232,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("bash" (:command "make test") "alpha\nbeta")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent-tool-activity-test--goto "    bash")
     (pi-coding-agent-toggle-tool-section)
@@ -254,7 +265,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("read" (:path "/tmp/pi-tool-activity/a.el" :offset 7) "line")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent--dispatch-button (point) nil t)
     (should (string-match-p
              "\n    read" (pi-coding-agent-tool-activity-test--visible)))
@@ -273,7 +284,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent--display-user-message "run")
     (pi-coding-agent-tool-activity-test--render-tool
      "c1" "bash" '(:command "one") "ok")
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent-tool-activity-test--render-tool
      "c2" "bash" '(:command "two") "ok")
@@ -316,7 +327,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
         (:path "/tmp/pi-tool-activity/a-very-long-directory/a.el")
         "done" (:diff "+ new\n- old") nil)
        ("bash" (:command "test") "boom" nil t)))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (should (<= (string-width
                  (buffer-substring-no-properties
                   (line-beginning-position) (line-end-position)))
@@ -334,7 +345,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
                  (lambda (&rest _) (setq overlays (1+ overlays)) nil)))
         (pi-coding-agent-tool-activity-test--render-tool
          "c1" "bash" '(:command "make test") "ok")
-        (pi-coding-agent-tool-activity-test--goto "Tools")
+        (pi-coding-agent-tool-activity-test--goto-group)
         (pi-coding-agent-toggle-tool-section))
       (should (= 0 headings))
       (should (= 0 overlays)))))
@@ -413,7 +424,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("bash" (:command "make test") "ok")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent--dispatch-button (point) nil t)
     (let (opened)
       (cl-letf (((symbol-function 'pi-coding-agent--open-tool-detail-buffer)
@@ -427,7 +438,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("read" (:path "lisp/a.el" :offset 7) "alpha\nbeta")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent-tool-activity-test--goto "    read")
     (pi-coding-agent-toggle-tool-section)
@@ -564,7 +575,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("bash" (:command "one") "ok")))
-    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-tool-activity-test--goto-group)
     (let ((group-button (button-at (point))))
       (should group-button)
       (should-not (button-get group-button 'face))
@@ -577,6 +588,128 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
       (should-not (button-get tool-button 'face))
       (should (eq 'pi-coding-agent-activity-tool-name
                   (get-text-property (+ (point) 4) 'font-lock-face))))))
+
+(ert-deftest pi-coding-agent-test-activity-icon-set-has-safe-width ()
+  "Every configured emoji is width two and needs no variation selector."
+  (let ((forbidden '("🛠" "⚠" "⚙")))
+    (dolist (entry pi-coding-agent--activity-icon-set)
+      (let ((marker (cdr entry)))
+        (should (= 2 (string-width marker)))
+        (should-not (string-match-p (string #xFE0F) marker))
+        (should-not (member marker forbidden))))))
+
+(ert-deftest pi-coding-agent-test-activity-type-marker-styles ()
+  "Activity type markers depend only on the explicit style."
+  (dolist (case '((emoji "🔧" "💭")
+                  (text "Tools" "Think")
+                  (none nil nil)))
+    (let ((pi-coding-agent-activity-icon-style (car case)))
+      (cl-letf (((symbol-function 'find-font)
+                 (lambda (&rest _) (ert-fail "font probing is forbidden")))
+                ((symbol-function 'display-graphic-p)
+                 (lambda (&rest _) (ert-fail "frame probing is forbidden"))))
+        (should (equal (nth 1 case)
+                       (pi-coding-agent--activity-type-marker 'tools)))
+        (should (equal (nth 2 case)
+                       (pi-coding-agent--activity-type-marker 'thinking)))))))
+
+(ert-deftest pi-coding-agent-test-activity-icon-style-row-shapes ()
+  "Completed and live group rows use the three exact marker shapes."
+  (let ((files (make-hash-table :test 'equal)))
+    (dotimes (index 6)
+      (puthash (format "file-%d" index) t files))
+    (let ((record
+           (pi-coding-agent--make-activity-record
+            :turn-id 0 :calls 6 :running nil :failed 0
+            :file-counts files :added 0 :removed 0
+            :test-passed 0 :test-failed 0)))
+      (dolist (case '((emoji "▸ 🔧 · 6 files" "◌ 🔧 · working")
+                      (text "▸ Tools · 6 files" "◌ Tools · working")
+                      (none "▸ 6 files" "◌ working")))
+        (let ((pi-coding-agent-activity-icon-style (car case)))
+          (should (string-prefix-p
+                   (nth 1 case)
+                   (substring-no-properties
+                    (pi-coding-agent--activity-group-text record))))
+          (setf (pi-coding-agent--activity-record-live record) t)
+          (should (equal
+                   (nth 2 case)
+                   (substring-no-properties
+                    (pi-coding-agent--activity-group-text record))))
+          (setf (pi-coding-agent--activity-record-live record) nil))))))
+
+(ert-deftest pi-coding-agent-test-activity-icon-style-alignment-and-budget ()
+  "All styles share a total row budget and a four-column tool indent."
+  (let ((files (make-hash-table :test 'equal)))
+    (puthash "a.el" t files)
+    (let ((record
+           (pi-coding-agent--make-activity-record
+            :turn-id 0 :calls 1 :running nil :failed 0
+            :file-counts files :added 0 :removed 0
+            :test-passed 0 :test-failed 0)))
+      (dolist (style '(emoji text none))
+        (let ((pi-coding-agent-activity-icon-style style))
+          (cl-letf (((symbol-function 'pi-coding-agent--activity-line-budget)
+                     (lambda () 16)))
+            (let ((row (pi-coding-agent--activity-group-text record)))
+              (should (<= (string-width row) 16))
+              (should (string-match-p "1 file" row))))))
+      (let* ((pi-coding-agent-activity-icon-style 'emoji)
+             (row (pi-coding-agent--activity-group-text record)))
+        (should (= 4 (string-width
+                      (substring row 0 (string-match " · " row))))))
+      (dolist (style '(emoji text none))
+        (let* ((pi-coding-agent-activity-icon-style style)
+               (line
+                (pi-coding-agent--activity-tool-line
+                 '(:status running :tool-name "bash" :target "test"))))
+          (should (equal "bash" (substring-no-properties line 4 8)))
+          (should (= 4 (string-width (substring line 0 4))))
+          (should (string-prefix-p "  ◌ "
+                                   (substring-no-properties line))))))))
+
+(ert-deftest pi-coding-agent-test-activity-icon-style-is-projection-only ()
+  "Changing style leaves existing text alone until an explicit rebuild."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (let ((pi-coding-agent-activity-icon-style 'text))
+      (pi-coding-agent-tool-activity-test--render-history
+       '(("bash" (:command "one") "ok")))
+      (let ((before (buffer-string)))
+        (setq pi-coding-agent-activity-icon-style 'emoji)
+        (should (equal before (buffer-string)))
+        (pi-coding-agent--display-session-history
+         pi-coding-agent--canonical-messages (current-buffer))
+        (should (string-match-p
+                 "🔧" (pi-coding-agent-tool-activity-test--visible)))))))
+
+(ert-deftest pi-coding-agent-test-activity-type-and-status-stay-separate ()
+  "Failure changes cue and text faces, not the type marker."
+  (let ((pi-coding-agent-activity-icon-style 'emoji)
+        (files (make-hash-table :test 'equal)))
+    (let* ((success
+            (pi-coding-agent--make-activity-record
+             :turn-id 0 :calls 1 :running nil :failed 0
+             :file-counts files :added 0 :removed 0
+             :test-passed 0 :test-failed 0))
+           (failure
+            (pi-coding-agent--make-activity-record
+             :turn-id 1 :calls 1 :running nil :failed 1
+             :file-counts files :added 0 :removed 0
+             :test-passed 0 :test-failed 0))
+           (success-row (pi-coding-agent--activity-group-text success))
+           (failure-row (pi-coding-agent--activity-group-text failure))
+           (tool-row
+            (pi-coding-agent--activity-tool-line
+             '(:status failed :tool-name "bash" :summary "boom"))))
+      (should (string-match-p "🔧" success-row))
+      (should (string-match-p "🔧" failure-row))
+      (should (string-match-p "1 failed" failure-row))
+      (should (eq 'pi-coding-agent-activity-label
+                  (get-text-property 0 'font-lock-face success-row)))
+      (should (eq 'pi-coding-agent-activity-failed
+                  (get-text-property 0 'font-lock-face failure-row)))
+      (should (eq 'pi-coding-agent-activity-failed
+                  (get-text-property 2 'font-lock-face tool-row))))))
 
 (provide 'pi-coding-agent-tool-activity-test)
 ;;; pi-coding-agent-tool-activity-test.el ends here

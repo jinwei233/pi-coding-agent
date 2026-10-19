@@ -584,7 +584,8 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
 (ert-deftest pi-coding-agent-gui-test-grouped-activity-narrow-themes ()
   "Grouped activity stays one line without button styling across themes."
   (let ((buffer (get-buffer-create "*pi-gui-grouped-activity*"))
-        (original-themes custom-enabled-themes))
+        (original-themes custom-enabled-themes)
+        (pi-coding-agent-activity-icon-style 'emoji))
     (unwind-protect
         (save-window-excursion
           (switch-to-buffer buffer)
@@ -609,16 +610,43 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
             (pi-coding-agent--update-theme-derived-faces)
             (font-lock-ensure)
             (redisplay t)
-            (goto-char (point-min))
-            (search-forward "Tools")
-            (let ((group-pos (match-beginning 0))
+            (let ((group-pos
+                   (text-property-any
+                    (point-min) (point-max)
+                    'pi-coding-agent-activity-group t)))
+              (should group-pos)
+              (goto-char group-pos)
+              (let* ((line-start (line-beginning-position))
+                     (line-end (line-end-position))
                   (line
                    (buffer-substring-no-properties
-                    (line-beginning-position) (line-end-position))))
-              (should (<= (string-width line)
-                          pi-coding-agent--single-line-preview-columns))
-              (goto-char group-pos)
-              (should-not (memq 'button (face-at-point nil t))))))
+                     line-start line-end))
+                     (separator
+                      (save-excursion
+                        (search-forward " · " line-end t)
+                        (match-beginning 0))))
+                (should separator)
+                (should (= 4
+                           (string-width
+                            (buffer-substring-no-properties
+                             line-start separator))))
+                (should (<= (string-width line)
+                            pi-coding-agent--single-line-preview-columns))
+                (should-not (memq 'button (face-at-point nil t)))
+                (should
+                 (memq
+                  (face-attribute
+                   'pi-coding-agent-activity-label :underline nil t)
+                  '(nil unspecified)))
+                (should
+                 (memq
+                  (face-attribute
+                   'pi-coding-agent-activity-summary :underline nil t)
+                  '(nil unspecified)))
+                (should
+                 (eq 'pi-coding-agent-activity-summary
+                     (get-text-property
+                      (+ separator 3) 'font-lock-face)))))))
       (mapc #'disable-theme custom-enabled-themes)
       (mapc (lambda (theme) (load-theme theme t)) original-themes)
       (when (buffer-live-p buffer)

@@ -206,7 +206,22 @@ Markdown/outline behavior.  The old =hidden= value maps to =grouped= for one
 compatibility cycle; =summary= retains the previous header-plus-summary
 presentation.
 
-During a live agent turn, the folded row stays at =Tools · working= across
+The separate =pi-coding-agent-activity-icon-style= option controls only the
+type marker.  Its default =text= keeps =Tools= and =Think=; =emoji= uses
+the fixed-width markers =🔧= and =💭=; =none= omits the marker and its
+separator.  For example, the same completed row starts with =▸ 🔧 ·=,
+=▸ Tools ·=, or just =▸=.  The emoji set contains only characters whose
+=string-width= is 2 and never uses VS16 sequences.  Terminals or systems
+without a suitable emoji font should explicitly select =text=; the package
+does not probe fonts, frames, or themes to change the configured style.
+
+Changing the style affects later projections, an explicit transcript rebuild,
+and new chats.  It does not scan and rewrite existing history.  Setting the
+option back to =text= restores the previous text shape.  Type labels and
+expanded tool names use a neutral shadow face in all three styles; this face
+adjustment is independent of the marker choice.
+
+During a live agent turn, the folded row stays at =◌ Tools · working= across
 consecutive tool start, update, and end events.  It changes to the final
 result-first summary once at agent end.  Expanding the row intentionally keeps
 the per-tool list live.
@@ -520,6 +535,11 @@ Less common tuning knobs:
 ;; Group successful tool activity by user turn:
 ;; (setopt pi-coding-agent-tool-activity-display 'grouped)
 
+;; Choose text labels (default), fixed-width emoji markers, or no type marker.
+;; Existing rows change only after a transcript rebuild.  Use `text' in a TTY
+;; or when no suitable emoji font is configured.
+;; (setopt pi-coding-agent-activity-icon-style 'emoji)
+
 ;; `pi-coding-agent-thinking-hidden-preview' is obsolete: collapsed thinking
 ;; always previews its first line, so setting it no longer changes anything.
 #+end_src
@@ -614,7 +634,9 @@ it.  Press =TAB= inside completed thinking to expand that block, and
 =TAB= again to collapse it back to the preview line.  The former
 =pi-coding-agent-thinking-hidden-preview= toggle is obsolete and
 ignored; choose =pi-coding-agent-thinking-display= instead when you want
-completed thinking shown expanded.
+completed thinking shown expanded.  The configured activity icon style also
+applies here: =emoji= renders =▸ 💭 · <first line>= and =none= renders
+=▸ <first line>=.
 
 ** Markdown tables 🧮
 

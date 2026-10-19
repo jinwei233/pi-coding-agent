@@ -434,6 +434,25 @@ single tool call helper."
     (should (equal "▸ Think · keep previewing"
                    (pi-coding-agent--thinking-hidden-stub "keep previewing")))))
 
+(ert-deftest pi-coding-agent-test-transcript-thinking-icon-style-shapes ()
+  "Thinking preview, empty, and live rows obey all icon styles."
+  (dolist (case '((emoji "▸ 💭 · preview" "▸ 💭" "◌ 💭 · working")
+                  (text "▸ Think · preview" "▸ Think" "◌ Think · working")
+                  (none "▸ preview" "▸" "◌ working")))
+    (let ((pi-coding-agent-activity-icon-style (car case)))
+      (should (equal (nth 1 case)
+                     (substring-no-properties
+                      (pi-coding-agent--thinking-hidden-stub "preview"))))
+      (should (equal (nth 2 case)
+                     (substring-no-properties
+                      (pi-coding-agent--thinking-hidden-stub ""))))
+      (should (equal (nth 3 case)
+                     (substring-no-properties
+                      (pi-coding-agent--thinking-live-stub))))
+      (dolist (text (list (nth 1 case) (nth 2 case) (nth 3 case)))
+        (should-not (string-match-p "  " text))
+        (should-not (string-suffix-p " ·" text))))))
+
 ;;;; 1.11 Whole-line summary button
 
 (ert-deftest pi-coding-agent-test-transcript-summary-line-is-a-button ()

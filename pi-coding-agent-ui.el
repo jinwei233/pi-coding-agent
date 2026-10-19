@@ -371,6 +371,40 @@ reloads, or whole-chat display-mode changes."
                  (const :tag "Hidden" hidden))
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-activity-icon-style 'text
+  "Type-marker style for tool activity and one-line thinking rows.
+The value is selected only from this explicit option:
+
+- `text' uses the stable `Tools' and `Think' labels.
+- `emoji' uses fixed-width type markers.
+- `none' omits the type marker.
+
+Changing this option affects later projections, an explicit transcript
+rebuild, and new chat buffers.  It does not scan or immediately rewrite
+already rendered history.  Set it back to `text' to restore the prior text
+shape.  Terminal sessions or systems without a suitable emoji font should
+also select `text' explicitly; no font or frame-based fallback is performed."
+  :type '(choice (const :tag "Text labels" text)
+                 (const :tag "Emoji markers" emoji)
+                 (const :tag "No type marker" none))
+  :group 'pi-coding-agent)
+
+(defconst pi-coding-agent--activity-icon-set
+  '((tools . "🔧")
+    (thinking . "💭"))
+  "Fixed-width emoji markers used by activity type.")
+
+(defun pi-coding-agent--activity-type-marker (type)
+  "Return the configured activity marker for TYPE, or nil.
+TYPE is `tools' or `thinking'.  Marker selection depends only on
+`pi-coding-agent-activity-icon-style'."
+  (pcase pi-coding-agent-activity-icon-style
+    ('emoji (alist-get type pi-coding-agent--activity-icon-set))
+    ('text (pcase type
+             ('tools "Tools")
+             ('thinking "Think")))
+    (_ nil)))
+
 (defcustom pi-coding-agent-tool-activity-display 'summary
   "How completed tool activity appears in the chat transcript.
 `summary' keeps the established presentation: the tool header followed by
@@ -569,12 +603,12 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   :group 'pi-coding-agent)
 
 (defface pi-coding-agent-activity-label
-  '((t :inherit font-lock-keyword-face :weight semi-bold))
+  '((t :inherit shadow :weight semi-bold))
   "Face for activity disclosure cues and type labels."
   :group 'pi-coding-agent)
 
 (defface pi-coding-agent-activity-tool-name
-  '((t :inherit default :weight semi-bold))
+  '((t :inherit shadow :weight semi-bold))
   "Face for tool names inside an expanded activity group."
   :group 'pi-coding-agent)
 

@@ -726,26 +726,60 @@ at most one empty paragraph separator while preserving indentation."
 (defconst pi-coding-agent--activity-live-cue "◌"
   "Single-column cue used for live folded activity rows.")
 
+(defconst pi-coding-agent--activity-tool-indent-columns 4
+  "Display columns before a tool name in an expanded activity group.")
+
+(defun pi-coding-agent--activity-row-text
+    (cue type content &optional cue-face)
+  "Return an activity row from CUE, TYPE marker, and optional CONTENT.
+TYPE is passed to `pi-coding-agent--activity-type-marker'.  When a marker is
+present, join it to CONTENT with ` · '.  Without a marker, join CUE directly
+to CONTENT.  Empty content never leaves trailing whitespace or a separator.
+CUE-FACE defaults to `pi-coding-agent-activity-label'."
+  (let* ((marker (pi-coding-agent--activity-type-marker type))
+         (cue-text
+          (propertize cue
+                      'font-lock-face
+                      (or cue-face 'pi-coding-agent-activity-label)))
+         (marker-text
+          (and marker
+               (propertize marker
+                           'font-lock-face
+                           'pi-coding-agent-activity-label))))
+    (concat
+     cue-text
+     (when marker-text (concat " " marker-text))
+     (when (and content (not (string-empty-p content)))
+       (if marker-text
+           (concat
+            (propertize " · "
+                        'font-lock-face
+                        'pi-coding-agent-activity-summary)
+            content)
+         (concat " " content))))))
+
 (defun pi-coding-agent--thinking-live-stub ()
   "Return the stable folded live-thinking stub."
-  (concat (propertize (concat pi-coding-agent--activity-live-cue " Think")
-                      'face 'pi-coding-agent-activity-label)
-          " · "
-          (propertize "working" 'face 'pi-coding-agent-activity-running)))
+  (pi-coding-agent--activity-row-text
+   pi-coding-agent--activity-live-cue
+   'thinking
+   (propertize "working"
+               'font-lock-face
+               'pi-coding-agent-activity-running)
+   'pi-coding-agent-activity-running))
 
 (defun pi-coding-agent--thinking-hidden-stub (normalized)
   "Return the collapsed completed-thinking stub for NORMALIZED.
-The stub is always a single `▸ Think · <preview>' line.  The preview comes
-from the first non-empty physical line and is truncated to the shared
-display-column budget, so single-line thinking previews too."
+The preview comes from the first non-empty physical line and is truncated to
+the shared display-column budget, so single-line thinking previews too."
   (let* ((line (pi-coding-agent--first-nonempty-line normalized))
-         (prefix (propertize "▸ Think"
-                            'face 'pi-coding-agent-activity-label))
-         (text (if line
-                   (concat prefix " · "
-                           (propertize
-                            line 'face 'pi-coding-agent-activity-summary))
-                 prefix)))
+         (content
+          (and line
+               (propertize line
+                           'font-lock-face
+                           'pi-coding-agent-activity-summary)))
+         (text (pi-coding-agent--activity-row-text
+                "▸" 'thinking content)))
     (pi-coding-agent--single-line-preview text)))
 
 (defun pi-coding-agent--propertize-live-thinking (rendered display)
@@ -770,8 +804,8 @@ is non-nil, render the raw thinking collected so far as a blockquote."
        (let ((normalized
               (pi-coding-agent--thinking-normalize-text
                (pi-coding-agent--thinking-stream-raw-content))))
-         (concat (propertize
-                  "▾ Think" 'face 'pi-coding-agent-activity-label)
+         (concat (pi-coding-agent--activity-row-text
+                  "▾" 'thinking nil 'pi-coding-agent-activity-running)
                  "\n"
                  (if (string-empty-p normalized)
                      "> "
@@ -809,6 +843,32 @@ records whether it is currently shown as `visible' or `hidden'."
        pi-coding-agent-thinking-normalized ,normalized
        pi-coding-agent-thinking-block-display ,display
        help-echo "TAB: toggle completed thinking"))))
+
+(defun pi-coding-agent--apply-rendered-face-properties (rendered start end)
+  "Copy RENDERED face intervals onto the equal text in START..END.
+Only `face' and `font-lock-face' are copied; completed-thinking metadata is
+owned by `pi-coding-agent--apply-completed-thinking-properties'."
+  (when (and (= (length rendered) (- end start))
+             (< start end))
+    (remove-text-properties start end '(face nil font-lock-face nil))
+    (let ((source 0)
+          (limit (length rendered)))
+      (while (< source limit)
+        (let* ((next (next-property-change source rendered limit))
+               (face (get-text-property source 'face rendered))
+               (font-lock-face
+                (get-text-property source 'font-lock-face rendered))
+               properties)
+          (when face
+            (setq properties (list 'face face)))
+          (when font-lock-face
+            (setq properties
+                  (append properties
+                          (list 'font-lock-face font-lock-face))))
+          (when properties
+            (add-text-properties
+             (+ start source) (+ start next) properties))
+          (setq source next))))))
 
 (defun pi-coding-agent--thinking-block-probe-pos (pos)
   "Return a position inside the completed-thinking block at POS, or nil.
@@ -921,9 +981,12 @@ non-empty."
       (when (<= start end)
         (let ((existing (buffer-substring-no-properties start end)))
           (if (equal existing plain-text)
-              (when order
-                (pi-coding-agent--apply-completed-thinking-properties
-                 start end order normalized display))
+              (progn
+                (when order
+                  (pi-coding-agent--apply-completed-thinking-properties
+                   start end order normalized display))
+                (pi-coding-agent--apply-rendered-face-properties
+                 text start end))
             (goto-char start)
             (delete-region start end)
             (insert text)
@@ -3671,14 +3734,14 @@ canonical or transient pair storage; IS-ERROR records completion status."
                ((pi-coding-agent--activity-record-live record)
                 pi-coding-agent--activity-live-cue)
                (t "▸")))
-         (prefix (concat
-                  (propertize cue
-                              'font-lock-face
-                              'pi-coding-agent-activity-label)
-                  " "
-                  (propertize "Tools"
-                              'font-lock-face
-                              'pi-coding-agent-activity-label)))
+         (cue-face
+          (cond
+           ((pi-coding-agent--activity-record-live record)
+            'pi-coding-agent-activity-running)
+           ((or (> (pi-coding-agent--activity-record-failed record) 0)
+                (> (pi-coding-agent--activity-record-test-failed record) 0))
+            'pi-coding-agent-activity-failed)
+           (t 'pi-coding-agent-activity-label)))
          (parts
           (if (pi-coding-agent--activity-record-live record)
               (list (propertize "working"
@@ -3686,20 +3749,56 @@ canonical or transient pair storage; IS-ERROR records completion status."
                                 'pi-coding-agent-activity-running))
             (pi-coding-agent--activity-summary-parts record)))
          (budget (pi-coding-agent--activity-line-budget))
-         (result prefix))
+         (result (pi-coding-agent--activity-row-text
+                  cue 'tools nil cue-face))
+         content)
     (catch 'full
       (dolist (part parts)
-        (let ((candidate (concat result " · " part)))
+        (let* ((candidate-content
+                (if content
+                    (concat
+                     content
+                     (propertize " · "
+                                 'font-lock-face
+                                 'pi-coding-agent-activity-summary)
+                     part)
+                  part))
+               (candidate
+                (pi-coding-agent--activity-row-text
+                 cue 'tools candidate-content cue-face)))
           (if (<= (string-width candidate) budget)
-              (setq result candidate)
+              (setq content candidate-content
+                    result candidate)
             (throw 'full nil)))))
     (truncate-string-to-width result budget nil nil "…")))
+
+(defun pi-coding-agent--activity-tool-prefix (cue cue-face)
+  "Return the fixed-width tool-row prefix for CUE using CUE-FACE."
+  (let* ((cue-text
+          (and cue (propertize cue 'font-lock-face cue-face)))
+         (prefix
+          (if cue-text
+              (concat
+               (make-string
+                (max 0
+                     (- pi-coding-agent--activity-tool-indent-columns
+                        (string-width cue-text)
+                        1))
+                ?\s)
+               cue-text
+               " ")
+            (make-string pi-coding-agent--activity-tool-indent-columns ?\s))))
+    (unless (= (string-width prefix)
+               pi-coding-agent--activity-tool-indent-columns)
+      (error "Activity tool prefix must occupy %d display columns"
+             pi-coding-agent--activity-tool-indent-columns))
+    prefix))
 
 (defun pi-coding-agent--activity-tool-line (tool)
   "Return the one-line display text for lightweight TOOL."
   (let* ((status (plist-get tool :status))
          (cue (pcase status
-                ('running "›")
+                ('running pi-coding-agent--activity-live-cue)
                 ('failed "!")
                 (_ nil)))
          (name (or (plist-get tool :tool-name) "tool"))
@@ -3709,17 +3808,11 @@ canonical or transient pair storage; IS-ERROR records completion status."
                    target))
          (summary (plist-get tool :summary))
          (text
-          (concat (if cue
-                      (concat
-                       "  "
-                       (propertize
-                        cue
-                        'font-lock-face
-                        (if (eq status 'failed)
-                            'pi-coding-agent-activity-failed
-                          'pi-coding-agent-activity-running))
-                       " ")
-                    "    ")
+          (concat (pi-coding-agent--activity-tool-prefix
+                   cue
+                   (if (eq status 'failed)
+                       'pi-coding-agent-activity-failed
+                     'pi-coding-agent-activity-running))
                   (propertize name
                               'font-lock-face
                               'pi-coding-agent-activity-tool-name)
@@ -3737,7 +3830,8 @@ canonical or transient pair storage; IS-ERROR records completion status."
                                               'pi-coding-agent-activity-failed
                                             'pi-coding-agent-activity-summary)))
                     ""))))
-    (pi-coding-agent--single-line-preview text)))
+    (truncate-string-to-width
+     text (pi-coding-agent--activity-line-budget) nil nil "…")))
 
 (defun pi-coding-agent--activity-propertize-region
     (start end turn-id &optional tool-call-id kind)
@@ -7682,8 +7776,8 @@ Returns nil when NORMALIZED has no visible completed-thinking content."
       (pi-coding-agent--propertize-completed-thinking
        (pcase display
          ('hidden (pi-coding-agent--thinking-hidden-stub normalized))
-         (_ (concat (propertize
-                     "▾ Think" 'face 'pi-coding-agent-activity-label)
+         (_ (concat (pi-coding-agent--activity-row-text
+                     "▾" 'thinking nil)
                     "\n"
                     (pi-coding-agent--thinking-blockquote-text normalized))))
        (or block-order (pi-coding-agent--next-thinking-block-order))
