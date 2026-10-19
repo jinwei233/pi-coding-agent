@@ -1392,6 +1392,17 @@ When fringes like `display-line-numbers-mode' consume columns,
    "host `vsop.byteintl.net`，state 里 `platform=bytedance` |\n")
   "A realistic log table mixing prose and inline technical tokens.")
 
+(defconst pi-coding-agent-test--narrow-comparison-table
+  (concat
+   "| | 旧 | 新 |\n"
+   "|---|---|---|\n"
+   "| 配置/ZTI 错误 | `stage=configuration` / `stage=zti` | 不变 |\n"
+   "| 装饰期任何 TypeError | **`stage=configuration`**（误导） | "
+   "`stage=unexpected error=TypeError` |\n"
+   "| 日志格式 | `[ssoForwardProxy] setup failed, stage=%s` | "
+   "`[ssoForwardProxy] setup failed, stage=%s error=%s` |\n")
+  "A three-column comparison table that needs a stacked narrow layout.")
+
 (ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()
   "Only the explicit same-base allowlist receives one VS16."
   (dolist (base '(#x1f6e0 #x2699 #x26a0))
@@ -1515,6 +1526,40 @@ When fringes like `display-line-numbers-mode' consume columns,
      (cl-every
       (lambda (line)
         (= (markdown-table-wrap-visible-width line) 120))
+      display-lines))))
+
+(ert-deftest pi-coding-agent-test-table-min-content-stacks-narrow-comparison ()
+  "A narrow comparison stays structured without splitting technical tokens."
+  (let* ((raw-lines
+          (split-string
+           (string-trim-right
+            pi-coding-agent-test--narrow-comparison-table)
+           "\n"))
+         (projection
+          (pi-coding-agent--table-display-projection raw-lines 55))
+         (display-lines
+          (and projection
+               (apply #'append (plist-get projection :groups))))
+         (text (and display-lines
+                    (mapconcat #'identity display-lines "\n"))))
+    (should (eq (plist-get projection :layout) 'stacked))
+    (should (= (length (plist-get projection :groups))
+               (length raw-lines)))
+    (dolist (token
+             '("配置/ZTI 错误"
+               "stage=configuration"
+               "stage=zti"
+               "stage=unexpected"
+               "error=TypeError"
+               "[ssoForwardProxy]"
+               "stage=%s"
+               "error=%s"))
+      (should (string-search token text)))
+    (should-not (string-search "[ ssoForwardProxy]" text))
+    (should
+     (cl-every
+      (lambda (line)
+        (= (markdown-table-wrap-visible-width line) 55))
       display-lines))))
 
 (ert-deftest pi-coding-agent-test-table-min-content-falls-back-when-too-narrow ()

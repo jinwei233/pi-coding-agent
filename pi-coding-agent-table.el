@@ -636,6 +636,93 @@ Return nil when CONTENT-WIDTH cannot hold all atomic minima and grid borders."
         (when (zerop deficits)
           (append widths nil))))))
 
+(defun pi-coding-agent--stacked-table-rule (width position)
+  "Return a WIDTH-column stacked-table rule at POSITION."
+  (concat (pcase position ('top "┌") ('bottom "└") (_ "├"))
+          (make-string (max 0 (- width 2)) ?─)
+          (pcase position ('top "┐") ('bottom "┘") (_ "┤"))))
+
+(defun pi-coding-agent--stacked-table-content-line (text inner-width)
+  "Frame TEXT in a stacked table with INNER-WIDTH content columns."
+  (let ((padding
+         (max 0 (- inner-width
+                   (markdown-table-wrap-visible-width text)))))
+    (concat "│ " text (make-string padding ?\s) " │")))
+
+(defun pi-coding-agent--stacked-table-groups
+    (headers rows width num-cols minima)
+  "Return narrow responsive display groups, or nil when unsafe.
+This layout is limited to two through four columns.  Each raw data row becomes
+a framed row title plus labeled field lines, preserving the raw-line mapping."
+  (let ((inner-width (- width 4)))
+    (when (and pi-coding-agent-prettify-tables
+               (<= 2 num-cols 4)
+               (>= inner-width 16)
+               (cl-loop for minimum across minima
+                        always (<= minimum inner-width)))
+      (let* ((padded-headers
+              (append headers
+                      (make-list (max 0 (- num-cols (length headers))) "")))
+             (title-column-p
+              (string-empty-p (or (car padded-headers) "")))
+             (legend
+              (mapconcat
+               #'identity
+               (seq-filter
+                (lambda (header) (not (string-empty-p header)))
+                padded-headers)
+               " / "))
+             (legend-lines
+              (pi-coding-agent--wrap-visible-table-cell legend inner-width))
+             (header-group
+              (cons
+               (pi-coding-agent--stacked-table-rule width 'top)
+               (mapcar
+                (lambda (line)
+                  (pi-coding-agent--stacked-table-content-line
+                   line inner-width))
+                legend-lines)))
+             (separator-group
+              (list (pi-coding-agent--stacked-table-rule width 'middle)))
+             (last-index (1- (length rows)))
+             (data-groups
+              (cl-loop
+               for row in rows
+               for row-index from 0
+               collect
+               (let ((cells
+                      (append row
+                              (make-list
+                               (max 0 (- num-cols (length row))) "")))
+                     lines)
+                 (dotimes (column num-cols)
+                   (let ((header (nth column padded-headers))
+                         (cell (nth column cells)))
+                     (when (or (not (string-empty-p cell))
+                               (not (string-empty-p header)))
+                       (let ((entry
+                              (if (and title-column-p (zerop column))
+                                  cell
+                                (concat header
+                                        (if (string-empty-p cell) ":" ": ")
+                                        cell))))
+                         (setq lines
+                               (append
+                                lines
+                                (mapcar
+                                 (lambda (line)
+                                   (pi-coding-agent--stacked-table-content-line
+                                    line inner-width))
+                                 (pi-coding-agent--wrap-visible-table-cell
+                                  entry inner-width))))))))
+                 (append
+                  lines
+                  (list
+                   (pi-coding-agent--stacked-table-rule
+                    width
+                    (if (= row-index last-index) 'bottom 'middle))))))))
+        (append (list header-group separator-group) data-groups)))))
+
 (defun pi-coding-agent--table-display-projection (raw-lines width)
   "Return the display projection plist for RAW-LINES at WIDTH.
 The plist contains `:groups', `:normalized-p', and `:ascii-cells-p'.  Nil means
@@ -765,27 +852,29 @@ the table cannot preserve its atomic min-content widths and must stay raw."
                                       group
                                       (when (= i last-index) (list bottom)))))
                  row-groups))))
-        (when col-widths
-          (list
-           :groups
-           (if no-prefix
-               (append (list header-group)
-                       (list sep-group)
-                       data-groups)
-             (append
-              (list (mapcar (lambda (line) (concat (car prefixes) line))
-                            header-group))
-              (list (mapcar (lambda (line) (concat (nth 1 prefixes) line))
-                            sep-group))
-              (cl-mapcar (lambda (prefix row-lines)
-                           (mapcar (lambda (line) (concat prefix line))
-                                   row-lines))
-                         (nthcdr 2 prefixes)
-                         data-groups)))
-           :normalized-p normalized-p
-           :ascii-cells-p
-           (pi-coding-agent--table-ascii-cells-p
-            display-headers display-rows)))))))
+        (let* ((layout (if col-widths 'grid 'stacked))
+               (groups
+                (if col-widths
+                    (append (list header-group)
+                            (list sep-group)
+                            data-groups)
+                  (pi-coding-agent--stacked-table-groups
+                   display-headers display-rows
+                   content-width num-cols minima))))
+          (when groups
+            (list
+             :groups
+             (if no-prefix
+                 groups
+               (cl-mapcar
+                (lambda (prefix group)
+                  (mapcar (lambda (line) (concat prefix line)) group))
+                prefixes groups))
+             :layout layout
+             :normalized-p normalized-p
+             :ascii-cells-p
+             (pi-coding-agent--table-ascii-cells-p
+              display-headers display-rows))))))))
 
 (defun pi-coding-agent--table-display-groups (raw-lines width)
   "Return prefix-aware display groups for RAW-LINES at WIDTH.
