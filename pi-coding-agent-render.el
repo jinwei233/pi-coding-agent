@@ -186,6 +186,7 @@ Nil means use `pi-coding-agent-tool-activity-display'.")
     pi-coding-agent--thinking-raw-chunks
     pi-coding-agent--thinking-pending-chars
     pi-coding-agent--thinking-stream-started
+    pi-coding-agent--thinking-live-expanded
     pi-coding-agent--line-parse-state
     pi-coding-agent--markdown-fence-state
     pi-coding-agent--markdown-line-buffer
@@ -720,6 +721,16 @@ at most one empty paragraph separator while preserving indentation."
       ""
     (concat "> " (replace-regexp-in-string "\n" "\n> " text))))
 
+(defconst pi-coding-agent--activity-live-cue "◌"
+  "Single-column cue used for live folded activity rows.")
+
+(defun pi-coding-agent--thinking-live-stub ()
+  "Return the stable folded live-thinking stub."
+  (concat (propertize (concat pi-coding-agent--activity-live-cue " Think")
+                      'face 'pi-coding-agent-activity-label)
+          " · "
+          (propertize "working" 'face 'pi-coding-agent-activity-running)))
+
 (defun pi-coding-agent--thinking-hidden-stub (normalized)
   "Return the collapsed completed-thinking stub for NORMALIZED.
 The stub is always a single `▸ Think · <preview>' line.  The preview comes
@@ -734,6 +745,37 @@ display-column budget, so single-line thinking previews too."
                             line 'face 'pi-coding-agent-activity-summary))
                  prefix)))
     (pi-coding-agent--single-line-preview text)))
+
+(defun pi-coding-agent--propertize-live-thinking (rendered display)
+  "Return RENDERED tagged as the current live thinking block.
+DISPLAY is either `hidden' for the stable folded stub or `visible' for the
+user-expanded live block."
+  (let ((text (copy-sequence rendered)))
+    (add-text-properties
+     0 (length text)
+     `(pi-coding-agent-thinking-live t
+       pi-coding-agent-thinking-live-display ,display
+       help-echo "TAB: toggle live thinking")
+     text)
+    text))
+
+(defun pi-coding-agent--live-thinking-rendered-text (&optional expanded)
+  "Return the current live thinking projection.
+When EXPANDED is nil, return the stable one-line working stub.  When EXPANDED
+is non-nil, render the raw thinking collected so far as a blockquote."
+  (pi-coding-agent--propertize-live-thinking
+   (if expanded
+       (let ((normalized
+              (pi-coding-agent--thinking-normalize-text
+               (pi-coding-agent--thinking-stream-raw-content))))
+         (concat (propertize
+                  "▾ Think" 'face 'pi-coding-agent-activity-label)
+                 "\n"
+                 (if (string-empty-p normalized)
+                     "> "
+                   (pi-coding-agent--thinking-blockquote-text normalized))))
+     (pi-coding-agent--thinking-live-stub))
+   (if expanded 'visible 'hidden)))
 
 (defun pi-coding-agent--next-thinking-block-order ()
   "Return the next monotonically increasing completed-thinking block order."
@@ -786,6 +828,28 @@ resolve to the completed thinking block the user was inspecting."
   "Return completed-thinking block order at POS, or nil."
   (when-let* ((probe (pi-coding-agent--thinking-block-probe-pos pos)))
     (get-text-property probe 'pi-coding-agent-thinking-block)))
+
+(defun pi-coding-agent--live-thinking-probe-pos (pos)
+  "Return a position inside the live thinking block at POS, or nil."
+  (when (> (point-max) (point-min))
+    (let ((probe (cond ((<= pos (point-min)) (point-min))
+                       ((>= pos (point-max)) (max (point-min)
+                                                  (1- (point-max))))
+                       (t pos))))
+      (cond
+       ((get-text-property probe 'pi-coding-agent-thinking-live) probe)
+       ((and (> probe (point-min))
+             (get-text-property (1- probe)
+                                'pi-coding-agent-thinking-live))
+        (1- probe))))))
+
+(defun pi-coding-agent--live-thinking-at-point-p ()
+  "Return non-nil when point is inside the current live thinking block."
+  (and (markerp pi-coding-agent--thinking-start-marker)
+       (marker-position pi-coding-agent--thinking-start-marker)
+       (markerp pi-coding-agent--thinking-marker)
+       (marker-position pi-coding-agent--thinking-marker)
+       (pi-coding-agent--live-thinking-probe-pos (point))))
 
 (defun pi-coding-agent--thinking-block-start (block-order)
   "Return the start position of completed thinking BLOCK-ORDER, or nil."
@@ -862,6 +926,24 @@ non-empty."
             (delete-region start end)
             (insert text)
             (set-marker pi-coding-agent--thinking-marker (point))))
+        (not (string-empty-p text))))))
+
+(defun pi-coding-agent--replace-live-thinking-region (rendered)
+  "Replace the active live thinking region with RENDERED."
+  (when (and (markerp pi-coding-agent--thinking-start-marker)
+             (markerp pi-coding-agent--thinking-marker)
+             (marker-position pi-coding-agent--thinking-start-marker)
+             (marker-position pi-coding-agent--thinking-marker))
+    (let ((start (marker-position pi-coding-agent--thinking-start-marker))
+          (end (marker-position pi-coding-agent--thinking-marker))
+          (text (or rendered ""))
+          (inhibit-read-only t))
+      (when (<= start end)
+        (goto-char start)
+        (delete-region start end)
+        (insert text)
+        (set-marker pi-coding-agent--thinking-start-marker start)
+        (set-marker pi-coding-agent--thinking-marker (point))
         (not (string-empty-p text))))))
 
 (defun pi-coding-agent--thinking-pending-string ()
@@ -969,7 +1051,8 @@ has no visible line, so it does not get a second gap."
         pi-coding-agent--thinking-raw nil
         pi-coding-agent--thinking-raw-chunks nil
         pi-coding-agent--thinking-pending-chars nil
-        pi-coding-agent--thinking-stream-started nil))
+        pi-coding-agent--thinking-stream-started nil
+        pi-coding-agent--thinking-live-expanded nil))
 
 (defmacro pi-coding-agent--with-window-rewrite-preservation (&rest body)
   "Execute BODY and keep chat windows useful after a large rewrite.
@@ -987,7 +1070,7 @@ clamped so the window remains filled when possible."
      result))
 
 (defun pi-coding-agent--display-thinking-start ()
-  "Insert opening marker for thinking block (blockquote)."
+  "Insert the stable live thinking stub."
   (when pi-coding-agent--streaming-marker
     (setq pi-coding-agent--in-thinking-block t)
     (let ((inhibit-read-only t))
@@ -1005,7 +1088,8 @@ clamped so the window remains filled when possible."
           ;; after the marker (we then advance it explicitly per delta).
           (pi-coding-agent--reset-thinking-state)
           (let ((start (point)))
-            (insert "> ")
+            (setq pi-coding-agent--thinking-live-expanded nil)
+            (insert (pi-coding-agent--live-thinking-rendered-text nil))
             (setq pi-coding-agent--thinking-start-marker
                   (copy-marker start nil))
             (setq pi-coding-agent--thinking-marker
@@ -1017,15 +1101,21 @@ Normalizes boundary and paragraph whitespace while streaming."
   (when (and delta pi-coding-agent--streaming-marker)
     (let ((delta (pi-coding-agent--render-safe-string delta))
           (inhibit-read-only t))
+      (unless (and pi-coding-agent--thinking-start-marker
+                   pi-coding-agent--thinking-marker
+                   (marker-position pi-coding-agent--thinking-start-marker)
+                   (marker-position pi-coding-agent--thinking-marker))
+        (pi-coding-agent--display-thinking-start))
       (if (and pi-coding-agent--thinking-start-marker
                pi-coding-agent--thinking-marker)
           (let ((fragment
                  (progn
                    (push delta pi-coding-agent--thinking-raw-chunks)
                    (pi-coding-agent--thinking-stream-transform-delta delta))))
-            (unless (string-empty-p fragment)
-            (pi-coding-agent--with-scroll-preservation
-              (save-excursion
+            (when (and pi-coding-agent--thinking-live-expanded
+                       (not (string-empty-p fragment)))
+              (pi-coding-agent--with-scroll-preservation
+                (save-excursion
                   (goto-char
                    (marker-position pi-coding-agent--thinking-marker))
                   (insert fragment)
@@ -3553,7 +3643,11 @@ canonical or transient pair storage; IS-ERROR records completion status."
 
 (defun pi-coding-agent--activity-group-text (record)
   "Return the one-line group text for activity RECORD."
-  (let* ((cue (if (pi-coding-agent--activity-record-expanded record) "▾" "▸"))
+  (let* ((cue (cond
+               ((pi-coding-agent--activity-record-expanded record) "▾")
+               ((pi-coding-agent--activity-record-live record)
+                pi-coding-agent--activity-live-cue)
+               (t "▸")))
          (prefix (concat
                   (propertize cue
                               'font-lock-face
@@ -3566,7 +3660,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
           (if (pi-coding-agent--activity-record-live record)
               (list (propertize "working"
                                 'font-lock-face
-                                'pi-coding-agent-activity-summary))
+                                'pi-coding-agent-activity-running))
             (pi-coding-agent--activity-summary-parts record)))
          (budget (pi-coding-agent--activity-line-budget))
          (result prefix))
@@ -4413,6 +4507,27 @@ context after the rewrite."
           pos replacements))))
     new-bounds))
 
+(defun pi-coding-agent--toggle-live-thinking-at-point ()
+  "Toggle the current live thinking block at point.
+Returns non-nil when point was inside the live thinking block."
+  (when (pi-coding-agent--live-thinking-at-point-p)
+    (let* ((original-pos (point))
+           (start (marker-position pi-coding-agent--thinking-start-marker)))
+      (setq pi-coding-agent--thinking-live-expanded
+            (not pi-coding-agent--thinking-live-expanded))
+      (pi-coding-agent--with-scroll-preservation
+        (save-excursion
+          (pi-coding-agent--replace-live-thinking-region
+           (pi-coding-agent--live-thinking-rendered-text
+            pi-coding-agent--thinking-live-expanded))))
+      (goto-char
+       (max start
+            (min original-pos
+                 (max start
+                      (1- (marker-position
+                           pi-coding-agent--thinking-marker)))))))
+    t))
+
 (defun pi-coding-agent--completed-thinking-blocks ()
   "Return completed thinking blocks in the current buffer in source order."
   (let ((pos (point-min))
@@ -4451,24 +4566,27 @@ coordinates from before the rewrites."
     replacements))
 
 (defun pi-coding-agent--toggle-thinking-block-at-point ()
-  "Toggle the completed-thinking block at point.
-Returns non-nil when point was inside a completed thinking block and the block
-was toggled successfully."
-  (when-let* ((block (pi-coding-agent--thinking-block-metadata-at-pos (point)))
-              (normalized (plist-get block :normalized))
-              (order (plist-get block :order))
-              (display (plist-get block :display))
-              (rendered (pi-coding-agent--completed-thinking-rendered-from-normalized
-                         normalized
-                         order
-                         (if (eq display 'hidden) 'visible 'hidden))))
-    (let* ((original-pos (point))
-           (new-bounds (pi-coding-agent--replace-thinking-block block rendered))
-           (new-start (car new-bounds))
-           (new-end (cdr new-bounds)))
-      (goto-char (max new-start
-                      (min original-pos (max new-start (1- new-end))))))
-    t))
+  "Toggle the live or completed thinking block at point.
+Returns non-nil when point was inside a thinking block and it toggled
+successfully."
+  (or (pi-coding-agent--toggle-live-thinking-at-point)
+      (when-let* ((block (pi-coding-agent--thinking-block-metadata-at-pos (point)))
+                  (normalized (plist-get block :normalized))
+                  (order (plist-get block :order))
+                  (display (plist-get block :display))
+                  (rendered
+                   (pi-coding-agent--completed-thinking-rendered-from-normalized
+                    normalized
+                    order
+                    (if (eq display 'hidden) 'visible 'hidden))))
+        (let* ((original-pos (point))
+               (new-bounds (pi-coding-agent--replace-thinking-block
+                            block rendered))
+               (new-start (car new-bounds))
+               (new-end (cdr new-bounds)))
+          (goto-char (max new-start
+                          (min original-pos (max new-start (1- new-end))))))
+        t)))
 
 (defun pi-coding-agent--insert-rendered-tool-content (content lang is-edit-diff)
   "Insert CONTENT rendered for LANG with a trailing newline.

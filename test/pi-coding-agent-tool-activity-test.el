@@ -392,7 +392,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
 
 (ert-deftest pi-coding-agent-test-tool-activity-cues-are-single-column ()
   "Disclosure and status cues occupy one terminal column."
-  (dolist (cue '("▸" "▾" "›" "!" "·"))
+  (dolist (cue '("▸" "▾" "◌" "›" "!" "·"))
     (should (= 1 (string-width cue)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-buttons-have-static-faces ()

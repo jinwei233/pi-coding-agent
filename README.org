@@ -480,7 +480,8 @@ managing grammars yourself, using extension features, or integrating
 Here's some common non-default preferences:
 
 #+begin_src emacs-lisp
-;; Collapse completed thinking in new chats; live thinking still streams:
+;; Collapse completed thinking in new chats; live thinking stays folded
+;; unless you press TAB on the live Think row:
 (setopt pi-coding-agent-thinking-display 'hidden)
 
 ;; Make the input pane 25% of the Pi window pair; rebalanced on frame resize:
@@ -597,11 +598,13 @@ chat buffers.
 ** Display of thinking 💭
 
 New chat buffers inherit =pi-coding-agent-thinking-display=.  The
-default is =visible=: live thinking streams while the assistant is
-working and remains expanded when that thinking block finishes.  Use
-=C-c C-p h= to change the current chat, or =C-c C-p H= to change the
-default for future chat buffers in the current Emacs session.  To make
-that default persist across restarts, set
+default is =visible=: live thinking stays folded as =◌ Think · working=
+while the assistant is working, and the completed thinking block remains
+expanded when it finishes.  Press =TAB= on the live =Think= row to opt
+into realtime expanded content for that block.  Use =C-c C-p h= to
+change the current chat, or =C-c C-p H= to change the default for future
+chat buffers in the current Emacs session.  To make that default persist
+across restarts, set
 =pi-coding-agent-thinking-display= in your init file or via =M-x
 customize-option=.
 

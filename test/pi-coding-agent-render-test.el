@@ -608,11 +608,14 @@ as the top-level structure."
     (should (string-match-p "C#" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-display-thinking-delta-appends-text ()
-  "message_update thinking_delta appends text to chat."
+  "Expanded live thinking appends text to chat."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)  ; Creates streaming marker
     (pi-coding-agent--display-thinking-delta "Let me think...")
+    (goto-char (point-min))
+    (search-forward "Think")
+    (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent--display-thinking-delta " about this.")
     (should (string-match-p "Let me think... about this." (buffer-string)))))
 
@@ -664,8 +667,10 @@ Models may send \\n\\n before thinking content too."
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
-    ;; Hidden header adds no blank line before the thinking blockquote
-    (should (string-match-p "Assistant\n=+\n>" (buffer-string)))))
+    ;; Hidden header adds no blank line before the live thinking stub.
+    (should (string-match-p
+             (regexp-quote "Assistant\n=========\n◌ Think")
+             (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-thinking-empty-lifecycle-no-visible-blockquote ()
   "Empty thinking start/end should not leave a visible blank blockquote."
@@ -691,8 +696,8 @@ Models may send \\n\\n before thinking content too."
       (goto-char (point-min))
       (should-not (re-search-forward "^>\\s-*$" nil t)))))
 
-(ert-deftest pi-coding-agent-test-hidden-thinking-shows-live-then-collapses-to-preview-line ()
-  "Hidden mode still shows live thinking, then collapses it to one preview line."
+(ert-deftest pi-coding-agent-test-live-thinking-folded-then-collapses-to-preview-line ()
+  "Live thinking stays folded, then hidden mode collapses to one preview line."
   (let ((pi-coding-agent-thinking-display 'hidden))
     (with-temp-buffer
       (pi-coding-agent-chat-mode)
@@ -700,7 +705,11 @@ Models may send \\n\\n before thinking content too."
       (pi-coding-agent--display-thinking-start)
       (pi-coding-agent--display-thinking-delta
        "Crafting response style\nCheck examples\nPolish wording")
-      (should (string-match-p "> Crafting response style" (buffer-string)))
+      (let ((live (buffer-string)))
+        (should (string-match-p
+                 (regexp-quote "◌ Think · working")
+                 live))
+        (should-not (string-match-p "> Crafting response style" live)))
       (pi-coding-agent--display-thinking-end "")
       (let ((text (buffer-string)))
         (should (string-match-p
@@ -709,6 +718,22 @@ Models may send \\n\\n before thinking content too."
         (should-not (string-match-p "> Crafting response style" text))
         (should-not (string-match-p "Thinking hidden" text))
         (should-not (string-match-p "more line" text))))))
+
+(ert-deftest pi-coding-agent-test-live-thinking-tab-expands-and-streams ()
+  "TAB on live thinking opts into realtime expanded content."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (pi-coding-agent--display-thinking-delta "First thought.")
+    (goto-char (point-min))
+    (search-forward "Think")
+    (pi-coding-agent-toggle-tool-section)
+    (let ((expanded (buffer-string)))
+      (should (string-match-p "▾ Think\n> First thought\\." expanded))
+      (should pi-coding-agent--thinking-live-expanded))
+    (pi-coding-agent--display-thinking-delta " Second thought.")
+    (should (string-match-p "Second thought" (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-hidden-thinking-truncates-long-first-line ()
   "Collapsed thinking truncates an over-budget first line instead of hiding it."
@@ -890,6 +915,9 @@ because it inserts at the end, while a full rewrite would lose it."
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
+    (goto-char (point-min))
+    (search-forward "Think")
+    (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent--display-thinking-delta "First thought.")
     (should (= (length pi-coding-agent--thinking-raw-chunks) 1))
     ;; Place a marker property inside the rendered thinking region
@@ -1020,6 +1048,9 @@ subsequent font-lock-ensure calls."
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
+    (goto-char (point-min))
+    (search-forward "Think")
+    (pi-coding-agent-toggle-tool-section)
     ;; Send initial content
     (pi-coding-agent--display-thinking-delta "First paragraph with text.")
     ;; Fontify
@@ -1822,6 +1853,9 @@ agent_end + next section's leading newline must not create triple newlines."
         (insert (format "previous history line %03d\n" (1+ i)))))
     (pi-coding-agent--display-agent-start)
     (pi-coding-agent--display-thinking-start)
+    (goto-char (point-min))
+    (search-forward "Think")
+    (pi-coding-agent-toggle-tool-section)
     (pi-coding-agent--display-thinking-delta
      (pi-coding-agent-test--long-thinking-text))))
 
@@ -10981,7 +11015,9 @@ Edit diffs include unchanged context rows with a leading space marker."
                                           (:type "thinking_delta" :delta 42)))))
               (error (setq caught err)))
             (should-not caught)
-            (should (string-match-p "^> 42" (buffer-string))))
+            (should (string-match-p
+                     (regexp-quote "◌ Think · working")
+                     (buffer-string))))
         (pi-coding-agent--unregister-display-handler proc)
         (when (process-live-p proc)
           (delete-process proc))))))
@@ -13086,7 +13122,10 @@ Commands with embedded newlines should not have any lines deleted."
     (pi-coding-agent--handle-display-event
      '(:type "message_update"
        :assistantMessageEvent (:type "thinking_delta" :delta "Analyzing...")))
-    (should (string-match-p "Analyzing..." (buffer-string)))))
+    (should (string-match-p
+             (regexp-quote "◌ Think · working")
+             (buffer-string)))
+    (should-not (string-match-p "Analyzing..." (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-activity-phase-thinking-on-agent-start ()
   "Activity phase becomes thinking on agent_start."
@@ -13705,6 +13744,9 @@ inserted text for fontification at the next redisplay."
         (pi-coding-agent-chat-mode)
         (pi-coding-agent--display-agent-start)
         (pi-coding-agent--display-thinking-start)
+        (goto-char (point-min))
+        (search-forward "Think")
+        (pi-coding-agent-toggle-tool-section)
         (add-hook 'after-change-functions #'test-hook nil t)
         (setq hook-called nil)
         (pi-coding-agent--display-thinking-delta "Test thinking")

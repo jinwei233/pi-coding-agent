@@ -363,9 +363,10 @@ Allowed values are:
 - `visible'  Keep completed thinking expanded as blockquote markdown.
 - `hidden'   Collapse completed thinking to a short stub line.
 
-Live streaming thinking is always shown while the assistant is still working.
-Per-block TAB toggles are temporary local overrides and are cleared by buffer
-rebuilds, reloads, or whole-chat display-mode changes."
+Live thinking stays folded as `◌ Think · working' while the assistant is
+working; TAB on that row opts into realtime expanded content.  Per-block TAB
+toggles are temporary local overrides and are cleared by buffer rebuilds,
+reloads, or whole-chat display-mode changes."
   :type '(choice (const :tag "Visible" visible)
                  (const :tag "Hidden" hidden))
   :group 'pi-coding-agent)
@@ -1921,6 +1922,9 @@ Whitespace cannot be normalized until later content or thinking end arrives.")
 
 (defvar-local pi-coding-agent--thinking-stream-started nil
   "Non-nil after the current thinking stream emits meaningful content.")
+
+(defvar-local pi-coding-agent--thinking-live-expanded nil
+  "Non-nil when the current live thinking block is user-expanded.")
 
 (defvar-local pi-coding-agent--line-parse-state 'line-start
   "Parsing state for current line during streaming.
