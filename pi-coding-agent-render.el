@@ -3204,14 +3204,15 @@ if none exists, render the result at point without a live overlay."
           pi-coding-agent-tool-activity-display)
       'hidden))
 
-(defun pi-coding-agent--tool-activity-turn-ordinal (&optional position)
+(defun pi-coding-agent--tool-activity-turn-ordinal (&optional position headings)
   "Return the 0-based user turn ordinal containing POSITION.
 Orphaned content before the first user heading (for example a compacted
 history window that starts mid-turn) uses the synthetic ordinal -1 so its
-tool activity can still be revealed."
+tool activity can still be revealed.  HEADINGS may be a precomputed list
+from `pi-coding-agent--collect-you-headings'."
   (save-excursion
     (when position (goto-char position))
-    (or (pi-coding-agent--user-turn-index-at-point) -1)))
+    (or (pi-coding-agent--user-turn-index-at-point headings) -1)))
 
 (defun pi-coding-agent--tool-activity-revealed-p (&optional ordinal)
   "Return non-nil when turn ORDINAL currently shows its tool activity."
@@ -3267,10 +3268,14 @@ command hint."
     (setq pi-coding-agent--tool-activity-revealed
           (delq ordinal pi-coding-agent--tool-activity-revealed))))
 
-(defun pi-coding-agent--tool-activity-body-runs (&optional ordinal)
+(defun pi-coding-agent--tool-activity-body-runs (&optional ordinal headings)
   "Return (START . END) runs of reduced tool activity text.
-When ORDINAL is non-nil only runs inside that turn are returned."
-  (let ((position (point-min))
+When ORDINAL is non-nil only runs inside that turn are returned.
+HEADINGS may be a precomputed user-heading list."
+  (let ((headings (or headings
+                      (and ordinal
+                           (pi-coding-agent--collect-you-headings))))
+        (position (point-min))
         runs)
     (while (< position (point-max))
       (let ((end (next-single-char-property-change
@@ -3282,7 +3287,7 @@ When ORDINAL is non-nil only runs inside that turn are returned."
                    (or (null ordinal)
                        (eql ordinal
                             (pi-coding-agent--tool-activity-turn-ordinal
-                             position))))
+                             position headings))))
           (push (cons position end) runs))
         (setq position end)))
     (nreverse runs)))
@@ -3306,22 +3311,26 @@ When ORDINAL is non-nil only that turn is considered."
 (defun pi-coding-agent--hide-tool-activity-in-turn (ordinal)
   "Hide the tool activity of turn ORDINAL again."
   (when (integerp ordinal)
-    (with-current-buffer (current-buffer)
-      (let ((inhibit-read-only t))
-        ;; Collapse expanded details first so only the reduced line is rewritten.
-        (dolist (overlay (overlays-in (point-min) (point-max)))
-          (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
-                     (overlay-get overlay 'pi-coding-agent-tool-detail-expanded)
-                     (eql ordinal
-                          (pi-coding-agent--tool-activity-turn-ordinal
-                           (overlay-start overlay))))
-            (let ((block (pi-coding-agent--tool-block-from-overlay overlay)))
-              (when block
-                (pi-coding-agent--collapse-tool-detail block)))))
-        (dolist (run (pi-coding-agent--tool-activity-body-runs ordinal))
-          (let ((kind (get-text-property (car run)
-                                         pi-coding-agent--tool-activity-region-property)))
-            (pi-coding-agent--hide-tool-activity (car run) (cdr run) kind)))))
+    (let ((headings (pi-coding-agent--collect-you-headings)))
+      (with-current-buffer (current-buffer)
+        (let ((inhibit-read-only t))
+          ;; Collapse expanded details first so only the reduced line is rewritten.
+          (dolist (overlay (overlays-in (point-min) (point-max)))
+            (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
+                       (overlay-get overlay 'pi-coding-agent-tool-detail-expanded)
+                       (eql ordinal
+                            (pi-coding-agent--tool-activity-turn-ordinal
+                             (overlay-start overlay) headings)))
+              (let ((block (pi-coding-agent--tool-block-from-overlay overlay)))
+                (when block
+                  (pi-coding-agent--collapse-tool-detail block)))))
+          (dolist (run (pi-coding-agent--tool-activity-body-runs
+                        ordinal headings))
+            (let ((kind (get-text-property
+                         (car run)
+                         pi-coding-agent--tool-activity-region-property)))
+              (pi-coding-agent--hide-tool-activity
+               (car run) (cdr run) kind))))))
     (pi-coding-agent--set-tool-activity-revealed ordinal nil)
     (pi-coding-agent--update-hidden-tool-count)
     (force-mode-line-update t)))
@@ -3330,28 +3339,33 @@ When ORDINAL is non-nil only that turn is considered."
   "Recompute the number of hidden completed tool calls in this buffer.
 Counts hot blocks with a completed summary and cold metadata runs whose
 turn is not currently revealed."
-  (let ((count 0))
+  (let ((count 0)
+        (headings (pi-coding-agent--collect-you-headings)))
     (unless (pi-coding-agent--tool-activity-hidden-mode-p)
       (setq count 0)
       (setq pi-coding-agent--hidden-tool-count 0))
     (when (pi-coding-agent--tool-activity-hidden-mode-p)
-    (dolist (overlay (overlays-in (point-min) (point-max)))
-      (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
-                 (overlay-get overlay 'pi-coding-agent-tool-summary)
-                 (not (overlay-get overlay 'pi-coding-agent-tool-detail-expanded)))
-        (unless (pi-coding-agent--tool-activity-revealed-p
-                 (pi-coding-agent--tool-activity-turn-ordinal
-                  (overlay-start overlay)))
-          (setq count (1+ count)))))
-    (let ((position (point-min)))
-      (while (< position (point-max))
-        (let ((end (next-single-char-property-change
-                    position 'pi-coding-agent-cold-tool-block nil (point-max))))
-          (when (get-text-property position 'pi-coding-agent-cold-tool-block)
-            (unless (pi-coding-agent--tool-activity-revealed-p
-                     (pi-coding-agent--tool-activity-turn-ordinal position))
-              (setq count (1+ count))))
-          (setq position end)))))
+      (dolist (overlay (overlays-in (point-min) (point-max)))
+        (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
+                   (overlay-get overlay 'pi-coding-agent-tool-summary)
+                   (not (overlay-get
+                         overlay 'pi-coding-agent-tool-detail-expanded)))
+          (unless (pi-coding-agent--tool-activity-revealed-p
+                   (pi-coding-agent--tool-activity-turn-ordinal
+                    (overlay-start overlay) headings))
+            (setq count (1+ count)))))
+      (let ((position (point-min)))
+        (while (< position (point-max))
+          (let ((end (next-single-char-property-change
+                      position 'pi-coding-agent-cold-tool-block
+                      nil (point-max))))
+            (when (get-text-property position
+                                     'pi-coding-agent-cold-tool-block)
+              (unless (pi-coding-agent--tool-activity-revealed-p
+                       (pi-coding-agent--tool-activity-turn-ordinal
+                        position headings))
+                (setq count (1+ count))))
+            (setq position end)))))
     (setq pi-coding-agent--hidden-tool-count count)))
 
 (defun pi-coding-agent--display-tool-running-line (block)
@@ -4012,16 +4026,18 @@ count because cold history must stay preview-only."
                                  (> hidden-count 0)
                                  hidden-count))))))
 
-(defun pi-coding-agent--cool-tool-overlay-hidden (overlay metadata header-end)
+(defun pi-coding-agent--cool-tool-overlay-hidden
+    (overlay metadata header-end &optional headings)
   "Cool OVERLAY with METADATA in hidden tool activity mode.
 HEADER-END marks the boundary between the hidden header and the activity
 line.  Keeps both in place, drops overlay, button and diff interactivity, and
 records lightweight cold metadata so the activity line can be revealed and its
-detail opened later."
+detail opened later.  HEADINGS may be a precomputed user-heading list."
   (let* ((ov-start (overlay-start overlay))
          (ov-end (overlay-end overlay))
          (target-metadata (plist-get metadata :target-metadata))
-         (ordinal (pi-coding-agent--tool-activity-turn-ordinal ov-start))
+         (ordinal
+          (pi-coding-agent--tool-activity-turn-ordinal ov-start headings))
          (reveal-p (pi-coding-agent--tool-activity-revealed-p ordinal))
          (inhibit-read-only t))
     (remove-overlays ov-start ov-end 'pi-coding-agent-diff-overlay t)
@@ -4047,17 +4063,18 @@ detail opened later."
                        :activity-line activity-line)))))
     t))
 
-(defun pi-coding-agent--cool-tool-overlay (overlay)
+(defun pi-coding-agent--cool-tool-overlay (overlay &optional headings)
   "Rewrite completed tool OVERLAY into its cold plain-history form.
 Preserves the header and visible preview, drops overlays, buttons, and
-diff annotations."
+diff annotations.  HEADINGS may be a precomputed user-heading list."
   (when (pi-coding-agent--completed-tool-overlay-p overlay)
     (when-let* ((metadata (pi-coding-agent--tool-overlay-cold-metadata overlay))
                 (visible-body (plist-get metadata :visible-body))
                 (header-end (marker-position
                              (overlay-get overlay 'pi-coding-agent-header-end))))
       (if (pi-coding-agent--tool-activity-hidden-mode-p)
-          (pi-coding-agent--cool-tool-overlay-hidden overlay metadata header-end)
+          (pi-coding-agent--cool-tool-overlay-hidden
+           overlay metadata header-end headings)
       (let* ((inhibit-read-only t)
              (hidden-count (plist-get metadata :hidden-count))
              (target-metadata (plist-get metadata :target-metadata))
@@ -4097,11 +4114,12 @@ rewrites do not disturb remaining candidates."
                                  overlays))
          (sorted (sort (copy-sequence candidates)
                        (lambda (a b)
-                         (> (overlay-start a) (overlay-start b))))))
+                         (> (overlay-start a) (overlay-start b)))))
+         (headings (pi-coding-agent--collect-you-headings)))
     (pi-coding-agent--with-scroll-preservation
       (save-excursion
         (dolist (overlay sorted)
-          (pi-coding-agent--cool-tool-overlay overlay)))))
+          (pi-coding-agent--cool-tool-overlay overlay headings)))))
   (pi-coding-agent--update-hidden-tool-count)
   (force-mode-line-update t))
 

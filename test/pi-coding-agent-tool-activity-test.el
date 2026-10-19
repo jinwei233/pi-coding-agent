@@ -355,6 +355,23 @@
     (pi-coding-agent--rerender-canonical-history)
     (should (= 1 pi-coding-agent--hidden-tool-count))))
 
+(ert-deftest pi-coding-agent-test-tool-activity-counter-scans-headings-once ()
+  "Counting hidden tools reuses one user-heading scan for every tool."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent-tool-activity-test--history
+     '("bash" (:command "one") "alpha")
+     '("read" (:path "/tmp/pi-tool-activity/a.el") "beta")
+     '("write" (:path "/tmp/pi-tool-activity/b.el" :content "gamma") "done"))
+    (let ((original (symbol-function 'pi-coding-agent--collect-you-headings))
+          (calls 0))
+      (cl-letf (((symbol-function 'pi-coding-agent--collect-you-headings)
+                 (lambda ()
+                   (setq calls (1+ calls))
+                   (funcall original))))
+        (pi-coding-agent--update-hidden-tool-count))
+      (should (= 1 calls))
+      (should (= 3 pi-coding-agent--hidden-tool-count)))))
+
 ;;;; 1.9 Cold history
 
 (ert-deftest pi-coding-agent-test-tool-activity-cold-block-is-invisible ()
