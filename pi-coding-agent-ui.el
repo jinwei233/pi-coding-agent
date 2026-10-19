@@ -373,13 +373,12 @@ rebuilds, reloads, or whole-chat display-mode changes."
 (defcustom pi-coding-agent-tool-activity-display 'summary
   "How completed tool activity appears in the chat transcript.
 `summary' keeps the established presentation: the tool header followed by
-one summary line.  `hidden' hides successful tool activity completely and
-shows one `<tool> · <target> · <count>' line per turn only after a
-turn-level TAB reveal; running tools keep one line and failed tools keep
-one diagnosable line in both modes.  This option is the package default;
-set it in your init file to opt into the quieter `hidden' mode."
+one summary line.  `grouped' keeps one result-first `Tools' row per user
+turn; TAB on that row reveals one lightweight row per tool.  The obsolete
+`hidden' value is accepted as an alias for `grouped'."
   :type '(choice (const :tag "Header plus summary line" summary)
-                 (const :tag "Hidden until revealed" hidden))
+                 (const :tag "Grouped by user turn" grouped)
+                 (const :tag "Grouped (obsolete hidden alias)" hidden))
   :group 'pi-coding-agent)
 
 (defcustom pi-coding-agent-thinking-hidden-preview t
@@ -568,6 +567,41 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   "Face for tool output text."
   :group 'pi-coding-agent)
 
+(defface pi-coding-agent-activity-group
+  '((t :inherit default :extend t))
+  "Face for a turn-level tool activity row."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-label
+  '((t :inherit font-lock-keyword-face :weight semi-bold))
+  "Face for activity disclosure cues and type labels."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-summary
+  '((t :inherit shadow))
+  "Face for low-priority activity summary text."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-running
+  '((t :inherit warning))
+  "Face for running tool activity."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-failed
+  '((t :inherit error :weight semi-bold))
+  "Face for failed tool activity."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-added
+  '((t :inherit diff-added))
+  "Face for added-line activity counts."
+  :group 'pi-coding-agent)
+
+(defface pi-coding-agent-activity-removed
+  '((t :inherit diff-removed))
+  "Face for removed-line activity counts."
+  :group 'pi-coding-agent)
+
 (defface pi-coding-agent-tool-block
   '((t :extend t))
   "Face for tool blocks.
@@ -674,6 +708,17 @@ falling back to INDICATOR-FACE when needed."
        :background
        (pi-coding-agent--blend-color bg tint amount)))))
 
+(defun pi-coding-agent--update-activity-group-face ()
+  "Set the activity group background from the active theme."
+  (when-let* ((background
+               (pi-coding-agent--theme-face-background 'default))
+              (foreground
+               (or (pi-coding-agent--theme-face-foreground 'shadow)
+                   (pi-coding-agent--theme-face-foreground 'default))))
+    (pi-coding-agent--set-face-background-only
+     'pi-coding-agent-activity-group
+     (pi-coding-agent--blend-color background foreground 0.06))))
+
 (defun pi-coding-agent--update-tool-block-error-face ()
   "Set `pi-coding-agent-tool-block-error' background from theme."
   (pi-coding-agent--set-face-background-only
@@ -696,7 +741,8 @@ falling back to INDICATOR-FACE when needed."
   "Set internal faces derived from the current theme.
 Updates tool blocks plus edit-diff overlays.  Called from mode setup and
 on theme changes."
-  (dolist (update '(pi-coding-agent--update-tool-block-face
+  (dolist (update '(pi-coding-agent--update-activity-group-face
+                    pi-coding-agent--update-tool-block-face
                     pi-coding-agent--update-tool-block-error-face
                     pi-coding-agent--update-edit-diff-faces))
     (condition-case-unless-debug nil
@@ -1468,8 +1514,11 @@ This is a read-only buffer showing the conversation history."
   (setq-local pi-coding-agent--thinking-display pi-coding-agent-thinking-display)
   (setq-local pi-coding-agent--tool-activity-display
               pi-coding-agent-tool-activity-display)
-  (setq-local pi-coding-agent--tool-activity-revealed nil)
-  (setq-local pi-coding-agent--hidden-tool-count 0)
+  (setq-local pi-coding-agent--activity-table (make-hash-table :test 'equal))
+  (setq-local pi-coding-agent--tool-activity-index
+              (make-hash-table :test 'equal))
+  (setq-local pi-coding-agent--activity-turn-counter 0)
+  (setq-local pi-coding-agent--current-activity-turn nil)
   (setq-local pi-coding-agent--tool-args-cache (make-hash-table :test 'equal))
   (setq-local pi-coding-agent--transient-tool-pairs
               (make-hash-table :test 'equal))
@@ -2671,27 +2720,14 @@ reduced activity text."
        (eq t (get-text-property pos 'invisible))))
 
 (defun pi-coding-agent--restore-hidden-structure (beg end)
-  "Restore invisibility for hidden turn and tool structure in BEG..END.
-Runs as a `jit-lock-register' pass so tree-sitter markdown fontification
-cannot reveal the structural headings or the hidden tool activity."
+  "Restore invisible turn structure in BEG..END after fontification."
   (let ((inhibit-read-only t))
-    ;; Turn structure is always hidden.
     (let ((pos beg))
       (while (< pos end)
         (let ((next (next-single-char-property-change
                      pos pi-coding-agent--hidden-turn-structure-property
                      nil end)))
           (when (get-text-property pos pi-coding-agent--hidden-turn-structure-property)
-            (put-text-property pos next 'invisible t))
-          (setq pos next))))
-    ;; Tool activity is hidden unless the current turn was revealed.
-    (let ((pos beg))
-      (while (< pos end)
-        (let ((next (next-single-char-property-change
-                     pos pi-coding-agent--tool-activity-region-property
-                     nil end)))
-          (when (and (get-text-property pos pi-coding-agent--tool-activity-region-property)
-                     (not (get-text-property pos pi-coding-agent--tool-activity-shown-property)))
             (put-text-property pos next 'invisible t))
           (setq pos next))))))
 
@@ -3264,25 +3300,13 @@ Accesses state from the linked chat buffer."
                              "idle"))
          (activity-phase-str
           (propertize (format "%-8s" activity-phase)
-                      'face 'pi-coding-agent-activity-phase))
-         (hidden-tools (and chat-buf
-                            (buffer-local-value 'pi-coding-agent--hidden-tool-count
-                                                chat-buf))))
+                      'face 'pi-coding-agent-activity-phase)))
     (concat
      (pi-coding-agent--header-format-identity
       model-short thinking activity-phase-str)
      (pi-coding-agent--header-format-stats stats)
      (pi-coding-agent--header-format-context-group session-name)
-     (pi-coding-agent--header-format-tool-activity hidden-tools)
      (pi-coding-agent--header-format-extension-group ext-status working-message))))
-
-(defun pi-coding-agent--header-format-tool-activity (hidden-count)
-  "Format HIDDEN-COUNT hidden tool calls for the header line.
-Returns an empty string when nothing is hidden."
-  (if (and (integerp hidden-count) (> hidden-count 0))
-      (concat " │" (propertize (format " tools %d" hidden-count)
-                               'face 'pi-coding-agent-activity-phase))
-    ""))
 
 ;;; State Management
 

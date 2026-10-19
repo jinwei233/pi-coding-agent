@@ -22,7 +22,7 @@ VERBOSE ?=
 
 .PHONY: test test-unit test-core test-ui test-render test-transcript test-tool-activity test-table test-input test-menu test-build
 .PHONY: test-integration test-integration-fake test-integration-real test-integration-ci test-integration-ci-real test-gui test-gui-ci test-all
-.PHONY: bench bench-batch bench-reload-resume bench-reload-resume-batch bench-reload-resume-smoke bench-large-output-batch
+.PHONY: bench bench-batch bench-reload-resume bench-reload-resume-batch bench-reload-resume-smoke bench-large-output-batch bench-tool-activity
 .PHONY: check check-parens compile lint lint-checkdoc lint-package clean clean-cache help
 .PHONY: ollama-start ollama-stop ollama-status setup-pi install-hooks
 
@@ -47,6 +47,7 @@ help:
 	@echo "  make bench-reload-resume-batch     Reload/resume benchmarks (batch, secondary lane)"
 	@echo "  make bench-reload-resume-smoke     Reload/resume smoke benchmark (batch, no timing thresholds)"
 	@echo "  make bench-large-output-batch      Synthetic history/text/thinking benchmark matrix"
+	@echo "  make bench-tool-activity           50/500-turn grouped tool activity benchmark"
 	@echo "  make lint             Checkdoc + package-lint"
 	@echo "  make check            Compile, lint, unit tests (pre-commit)"
 	@echo "  make install-hooks    Set up git pre-commit hook"
@@ -280,6 +281,16 @@ bench-large-output-batch: .deps-stamp
 		-l pi-coding-agent \
 		-l pi-coding-agent-large-output-bench \
 		--eval "(pi-coding-agent-large-output-bench-run)"
+
+bench-tool-activity: .deps-stamp
+	@$(BATCH) -L bench \
+		--eval "(setq load-prefer-newer t)" \
+		--eval "(require 'package)" \
+		--eval "(package-initialize)" \
+		$(LOCAL_LOAD_PATH) \
+		-l pi-coding-agent \
+		-l pi-coding-agent-large-output-bench \
+		--eval "(pi-coding-agent-large-output-bench-run-tool-activity)"
 
 # ============================================================
 # Ollama management (local development)

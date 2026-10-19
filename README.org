@@ -194,25 +194,20 @@ as =search-forward=, =occur= or =replace-string= work on buffer text and can
 still match the hidden structure, which is a known limit of the quiet
 presentation.
 
-Completed tool calls normally show their existing header (which may span
-several lines for long arguments) followed by exactly one summary line, for
-example =$ run-tests= plus =42 lines · collected 10 items=.  Set
-=pi-coding-agent-tool-activity-display= to =hidden= to drop that machinery
-from the transcript entirely: a successful tool then occupies no visible line,
-and the chat header line carries a =tools N= counter instead.  In that mode
-=TAB= in a turn reveals one reduced line per tool
-(=bash · npm · 42 lines=, =edit src/app.el · +4 -1=, =read src/app.el · 120
-lines=), =TAB= on such a line opens the full detail, and =TAB= in the turn
-body hides the activity again.  Running tools keep one =▸ bash · running=
-line and failed tools keep one =failed · <first line>= line so progress and
-errors stay visible.  The shortened line never echoes the whole command and
-shows project-relative paths.  The summary never repeats output tails,
-hidden-line counts or expand hints.
+Completed tool calls use one folded activity row per user turn when
+=pi-coding-agent-tool-activity-display= is =grouped=:
+=▸ Tools · 1 file · +4 -1 · tests passed · 7 calls=.  Results outrank call
+counts when the window is narrow.  =TAB= or =RET= on the row reveals one
+short row per tool; =TAB= on a tool row toggles its complete detail.  =RET=
+on read, edit, and write rows visits the authoritative file and line, while
+=RET= on other tools opens detail.  Ordinary transcript =TAB= keeps its
+Markdown/outline behavior.  The old =hidden= value maps to =grouped= for one
+compatibility cycle; =summary= retains the previous header-plus-summary
+presentation.
 
-Press =RET= on a summary or reveal line to expand it; =RET= on a detail line
-keeps visiting file targets.  Long-running commands stream output live, file
-operations (=read=, =write=, =edit=) get syntax highlighting, and edit diffs
-highlight what changed.
+Grouped history is rendered directly from lightweight per-turn records.  It
+does not materialize hidden tool headers, outputs, or overlays, and live
+updates rewrite only the current turn's activity region.
 
 Markdown pipe tables get a display-only treatment: wide tables are
 wrapped and drawn to neatly fit window width, with cleaner separators,
@@ -515,8 +510,8 @@ Less common tuning knobs:
 ;; Let Pi's saved project trust decisions decide whether .pi resources load:
 ;; (setopt pi-coding-agent-project-trust-policy 'default)
 
-;; Hide successful tool activity from the transcript (TAB reveals it):
-;; (setopt pi-coding-agent-tool-activity-display 'hidden)
+;; Group successful tool activity by user turn:
+;; (setopt pi-coding-agent-tool-activity-display 'grouped)
 
 ;; `pi-coding-agent-thinking-hidden-preview' is obsolete: collapsed thinking
 ;; always previews its first line, so setting it no longer changes anything.

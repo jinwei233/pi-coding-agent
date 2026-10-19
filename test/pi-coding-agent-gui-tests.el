@@ -351,9 +351,8 @@ unrelated raw offset in the conversation."
             (should (string-match-p "Thinking detail 25" (buffer-string)))
             (should (equal block-before
                            (pi-coding-agent-gui-test--window-thinking-block-order win)))
-            (should (string-match-p
-                     "^> Thinking detail [0-9][0-9]$"
-                     (pi-coding-agent-gui-test--window-current-line win)))
+            (should (equal "▾ Think"
+                           (pi-coding-agent-gui-test--window-current-line win)))
             (should (pi-coding-agent-gui-test--window-substantially-filled-p win))))
       (kill-buffer buf))))
 
@@ -579,6 +578,56 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
           (redisplay)
           (should (string-match-p "Line 20" (buffer-string))))
       (kill-buffer buf))))
+
+;;;; Grouped Activity Tests
+
+(ert-deftest pi-coding-agent-gui-test-grouped-activity-narrow-themes ()
+  "Grouped activity stays one line with a subtle face in light and dark themes."
+  (let ((buffer (get-buffer-create "*pi-gui-grouped-activity*"))
+        (original-themes custom-enabled-themes))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (pi-coding-agent-chat-mode)
+          (setq-local pi-coding-agent--tool-activity-display 'grouped)
+          (pi-coding-agent--set-chat-session-identity "/tmp/pi-gui-activity/")
+          (pi-coding-agent--display-session-history
+           (vector
+            '(:role "user" :content "check")
+            '(:role "assistant"
+              :content
+              [(:type "toolCall" :id "call-1" :name "edit"
+                :arguments
+                (:path "/tmp/pi-gui-activity/very/long/path/file.el"))])
+            '(:role "toolResult" :toolCallId "call-1" :toolName "edit"
+              :content [(:type "text" :text "done")]
+              :details (:diff "+ new\n- old") :isError nil))
+           buffer)
+          (dolist (theme '(modus-operandi modus-vivendi))
+            (mapc #'disable-theme custom-enabled-themes)
+            (load-theme theme t)
+            (pi-coding-agent--update-theme-derived-faces)
+            (font-lock-ensure)
+            (redisplay t)
+            (goto-char (point-min))
+            (search-forward "Tools")
+            (let ((line
+                   (buffer-substring-no-properties
+                    (line-beginning-position) (line-end-position)))
+                  (background
+                   (face-background
+                    'pi-coding-agent-activity-group nil t)))
+              (should (<= (string-width line)
+                          pi-coding-agent--single-line-preview-columns))
+              (should (color-defined-p background))
+              (should-not
+               (eq t
+                   (face-attribute
+                    'pi-coding-agent-activity-group :underline nil t))))))
+      (mapc #'disable-theme custom-enabled-themes)
+      (mapc (lambda (theme) (load-theme theme t)) original-themes)
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 ;;;; Streaming Fontification Tests
 

@@ -535,6 +535,112 @@ and DELTA-COUNT is the number of one-character process reads."
     (pi-coding-agent-large-output-bench--result
      kind size delta-size elapsed rendered-size)))
 
+(defun pi-coding-agent-large-output-bench--activity-history
+    (turn-count tools-per-turn payload-size)
+  "Return grouped activity history for TURN-COUNT and TOOLS-PER-TURN.
+Each read, edit, and bash result carries a deterministic PAYLOAD-SIZE body."
+  (let ((payload (pi-coding-agent-large-output-bench--payload payload-size))
+        (messages nil)
+        (tool-index 0))
+    (dotimes (turn turn-count)
+      (push (list :role "user" :content (format "turn %d" turn))
+            messages)
+      (dotimes (slot tools-per-turn)
+        (setq tool-index (1+ tool-index))
+        (let* ((id (format "activity-%d" tool-index))
+               (kind (aref ["read" "edit" "bash"] (% slot 3)))
+               (path (format "/tmp/pi-activity/file-%d.el" tool-index))
+               (args (pcase kind
+                       ("read" (list :path path :offset 1))
+                       ("edit" (list :path path))
+                       (_ (list :command "synthetic-command"))))
+               (details (and (equal kind "edit")
+                             (list :diff payload))))
+          (push (list :role "assistant"
+                      :content
+                      (vector
+                       (list :type "toolCall" :id id
+                             :name kind :arguments args)))
+                messages)
+          (push (list :role "toolResult"
+                      :toolCallId id :toolName kind
+                      :content
+                      (vector (list :type "text" :text payload))
+                      :details details :isError nil)
+                messages))))
+    (vconcat (nreverse messages))))
+
+(defun pi-coding-agent-large-output-bench--activity-case
+    (turn-count tools-per-turn payload-size)
+  "Benchmark one grouped activity history and local expand operation."
+  (let ((messages
+         (pi-coding-agent-large-output-bench--activity-history
+          turn-count tools-per-turn payload-size))
+        replay
+        expand
+        live-end
+        metrics)
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (setq-local pi-coding-agent--tool-activity-display 'grouped)
+      (garbage-collect)
+      (setq replay
+            (benchmark-run
+              1
+              (pi-coding-agent--display-session-history
+               messages (current-buffer))))
+      (goto-char (point-min))
+      (search-forward "Tools")
+      (goto-char (match-beginning 0))
+      (garbage-collect)
+      (setq expand
+            (benchmark-run 1
+              (pi-coding-agent-toggle-tool-section)))
+      (goto-char (point-max))
+      (pi-coding-agent--display-user-message "live benchmark")
+      (pi-coding-agent--handle-display-event
+       '(:type "tool_execution_start" :toolCallId "live-tool"
+         :toolName "bash" :args (:command "synthetic")))
+      (garbage-collect)
+      (setq live-end
+            (benchmark-run
+              1
+              (pi-coding-agent--handle-display-event
+               '(:type "tool_execution_end" :toolCallId "live-tool"
+                 :toolName "bash"
+                 :result (:content [(:type "text" :text "done")])
+                 :isError nil))))
+      (setq metrics
+            (list :kind 'grouped-tool-activity
+                  :turns turn-count
+                  :tools (* turn-count tools-per-turn)
+                  :payload-bytes payload-size
+                  :replay-seconds (nth 0 replay)
+                  :replay-gc-count (nth 1 replay)
+                  :replay-gc-seconds (nth 2 replay)
+                  :expand-seconds (nth 0 expand)
+                  :expand-gc-count (nth 1 expand)
+                  :live-end-seconds (nth 0 live-end)
+                  :live-end-gc-count (nth 1 live-end)
+                  :buffer-bytes (buffer-size)
+                  :activity-records
+                  (hash-table-count pi-coding-agent--activity-table)
+                  :tool-overlays
+                  (seq-count
+                   (lambda (overlay)
+                     (overlay-get overlay 'pi-coding-agent-tool-block))
+                   (overlays-in (point-min) (point-max))))))
+    (prin1 metrics)
+    (terpri)
+    metrics))
+
+;;;###autoload
+(defun pi-coding-agent-large-output-bench-run-tool-activity ()
+  "Run repeatable grouped activity history benchmarks."
+  (dolist (case '((50 2 4096)
+                  (500 2 4096)))
+    (apply #'pi-coding-agent-large-output-bench--activity-case case)))
+
 ;;;###autoload
 (defun pi-coding-agent-large-output-bench-run ()
   "Run the synthetic large-output benchmark matrix."

@@ -1005,8 +1005,9 @@ because it inserts at the end, while a full rewrite would lose it."
       (pi-coding-agent--display-thinking-delta "Second thought.")
       (pi-coding-agent--display-thinking-end "")
       (let ((text (buffer-string)))
-        ;; The > must start on its own line, separated by blank line from text
-        (should (string-match-p "my answer\\.\n\n> Second thought\\." text))
+        ;; The disclosure and > must start on their own lines after the text.
+        (should (string-match-p
+                 "my answer\\.\n\n▾ Think\n> Second thought\\." text))
         ;; The > must NOT be glued to the text
         (should-not (string-match-p "my answer\\.>" text))))))
 

@@ -409,11 +409,11 @@ single tool call helper."
 
 (ert-deftest pi-coding-agent-test-transcript-thinking-stub-previews-first-line ()
   "Collapsed thinking previews its first non-empty line."
-  (should (equal "Think \u00b7 first line"
+  (should (equal "▸ Think · first line"
                  (pi-coding-agent--thinking-hidden-stub "\n\n  first line\nsecond")))
-  (should (equal "Think \u00b7 only"
+  (should (equal "▸ Think · only"
                  (pi-coding-agent--thinking-hidden-stub "only")))
-  (should (equal "Think"
+  (should (equal "▸ Think"
                  (pi-coding-agent--thinking-hidden-stub "\n\n"))))
 
 (ert-deftest pi-coding-agent-test-transcript-thinking-stub-obeys-column-budget ()
@@ -421,15 +421,16 @@ single tool call helper."
   (dolist (text (list (make-string 200 ?x)
                       (make-string 200 ?漢)))
     (let* ((stub (pi-coding-agent--thinking-hidden-stub text))
-           (preview (string-trim (substring stub (length "Think \u00b7 ")))))
+           (preview (string-trim (substring stub (length "▸ Think · ")))))
       (should (string-suffix-p "\u2026" preview))
       (should (<= (string-width preview)
-                  pi-coding-agent--single-line-preview-columns)))))
+                  (- pi-coding-agent--single-line-preview-columns
+                     (string-width "▸ Think · ")))))))
 
 (ert-deftest pi-coding-agent-test-transcript-thinking-stub-ignores-obsolete-option ()
   "The obsolete preview option no longer changes the stub."
   (let ((pi-coding-agent-thinking-hidden-preview nil))
-    (should (equal "Think \u00b7 keep previewing"
+    (should (equal "▸ Think · keep previewing"
                    (pi-coding-agent--thinking-hidden-stub "keep previewing")))))
 
 ;;;; 1.11 Whole-line summary button
