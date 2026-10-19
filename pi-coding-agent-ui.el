@@ -568,11 +568,6 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   "Face for tool output text."
   :group 'pi-coding-agent)
 
-(defface pi-coding-agent-activity-group
-  '((t :inherit default :extend t))
-  "Face for a turn-level tool activity row."
-  :group 'pi-coding-agent)
-
 (defface pi-coding-agent-activity-label
   '((t :inherit font-lock-keyword-face :weight semi-bold))
   "Face for activity disclosure cues and type labels."
@@ -718,17 +713,6 @@ falling back to INDICATOR-FACE when needed."
        :background
        (pi-coding-agent--blend-color bg tint amount)))))
 
-(defun pi-coding-agent--update-activity-group-face ()
-  "Set the activity group background from the active theme."
-  (when-let* ((background
-               (pi-coding-agent--theme-face-background 'default))
-              (foreground
-               (or (pi-coding-agent--theme-face-foreground 'shadow)
-                   (pi-coding-agent--theme-face-foreground 'default))))
-    (pi-coding-agent--set-face-background-only
-     'pi-coding-agent-activity-group
-     (pi-coding-agent--blend-color background foreground 0.06))))
-
 (defun pi-coding-agent--update-tool-block-error-face ()
   "Set `pi-coding-agent-tool-block-error' background from theme."
   (pi-coding-agent--set-face-background-only
@@ -751,8 +735,7 @@ falling back to INDICATOR-FACE when needed."
   "Set internal faces derived from the current theme.
 Updates tool blocks plus edit-diff overlays.  Called from mode setup and
 on theme changes."
-  (dolist (update '(pi-coding-agent--update-activity-group-face
-                    pi-coding-agent--update-tool-block-face
+  (dolist (update '(pi-coding-agent--update-tool-block-face
                     pi-coding-agent--update-tool-block-error-face
                     pi-coding-agent--update-edit-diff-faces))
     (condition-case-unless-debug nil

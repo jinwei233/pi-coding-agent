@@ -236,6 +236,8 @@ is hidden, and TIMESTAMP reaches the user only through the marker's
 `help-echo'."
   (let ((start (with-current-buffer (pi-coding-agent--get-chat-buffer) (point-max))))
     (with-current-buffer (pi-coding-agent--get-chat-buffer)
+      (when (pi-coding-agent--history-postprocessing-deferred-p)
+        (pi-coding-agent--activity-flush-history-record))
       (pi-coding-agent--activity-begin-turn)
       (pi-coding-agent--insert-turn-heading "You" timestamp)
       (pi-coding-agent--insert-user-turn-marker timestamp)
@@ -1774,6 +1776,7 @@ which asks upfront before any buffers are touched."
              (plist-get response :stderr)
              (plist-get response :exitCode))
             (process-put process 'pi-coding-agent-exit-error-rendered t))
+        (pi-coding-agent--activity-interrupt-live-turn)
         (pi-coding-agent--set-process nil)
         (pi-coding-agent--set-activity-phase "idle")
         (setq pi-coding-agent--local-user-message nil)
@@ -2488,6 +2491,8 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   "Major mode for a lazily rendered Pi tool detail."
   (setq-local buffer-read-only t)
   (define-key pi-coding-agent-tool-detail-mode-map
+              (kbd "RET") #'pi-coding-agent-visit-file)
+  (define-key pi-coding-agent-tool-detail-mode-map
               (kbd "q") #'pi-coding-agent--quit-tool-detail-buffer))
 
 (defun pi-coding-agent--quit-tool-detail-buffer ()
@@ -2525,6 +2530,11 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
     (unless pair
       (user-error "Tool detail unavailable for %s: pair not found" tool-call-id))
     (let* ((owner (current-buffer))
+           (tool
+            (when-let* ((record
+                         (pi-coding-agent--activity-record-for-tool
+                          tool-call-id)))
+              (pi-coding-agent--activity-tool record tool-call-id)))
            (existing (and pi-coding-agent--tool-detail-buffers
                           (gethash tool-call-id
                                    pi-coding-agent--tool-detail-buffers)))
@@ -2543,6 +2553,9 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
         (let ((inhibit-read-only t))
           (erase-buffer)
           (insert (or detail ""))
+          (when tool
+            (pi-coding-agent--activity-propertize-detail-lines
+             (point-min) (point-max) tool))
           (goto-char (point-min))
           (pi-coding-agent-tool-detail-mode)
           (setq-local pi-coding-agent--detail-owner owner)
@@ -3336,6 +3349,7 @@ if none exists, render the result at point without a live overlay."
   turn-id
   start-marker
   end-marker
+  history-dirty
   expanded
   live
   detail-tool-call-id
@@ -3368,6 +3382,11 @@ The former `hidden' value is a compatibility alias for `grouped'."
     (setq pi-coding-agent--tool-activity-index
           (make-hash-table :test 'equal))))
 
+(defun pi-coding-agent--initialize-history-activity ()
+  "Initialize grouped activity once for the current history replay."
+  (pi-coding-agent--ensure-activity-state)
+  (cl-incf pi-coding-agent--history-activity-initializations))
+
 (defun pi-coding-agent--activity-begin-turn ()
   "Allocate and select the next stable activity turn identity."
   (pi-coding-agent--ensure-activity-state)
@@ -3389,6 +3408,7 @@ The former `hidden' value is a compatibility alias for `grouped'."
         (let ((record
                (pi-coding-agent--make-activity-record
                 :turn-id turn-id
+                :history-dirty nil
                 :expanded nil
                 :live nil
                 :detail-tool-call-id nil
@@ -3533,17 +3553,20 @@ canonical or transient pair storage; IS-ERROR records completion status."
     ;; record keeps only the detail locator; canonical/transient data owns
     ;; the complete result.
     (setq summary-record (plist-put summary-record :images nil))
-    (append
-     (list :status (if (eq is-error t) 'failed 'succeeded)
-           :target (pi-coding-agent--tool-activity-target-label summary-record)
-           :raw-path (plist-get path-metadata :raw-path)
-           :path-error (plist-get path-metadata :path-error)
-           :added (if (stringp written)
-                      (pi-coding-agent--tool-text-line-count written)
-                    (car diff-counts))
-           :removed (cdr diff-counts)
-           :test-status (pi-coding-agent--activity-test-status details))
-     summary-record)))
+    (let ((record
+           (append
+            (list :status (if (eq is-error t) 'failed 'succeeded)
+                  :path (plist-get path-metadata :path)
+                  :raw-path (plist-get path-metadata :raw-path)
+                  :path-error (plist-get path-metadata :path-error)
+                  :added (if (stringp written)
+                             (pi-coding-agent--tool-text-line-count written)
+                           (car diff-counts))
+                  :removed (cdr diff-counts)
+                  :test-status (pi-coding-agent--activity-test-status details))
+            summary-record)))
+      (plist-put record :target
+                 (pi-coding-agent--tool-activity-target-label record)))))
 
 (defun pi-coding-agent--activity-running-tool-record
     (tool-call-id tool-name args)
@@ -3599,6 +3622,10 @@ canonical or transient pair storage; IS-ERROR records completion status."
       (push (propertize (format "%d failed" failed)
                         'font-lock-face 'pi-coding-agent-activity-failed)
             parts))
+    (when (eq tests 'failed)
+      (push (propertize "tests failed"
+                        'font-lock-face 'pi-coding-agent-activity-failed)
+            parts))
     (when (> files 0)
       (push (propertize (format "%d file%s" files (if (= files 1) "" "s"))
                         'font-lock-face 'pi-coding-agent-activity-summary)
@@ -3615,10 +3642,6 @@ canonical or transient pair storage; IS-ERROR records completion status."
                 counts))
         (push (string-join (nreverse counts) " ") parts)))
     (pcase tests
-      ('failed
-       (push (propertize "tests failed"
-                         'font-lock-face 'pi-coding-agent-activity-failed)
-             parts))
       ('passed
        (push (propertize "tests passed"
                          'font-lock-face 'success)
@@ -3635,10 +3658,10 @@ canonical or transient pair storage; IS-ERROR records completion status."
 
 (defun pi-coding-agent--activity-line-budget ()
   "Return a conservative display-column budget for an activity row."
-  (max 24
+  (max 1
        (min pi-coding-agent--single-line-preview-columns
             (if-let* ((window (get-buffer-window (current-buffer) t)))
-                (max 24 (- (window-body-width window) 2))
+                (max 1 (- (window-body-width window) 2))
               pi-coding-agent--single-line-preview-columns))))
 
 (defun pi-coding-agent--activity-group-text (record)
@@ -3664,11 +3687,13 @@ canonical or transient pair storage; IS-ERROR records completion status."
             (pi-coding-agent--activity-summary-parts record)))
          (budget (pi-coding-agent--activity-line-budget))
          (result prefix))
-    (dolist (part parts)
-      (let ((candidate (concat result " · " part)))
-        (when (<= (string-width candidate) budget)
-          (setq result candidate))))
-    result))
+    (catch 'full
+      (dolist (part parts)
+        (let ((candidate (concat result " · " part)))
+          (if (<= (string-width candidate) budget)
+              (setq result candidate)
+            (throw 'full nil)))))
+    (truncate-string-to-width result budget nil nil "…")))
 
 (defun pi-coding-agent--activity-tool-line (tool)
   "Return the one-line display text for lightweight TOOL."
@@ -3723,6 +3748,40 @@ canonical or transient pair storage; IS-ERROR records completion status."
      pi-coding-agent-activity-kind ,kind
      pi-coding-agent-activity-tool-call-id ,tool-call-id)))
 
+(defun pi-coding-agent--activity-detail-line (tool text row)
+  "Return TOOL's authoritative file line for detail TEXT at zero-based ROW."
+  (pcase (plist-get tool :tool-name)
+    ("read" (+ (or (plist-get tool :offset) 1) row))
+    ("write" (1+ row))
+    ("edit"
+     (when (string-match
+            "\\`[ +-] *\\([1-9][0-9]*\\)\\(?:[ \t]+\\|\\'\\)" text)
+       (string-to-number (match-string 1 text))))))
+
+(defun pi-coding-agent--activity-propertize-detail-lines
+    (start end tool &optional indentation)
+  "Attach TOOL navigation metadata to detail lines from START to END.
+INDENTATION is the number of display-only prefix characters inserted before
+each source line."
+  (let ((row 0)
+        (indentation (or indentation 0)))
+    (save-excursion
+      (goto-char start)
+      (while (< (point) end)
+        (let* ((line-start (min end (+ (line-beginning-position) indentation)))
+               (line-end (min end (line-end-position)))
+               (text (buffer-substring-no-properties line-start line-end))
+               (line (pi-coding-agent--activity-detail-line tool text row)))
+          (add-text-properties
+           (line-beginning-position) (min end (1+ (line-end-position)))
+           `(pi-coding-agent-activity-detail-owned t
+             pi-coding-agent-tool-path ,(plist-get tool :path)
+             pi-coding-agent-tool-raw-path ,(plist-get tool :raw-path)
+             pi-coding-agent-tool-path-error ,(plist-get tool :path-error)
+             pi-coding-agent-tool-line ,line))
+          (setq row (1+ row))
+          (forward-line 1))))))
+
 (defun pi-coding-agent--activity-insert-detail (record tool)
   "Insert expanded detail for TOOL in activity RECORD."
   (when-let* ((pair (pi-coding-agent--resolve-tool-detail-pair
@@ -3740,7 +3799,9 @@ canonical or transient pair storage; IS-ERROR records completion status."
        start (point)
        (pi-coding-agent--activity-record-turn-id record)
        (plist-get tool :tool-call-id)
-       'detail))))
+       'detail)
+      (pi-coding-agent--activity-propertize-detail-lines
+       start (point) tool 4))))
 
 (defun pi-coding-agent--activity-render-record (record)
   "Render activity RECORD by rewriting only its own projection region."
@@ -3813,7 +3874,8 @@ canonical or transient pair storage; IS-ERROR records completion status."
     (and (markerp start)
          (marker-position start)
          (markerp end)
-         (marker-position end))))
+         (marker-position end)
+         (< (marker-position start) (marker-position end)))))
 
 (defun pi-coding-agent--activity-render-live-update (record)
   "Render RECORD when its current live projection needs visible refresh.
@@ -3823,22 +3885,55 @@ Expanded groups continue to refresh their per-tool rows."
             (not (pi-coding-agent--activity-record-rendered-p record)))
     (pi-coding-agent--activity-render-record record)))
 
+(defun pi-coding-agent--activity-stage-history-record (record)
+  "Mark history RECORD dirty and retain its first source-order position."
+  (unless (pi-coding-agent--activity-record-start-marker record)
+    (save-excursion
+      (goto-char (point-max))
+      (pi-coding-agent--ensure-blank-line-before-block)
+      (let ((position (point)))
+        (setf (pi-coding-agent--activity-record-start-marker record)
+              (copy-marker position nil)
+              (pi-coding-agent--activity-record-end-marker record)
+              (copy-marker position nil)))))
+  (setf (pi-coding-agent--activity-record-history-dirty record) t))
+
+(defun pi-coding-agent--activity-flush-history-record (&optional record)
+  "Render dirty history RECORD once, defaulting to the current turn."
+  (let ((record
+         (or record
+             (and pi-coding-agent--current-activity-turn
+                  (pi-coding-agent--activity-record-for-turn
+                   pi-coding-agent--current-activity-turn)))))
+    (when (and record
+               (pi-coding-agent--activity-record-history-dirty record))
+      (setf (pi-coding-agent--activity-record-history-dirty record) nil)
+      (pi-coding-agent--activity-render-record record))))
+
 (defun pi-coding-agent--activity-start-tool
     (tool-call-id tool-name args &optional live)
   "Add or update grouped TOOL-CALL-ID with TOOL-NAME and ARGS.
 When LIVE is non-nil, keep a folded projection stable until agent end."
   (when (pi-coding-agent--tool-activity-grouped-mode-p)
     (let* ((turn-id (pi-coding-agent--activity-current-turn))
-           (record (pi-coding-agent--activity-record-for-turn turn-id t)))
+           (record (pi-coding-agent--activity-record-for-turn turn-id t))
+           (was-live (pi-coding-agent--activity-record-live record)))
       (when live
         (setf (pi-coding-agent--activity-record-live record) t))
       (pi-coding-agent--activity-put-tool
        record
        (pi-coding-agent--activity-running-tool-record
         tool-call-id tool-name args))
-      (if live
-          (pi-coding-agent--activity-render-live-update record)
-        (pi-coding-agent--activity-render-record record))
+      (cond
+       ((and (not live) (pi-coding-agent--history-postprocessing-deferred-p))
+        (pi-coding-agent--activity-stage-history-record record))
+       (live
+        (if (and (not was-live)
+                 (pi-coding-agent--activity-record-rendered-p record))
+            (pi-coding-agent--activity-render-record record)
+          (pi-coding-agent--activity-render-live-update record)))
+       (t
+        (pi-coding-agent--activity-render-record record)))
       record)))
 
 (defun pi-coding-agent--activity-finish-tool
@@ -3856,9 +3951,13 @@ keep a folded projection stable until agent end."
     (when live
       (setf (pi-coding-agent--activity-record-live record) t))
     (pi-coding-agent--activity-put-tool record tool)
-    (if live
-        (pi-coding-agent--activity-render-live-update record)
-      (pi-coding-agent--activity-render-record record))
+    (cond
+     ((and (not live) (pi-coding-agent--history-postprocessing-deferred-p))
+      (pi-coding-agent--activity-stage-history-record record))
+     (live
+      (pi-coding-agent--activity-render-live-update record))
+     (t
+      (pi-coding-agent--activity-render-record record)))
     record))
 
 (defun pi-coding-agent--activity-finalize-live-turn ()
@@ -3871,6 +3970,24 @@ keep a folded projection stable until agent end."
       (when (pi-coding-agent--activity-record-live record)
         (setf (pi-coding-agent--activity-record-live record) nil)
         (pi-coding-agent--activity-render-record record)))))
+
+(defun pi-coding-agent--activity-interrupt-live-turn ()
+  "Settle running tools in the current live turn after process exit."
+  (when (and (pi-coding-agent--tool-activity-grouped-mode-p)
+             pi-coding-agent--current-activity-turn)
+    (when-let* ((record
+                 (pi-coding-agent--activity-record-for-turn
+                  pi-coding-agent--current-activity-turn))
+                ((pi-coding-agent--activity-record-live record)))
+      (dolist (tool (copy-sequence
+                     (pi-coding-agent--activity-record-tools record)))
+        (when (eq (plist-get tool :status) 'running)
+          (let ((settled (copy-sequence tool)))
+            (setq settled (plist-put settled :status 'failed)
+                  settled (plist-put settled :summary "interrupted"))
+            (pi-coding-agent--activity-put-tool record settled))))
+      (setf (pi-coding-agent--activity-record-live record) nil)
+      (pi-coding-agent--activity-render-record record))))
 
 (defun pi-coding-agent--activity-record-at-point ()
   "Return the grouped activity record at point."
@@ -3928,14 +4045,18 @@ keep a folded projection stable until agent end."
 
 (defun pi-coding-agent--activity-visit-tool (tool)
   "Visit TOOL's authoritative file target, or open its detail."
-  (if-let* ((path (plist-get tool :path)))
-      (pi-coding-agent--visit-file-target
-       (list :source :tool
-             :emacs-path path
-             :line (or (plist-get tool :offset) 1))
-       current-prefix-arg)
+  (cond
+   ((plist-get tool :path)
+    (pi-coding-agent--visit-file-target
+     (list :source :tool
+           :emacs-path (plist-get tool :path)
+           :line (or (plist-get tool :offset) 1))
+     current-prefix-arg))
+   ((plist-get tool :path-error)
+    (user-error "%s" (plist-get tool :path-error)))
+   (t
     (pi-coding-agent--open-tool-detail-buffer
-     (plist-get tool :tool-call-id))))
+     (plist-get tool :tool-call-id)))))
 
 (defun pi-coding-agent--activity-tool-button-action (button)
   "Run the primary action for grouped activity BUTTON."
@@ -3985,9 +4106,7 @@ keep a folded projection stable until agent end."
 
 (defun pi-coding-agent--tool-activity-hidden-mode-p ()
   "Return non-nil when completed tool activity is hidden until revealed."
-  (eq (or pi-coding-agent--tool-activity-display
-          pi-coding-agent-tool-activity-display)
-      'hidden))
+  (eq (pi-coding-agent--tool-activity-mode) 'hidden))
 
 (defun pi-coding-agent--tool-activity-turn-ordinal (&optional position headings)
   "Return the 0-based user turn ordinal containing POSITION.
@@ -6926,6 +7045,36 @@ returns nil."
    (cons (overlay-start overlay) (overlay-end overlay))
    (lambda () (pi-coding-agent--tool-line-at-point overlay))))
 
+(defun pi-coding-agent--activity-detail-file-target-at-point ()
+  "Return the authoritative grouped-detail file target at point, or nil."
+  (let* ((position
+          (if (get-text-property
+               (point) 'pi-coding-agent-activity-detail-owned)
+              (point)
+            (and (> (point) (point-min)) (1- (point)))))
+         (owned
+          (and position
+               (get-text-property
+                position 'pi-coding-agent-activity-detail-owned))))
+    (when owned
+      (let ((path (get-text-property position 'pi-coding-agent-tool-path))
+            (raw (get-text-property
+                  position 'pi-coding-agent-tool-raw-path))
+            (path-error
+             (get-text-property
+              position 'pi-coding-agent-tool-path-error))
+            (line (get-text-property position 'pi-coding-agent-tool-line)))
+        (cond
+         (path
+          (save-excursion
+            (goto-char position)
+            (pi-coding-agent--make-file-target
+             :tool (or raw path) path
+             :line line
+             :bounds (cons (line-beginning-position) (line-end-position)))))
+         (path-error
+          (user-error "%s" path-error)))))))
+
 (defun pi-coding-agent--cold-tool-block-at-point ()
   "Return authoritative cold-tool metadata and physical bounds at point.
 Return nil outside a cold tool.  Any chat restriction is restored exactly."
@@ -6979,16 +7128,24 @@ Resolution priority is authoritative hot/cold tool metadata, semantic Markdown
 link ownership, then strict visible text.  Invalid or absent tool metadata never
 falls through.  Semantic lookup is explicitly tri-state, so an owned non-file,
 reference, or malformed link also never falls through to a path-like label."
-  (if-let* ((overlay (pi-coding-agent--tool-overlay-at-point)))
-      (pi-coding-agent--tool-file-target overlay)
-    (if-let* ((cold-block (pi-coding-agent--cold-tool-block-at-point)))
-        (pi-coding-agent--cold-tool-file-target cold-block)
-      (pcase (pi-coding-agent--semantic-link-file-target-at-point)
-        (`(:status :owned-valid :target ,target) target)
-        (`(:status :owned-invalid) nil)
-        (`(:status :not-a-link . ,properties)
-         (pi-coding-agent--text-file-target-at-point
-          (plist-get properties :markdown-code-span)))))))
+  (let ((detail-owned
+         (or (get-text-property
+              (point) 'pi-coding-agent-activity-detail-owned)
+             (and (> (point) (point-min))
+                  (get-text-property
+                   (1- (point)) 'pi-coding-agent-activity-detail-owned)))))
+    (if detail-owned
+        (pi-coding-agent--activity-detail-file-target-at-point)
+      (if-let* ((overlay (pi-coding-agent--tool-overlay-at-point)))
+          (pi-coding-agent--tool-file-target overlay)
+        (if-let* ((cold-block (pi-coding-agent--cold-tool-block-at-point)))
+            (pi-coding-agent--cold-tool-file-target cold-block)
+          (pcase (pi-coding-agent--semantic-link-file-target-at-point)
+            (`(:status :owned-valid :target ,target) target)
+            (`(:status :owned-invalid) nil)
+            (`(:status :not-a-link . ,properties)
+             (pi-coding-agent--text-file-target-at-point
+              (plist-get properties :markdown-code-span)))))))))
 
 (defconst pi-coding-agent--shell-execution-buffer-variables
   '(process-environment exec-path shell-file-name shell-command-switch
@@ -7949,12 +8106,13 @@ Tool calls are rendered with headers, output, overlays, and toggles."
   (let ((inhibit-read-only t))
     (pi-coding-agent--clear-render-artifacts)
     (when (pi-coding-agent--tool-activity-grouped-mode-p)
-      (setq pi-coding-agent--history-activity-initializations 1))
+      (pi-coding-agent--initialize-history-activity))
     (erase-buffer)
     (insert (pi-coding-agent--format-startup-header) "\n")))
 
 (defun pi-coding-agent--finish-session-history-display ()
   "Finalize a complete history replay in the current chat buffer."
+  (pi-coding-agent--activity-flush-history-record)
   (goto-char (point-max))
   (unless (bolp)
     (insert "\n"))

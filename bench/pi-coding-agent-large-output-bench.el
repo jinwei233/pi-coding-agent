@@ -647,7 +647,8 @@ Each read, edit, and bash result carries a deterministic PAYLOAD-SIZE body."
 (defun pi-coding-agent-large-output-bench-run-tool-activity ()
   "Run repeatable grouped activity history benchmarks."
   (dolist (case '((50 2 4096)
-                  (500 2 4096)))
+                  (500 2 4096)
+                  (1 3 1048576)))
     (apply #'pi-coding-agent-large-output-bench--activity-case case)))
 
 ;;;###autoload

@@ -340,13 +340,28 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
       (should (= 0 overlays)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-history-initializes-once ()
-  "A replay performs one grouped activity initialization."
+  "A replay initializes once and renders each turn only once."
   (pi-coding-agent-tool-activity-test--with-chat
-    (pi-coding-agent-tool-activity-test--render-history
-     '(("bash" (:command "one") "ok")
-       ("bash" (:command "two") "ok"))
-     '(("bash" (:command "three") "ok")))
-    (should (= 1 pi-coding-agent--history-activity-initializations))))
+    (let ((initialize
+           (symbol-function 'pi-coding-agent--initialize-history-activity))
+          (render (symbol-function 'pi-coding-agent--activity-render-record))
+          (initializations 0)
+          (renders 0))
+      (cl-letf (((symbol-function 'pi-coding-agent--initialize-history-activity)
+                 (lambda ()
+                   (setq initializations (1+ initializations))
+                   (funcall initialize)))
+                ((symbol-function 'pi-coding-agent--activity-render-record)
+                 (lambda (record)
+                   (setq renders (1+ renders))
+                   (funcall render record))))
+        (pi-coding-agent-tool-activity-test--render-history
+         '(("bash" (:command "one") "ok")
+           ("bash" (:command "two") "ok"))
+         '(("bash" (:command "three") "ok"))))
+      (should (= 1 initializations))
+      (should (= 1 pi-coding-agent--history-activity-initializations))
+      (should (= 2 renders)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-summary-fallback ()
   "Summary mode keeps the established per-tool presentation."
@@ -364,7 +379,156 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   "The old hidden value maps to grouped for one compatibility cycle."
   (pi-coding-agent-tool-activity-test--with-chat
     (setq-local pi-coding-agent--tool-activity-display 'hidden)
-    (should (eq 'grouped (pi-coding-agent--tool-activity-mode)))))
+    (should (eq 'grouped (pi-coding-agent--tool-activity-mode)))
+    (should-not (pi-coding-agent--tool-activity-hidden-mode-p))
+    (pi-coding-agent-tool-activity-test--render-history
+     '(("bash" (:command "one") "ok")))
+    (let ((headings 0)
+          (property-scans 0))
+      (cl-letf (((symbol-function 'pi-coding-agent--collect-you-headings)
+                 (lambda (&rest _) (setq headings (1+ headings)) nil))
+                ((symbol-function 'next-single-char-property-change)
+                 (lambda (&rest _)
+                   (setq property-scans (1+ property-scans))
+                   (point-max)))
+                ((symbol-function 'outline-cycle) #'ignore))
+        (pi-coding-agent-tool-activity-test--goto "turn 1")
+        (pi-coding-agent-toggle-tool-section))
+      (should (= 0 headings))
+      (should (= 0 property-scans)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-completed-path-is-normalized ()
+  "Completed grouped records retain normalized and raw path metadata."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent-tool-activity-test--render-history
+     '(("read" (:path "lisp/a.el" :offset 3) "line")))
+    (let* ((record (gethash 0 pi-coding-agent--activity-table))
+           (tool (car (pi-coding-agent--activity-record-tools record))))
+      (should (equal "/tmp/pi-tool-activity/lisp/a.el"
+                     (plist-get tool :path)))
+      (should (equal "lisp/a.el" (plist-get tool :raw-path))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-nonfile-ret-opens-detail ()
+  "RET on a non-file tool row opens complete detail."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent-tool-activity-test--render-history
+     '(("bash" (:command "make test") "ok")))
+    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent--dispatch-button (point) nil t)
+    (let (opened)
+      (cl-letf (((symbol-function 'pi-coding-agent--open-tool-detail-buffer)
+                 (lambda (tool-call-id) (setq opened tool-call-id))))
+        (pi-coding-agent-tool-activity-test--goto "    bash")
+        (pi-coding-agent--dispatch-button (point) nil t))
+      (should (equal "call-1" opened)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-inline-detail-navigation ()
+  "Expanded read detail rows retain exact physical line navigation."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent-tool-activity-test--render-history
+     '(("read" (:path "lisp/a.el" :offset 7) "alpha\nbeta")))
+    (pi-coding-agent-tool-activity-test--goto "Tools")
+    (pi-coding-agent-toggle-tool-section)
+    (pi-coding-agent-tool-activity-test--goto "    read")
+    (pi-coding-agent-toggle-tool-section)
+    (pi-coding-agent-tool-activity-test--goto "    beta")
+    (let ((target (pi-coding-agent--file-target-at-point)))
+      (should (equal "/tmp/pi-tool-activity/lisp/a.el"
+                     (plist-get target :emacs-path)))
+      (should (= 8 (plist-get target :line))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-external-detail-navigation ()
+  "Large detail buffers retain exact file navigation metadata."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent-tool-activity-test--render-history
+     '(("write" (:path "lisp/a.el" :content "one\ntwo") "done")))
+    (let (detail-buffer)
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _) (setq detail-buffer buffer))))
+        (pi-coding-agent--open-tool-detail-buffer "call-1"))
+      (unwind-protect
+          (with-current-buffer detail-buffer
+            (should (eq #'pi-coding-agent-visit-file
+                        (key-binding (kbd "RET"))))
+            (goto-char (point-min))
+            (forward-line 1)
+            (let ((target (pi-coding-agent--file-target-at-point)))
+              (should (equal "/tmp/pi-tool-activity/lisp/a.el"
+                             (plist-get target :emacs-path)))
+              (should (= 2 (plist-get target :line)))))
+        (when (buffer-live-p detail-buffer)
+          (kill-buffer detail-buffer))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-history-multiple-calls-one-message ()
+  "Multiple toolCall blocks in one assistant message preserve source order."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent--display-session-history
+     (vector
+      '(:role "user" :content "run")
+      '(:role "assistant"
+        :content [(:type "toolCall" :id "c1" :name "bash"
+                   :arguments (:command "one"))
+                  (:type "toolCall" :id "c2" :name "bash"
+                   :arguments (:command "two"))])
+      '(:role "toolResult" :toolCallId "c1" :toolName "bash"
+        :content [(:type "text" :text "one")] :isError nil)
+      '(:role "toolResult" :toolCallId "c2" :toolName "bash"
+        :content [(:type "text" :text "two")] :isError nil))
+     (current-buffer))
+    (let* ((record (gethash 0 pi-coding-agent--activity-table))
+           (ids (mapcar
+                 (lambda (tool) (plist-get tool :tool-call-id))
+                 (pi-coding-agent--activity-record-tools record))))
+      (should (equal '("c1" "c2") ids)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-retry-restores-working ()
+  "A retry after agent end immediately restores the stable working row."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent--display-user-message "run")
+    (pi-coding-agent-tool-activity-test--render-tool
+     "c1" "bash" '(:command "one") "ok")
+    (pi-coding-agent--handle-display-event '(:type "agent_end"))
+    (should-not (string-match-p
+                 "working" (pi-coding-agent-tool-activity-test--visible)))
+    (pi-coding-agent--handle-display-event
+     '(:type "tool_execution_start" :toolCallId "c2"
+       :toolName "bash" :args (:command "two")))
+    (should (string-match-p
+             "Tools · working"
+             (pi-coding-agent-tool-activity-test--visible)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-process-exit-settles-working ()
+  "An interrupted live turn converges to a failed final summary."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent--display-user-message "run")
+    (pi-coding-agent--handle-display-event
+     '(:type "tool_execution_start" :toolCallId "c1"
+       :toolName "bash" :args (:command "one")))
+    (pi-coding-agent--activity-interrupt-live-turn)
+    (let ((visible (pi-coding-agent-tool-activity-test--visible)))
+      (should-not (string-match-p "working" visible))
+      (should (string-match-p "1 failed" visible)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-priority-and-tiny-budget ()
+  "Summary omission is priority ordered and never exceeds tiny windows."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (pi-coding-agent--display-user-message "run")
+    (pi-coding-agent-tool-activity-test--render-tool
+     "c1" "edit" '(:path "a.el") "done"
+     '(:diff "+ 1 new" :testStatus "failed"))
+    (pi-coding-agent--activity-finalize-live-turn)
+    (let ((record (gethash 0 pi-coding-agent--activity-table)))
+      (cl-letf (((symbol-function 'pi-coding-agent--activity-line-budget)
+                 (lambda () 22)))
+        (let ((text (substring-no-properties
+                     (pi-coding-agent--activity-group-text record))))
+          (should (string-match-p "tests failed" text))
+          (should-not (string-match-p "calls" text))))
+      (cl-letf (((symbol-function 'pi-coding-agent--activity-line-budget)
+                 (lambda () 4)))
+        (should (<= (string-width
+                     (pi-coding-agent--activity-group-text record))
+                    4))))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-clear-releases-markers ()
   "Render teardown clears activity records and marker ownership."

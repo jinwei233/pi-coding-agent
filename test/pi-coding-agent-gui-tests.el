@@ -582,7 +582,7 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
 ;;;; Grouped Activity Tests
 
 (ert-deftest pi-coding-agent-gui-test-grouped-activity-narrow-themes ()
-  "Grouped activity stays one line with a subtle face in light and dark themes."
+  "Grouped activity stays one line without button styling across themes."
   (let ((buffer (get-buffer-create "*pi-gui-grouped-activity*"))
         (original-themes custom-enabled-themes))
     (unwind-protect
@@ -614,19 +614,11 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
             (let ((group-pos (match-beginning 0))
                   (line
                    (buffer-substring-no-properties
-                    (line-beginning-position) (line-end-position)))
-                  (background
-                   (face-background
-                    'pi-coding-agent-activity-group nil t)))
+                    (line-beginning-position) (line-end-position))))
               (should (<= (string-width line)
                           pi-coding-agent--single-line-preview-columns))
-              (should (color-defined-p background))
               (goto-char group-pos)
-              (should-not (memq 'button (face-at-point nil t)))
-              (should-not
-               (eq t
-                   (face-attribute
-                    'pi-coding-agent-activity-group :underline nil t))))))
+              (should-not (memq 'button (face-at-point nil t))))))
       (mapc #'disable-theme custom-enabled-themes)
       (mapc (lambda (theme) (load-theme theme t)) original-themes)
       (when (buffer-live-p buffer)
