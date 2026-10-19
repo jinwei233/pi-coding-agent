@@ -611,7 +611,8 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
             (redisplay t)
             (goto-char (point-min))
             (search-forward "Tools")
-            (let ((line
+            (let ((group-pos (match-beginning 0))
+                  (line
                    (buffer-substring-no-properties
                     (line-beginning-position) (line-end-position)))
                   (background
@@ -620,6 +621,8 @@ chat-mode buffer to isolate the toggle logic from RPC timing."
               (should (<= (string-width line)
                           pi-coding-agent--single-line-preview-columns))
               (should (color-defined-p background))
+              (goto-char group-pos)
+              (should-not (memq 'button (face-at-point nil t)))
               (should-not
                (eq t
                    (face-attribute

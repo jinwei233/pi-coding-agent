@@ -183,7 +183,7 @@ traditional Emacs fallbacks.
 
 The chat buffer is rendered as Markdown and uses tree-sitter for
 syntax highlighting code blocks and diffs.  Turn boundaries stay quiet:
-a user turn starts with a single =❯= line, and the structural
+a user turn starts with =❯= beside its first line, and the structural
 =You=/=Assistant= headings, their underlines and the message timestamps
 remain in the buffer for navigation but are not displayed.  The
 timestamp of a user turn is available through the marker's tooltip
@@ -198,7 +198,8 @@ Completed tool calls use one folded activity row per user turn when
 =pi-coding-agent-tool-activity-display= is =grouped=:
 =▸ Tools · 1 file · +4 -1 · tests passed · 7 calls=.  Results outrank call
 counts when the window is narrow.  =TAB= or =RET= on the row reveals one
-short row per tool; =TAB= on a tool row toggles its complete detail.  =RET=
+muted row per tool without link underlines; =TAB= on a tool row toggles its
+complete detail.  =RET=
 on read, edit, and write rows visits the authoritative file and line, while
 =RET= on other tools opens detail.  Ordinary transcript =TAB= keeps its
 Markdown/outline behavior.  The old =hidden= value maps to =grouped= for one

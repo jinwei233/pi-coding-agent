@@ -124,7 +124,7 @@ single tool call helper."
 ;;;; 1.1 Turn marker in live and history rendering
 
 (ert-deftest pi-coding-agent-test-transcript-live-user-turn-uses-marker-line ()
-  "A live user turn shows a bare marker line instead of You/Assistant headings."
+  "A live user turn shows a quiet marker instead of You/Assistant headings."
   (pi-coding-agent-transcript-test--with-chat
     (pi-coding-agent--display-user-message "Hello there")
     (pi-coding-agent--display-agent-start)
@@ -143,7 +143,7 @@ single tool call helper."
       (should (string-match-p "Assistant\n=========" raw)))))
 
 (ert-deftest pi-coding-agent-test-transcript-history-user-turn-uses-marker-line ()
-  "History replay uses the same marker line and hidden headings as live turns."
+  "History replay uses the same marker and hidden headings as live turns."
   (pi-coding-agent-transcript-test--with-history
       (pi-coding-agent-transcript-test--messages
        '("user" "Hello there")
@@ -236,7 +236,7 @@ single tool call helper."
 ;;;; 1.4 Folded paragraph break between marker and body
 
 (ert-deftest pi-coding-agent-test-transcript-marker-keeps-hidden-paragraph-break ()
-  "The marker and body stay adjacent on screen but keep a paragraph break."
+  "The marker and body share a visual line but keep a paragraph break."
   (pi-coding-agent-transcript-test--with-chat
     (pi-coding-agent--display-user-message "Body line")
     (let* ((raw (buffer-string))
@@ -247,9 +247,10 @@ single tool call helper."
       ;; Two real newlines follow the marker in the buffer.
       (should (equal (buffer-substring-no-properties marker-pos (+ marker-pos 3))
                      (concat pi-coding-agent-transcript-test--marker "\n\n")))
-      ;; The second newline is folded, so nothing is drawn for it.
+      ;; One newline becomes spacing and the empty paragraph line is folded.
+      (should (equal " " (get-text-property (1+ marker-pos) 'display)))
       (should (equal "" (get-text-property (+ marker-pos 2) 'display)))
-      ;; Visible result is two adjacent lines.
+      ;; Visible-text extraction preserves source newlines for copy semantics.
       (should (equal (concat "\n" pi-coding-agent-transcript-test--marker "\nBody line\n")
                      (pi-coding-agent-transcript-test--visible)))
       ;; Visible copy keeps the marker/newline/body shape.

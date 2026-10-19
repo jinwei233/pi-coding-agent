@@ -577,6 +577,11 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   "Face for activity disclosure cues and type labels."
   :group 'pi-coding-agent)
 
+(defface pi-coding-agent-activity-tool-name
+  '((t :inherit default :weight semi-bold))
+  "Face for tool names inside an expanded activity group."
+  :group 'pi-coding-agent)
+
 (defface pi-coding-agent-activity-summary
   '((t :inherit shadow))
   "Face for low-priority activity summary text."
@@ -601,6 +606,10 @@ When DEFER is non-nil, leave image-spec creation to the chat jit pass."
   '((t :inherit diff-removed))
   "Face for removed-line activity counts."
   :group 'pi-coding-agent)
+
+(define-button-type 'pi-coding-agent-activity-button
+  'face nil
+  'mouse-face 'highlight)
 
 (defface pi-coding-agent-tool-block
   '((t :extend t))
@@ -2764,9 +2773,10 @@ heading text only, never in visible output."
 (defun pi-coding-agent--insert-user-turn-marker (&optional timestamp)
   "Insert the visible user turn marker and its folded paragraph separator.
 The buffer keeps `❯' plus an empty paragraph line so the following user
-text still starts a fresh Markdown block, while the empty line's newline
-is folded so the visible result stays two adjacent lines.  TIMESTAMP is
-exposed only through the marker's `help-echo'."
+text still starts a fresh Markdown block.  The first newline displays as
+a space and the empty line's newline is folded, so the marker and the first
+body line share one visual line.  TIMESTAMP is exposed only through the
+marker's `help-echo'."
   (let* ((help (if timestamp
                    (format "You · %s"
                            (pi-coding-agent--format-message-timestamp timestamp))
@@ -2776,6 +2786,7 @@ exposed only through the marker's `help-echo'."
      (propertize pi-coding-agent--turn-marker 'help-echo help))
     (pi-coding-agent--append-to-chat "\n\n")
     (let ((inhibit-read-only t))
+      (put-text-property (1+ start) (+ start 2) 'display " ")
       (put-text-property (+ start 2) (+ start 3) 'display ""))))
 
 (defun pi-coding-agent--single-line-preview (text &optional columns)

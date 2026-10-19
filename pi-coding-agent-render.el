@@ -229,9 +229,10 @@ Nil means use `pi-coding-agent-tool-activity-display'.")
 
 (defun pi-coding-agent--display-user-message (text &optional timestamp)
   "Display user message TEXT in the chat buffer.
-The turn opens with a visible `❯' marker line.  The structural `You'
-setext heading stays in the buffer for navigation but is hidden, and
-TIMESTAMP reaches the user only through the marker's `help-echo'."
+The turn opens with a visible `❯' marker beside its first line.  The
+structural `You' setext heading stays in the buffer for navigation but
+is hidden, and TIMESTAMP reaches the user only through the marker's
+`help-echo'."
   (let ((start (with-current-buffer (pi-coding-agent--get-chat-buffer) (point-max))))
     (with-current-buffer (pi-coding-agent--get-chat-buffer)
       (pi-coding-agent--activity-begin-turn)
@@ -3501,36 +3502,39 @@ canonical or transient pair storage; IS-ERROR records completion status."
          parts)
     (when (> failed 0)
       (push (propertize (format "%d failed" failed)
-                        'face 'pi-coding-agent-activity-failed)
+                        'font-lock-face 'pi-coding-agent-activity-failed)
             parts))
     (when (> files 0)
       (push (propertize (format "%d file%s" files (if (= files 1) "" "s"))
-                        'face 'pi-coding-agent-activity-summary)
+                        'font-lock-face 'pi-coding-agent-activity-summary)
             parts))
     (when (or (> added 0) (> removed 0))
-      (push (concat
-             (propertize (format "+%d" added)
-                         'face 'pi-coding-agent-activity-added)
-             " "
-             (propertize (format "-%d" removed)
-                         'face 'pi-coding-agent-activity-removed))
-            parts))
+      (let (counts)
+        (when (> added 0)
+          (push (propertize (format "+%d" added)
+                            'font-lock-face 'pi-coding-agent-activity-added)
+                counts))
+        (when (> removed 0)
+          (push (propertize (format "-%d" removed)
+                            'font-lock-face 'pi-coding-agent-activity-removed)
+                counts))
+        (push (string-join (nreverse counts) " ") parts)))
     (pcase tests
       ('failed
        (push (propertize "tests failed"
-                         'face 'pi-coding-agent-activity-failed)
+                         'font-lock-face 'pi-coding-agent-activity-failed)
              parts))
       ('passed
        (push (propertize "tests passed"
-                         'face 'success)
+                         'font-lock-face 'success)
              parts)))
     (when running
       (push (propertize
              (format "running %s" (car running))
-             'face 'pi-coding-agent-activity-running)
+             'font-lock-face 'pi-coding-agent-activity-running)
             parts))
     (push (propertize (format "%d call%s" calls (if (= calls 1) "" "s"))
-                      'face 'pi-coding-agent-activity-summary)
+                      'font-lock-face 'pi-coding-agent-activity-summary)
           parts)
     (nreverse parts)))
 
@@ -3546,9 +3550,13 @@ canonical or transient pair storage; IS-ERROR records completion status."
   "Return the one-line group text for activity RECORD."
   (let* ((cue (if (pi-coding-agent--activity-record-expanded record) "▾" "▸"))
          (prefix (concat
-                  (propertize cue 'face 'pi-coding-agent-activity-label)
+                  (propertize cue
+                              'font-lock-face
+                              'pi-coding-agent-activity-label)
                   " "
-                  (propertize "Tools" 'face 'pi-coding-agent-activity-label)))
+                  (propertize "Tools"
+                              'font-lock-face
+                              'pi-coding-agent-activity-label)))
          (parts (pi-coding-agent--activity-summary-parts record))
          (budget (pi-coding-agent--activity-line-budget))
          (result prefix))
@@ -3564,30 +3572,38 @@ canonical or transient pair storage; IS-ERROR records completion status."
          (cue (pcase status
                 ('running "›")
                 ('failed "!")
-                (_ "·")))
+                (_ nil)))
          (name (or (plist-get tool :tool-name) "tool"))
          (target (plist-get tool :target))
+         (target (unless (and (equal name "bash")
+                              (equal target "cd"))
+                   target))
          (summary (plist-get tool :summary))
          (text
-          (concat "  "
-                  (propertize cue
-                              'face
-                              (pcase status
-                                ('running 'pi-coding-agent-activity-running)
-                                ('failed 'pi-coding-agent-activity-failed)
-                                (_ 'shadow)))
-                  " "
-                  (propertize name 'face 'pi-coding-agent-tool-name)
+          (concat (if cue
+                      (concat
+                       "  "
+                       (propertize
+                        cue
+                        'font-lock-face
+                        (if (eq status 'failed)
+                            'pi-coding-agent-activity-failed
+                          'pi-coding-agent-activity-running))
+                       " ")
+                    "    ")
+                  (propertize name
+                              'font-lock-face
+                              'pi-coding-agent-activity-tool-name)
                   (if (and target (not (string-empty-p target)))
-                      (concat " · "
+                      (concat "  "
                               (propertize target
-                                          'face
+                                          'font-lock-face
                                           'pi-coding-agent-activity-summary))
                     "")
                   (if (and summary (not (string-empty-p summary)))
                       (concat " · "
                               (propertize summary
-                                          'face
+                                          'font-lock-face
                                           (if (eq status 'failed)
                                               'pi-coding-agent-activity-failed
                                             'pi-coding-agent-activity-summary)))
@@ -3650,10 +3666,9 @@ canonical or transient pair storage; IS-ERROR records completion status."
           (insert (pi-coding-agent--activity-group-text record) "\n")
           (make-text-button
            group-start (point)
+           :type 'pi-coding-agent-activity-button
            'action #'pi-coding-agent--activity-toggle-group-button
            'follow-link t
-           'face 'pi-coding-agent-activity-group
-           'mouse-face 'highlight
            'help-echo "TAB/RET/click: toggle tools"
            'pi-coding-agent-tool-toggle t
            'pi-coding-agent-activity-group t
@@ -3667,10 +3682,9 @@ canonical or transient pair storage; IS-ERROR records completion status."
                 (insert (pi-coding-agent--activity-tool-line tool) "\n")
                 (make-text-button
                  tool-start (point)
+                 :type 'pi-coding-agent-activity-button
                  'action #'pi-coding-agent--activity-tool-button-action
                  'follow-link t
-                 'face nil
-                 'mouse-face 'highlight
                  'help-echo
                  (if (plist-get tool :path)
                      "TAB: details; RET/click: visit file"

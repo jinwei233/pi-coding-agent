@@ -109,7 +109,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
       (should (string-match-p "+1 -1" visible))
       (should (string-match-p "2 calls" visible))
       (should-not (string-match-p "secret" visible))
-      (should-not (string-match-p "  · read" visible)))))
+      (should-not (string-match-p "\n    read" visible)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-history-matches-live-shape ()
   "History directly builds the same one-group projection."
@@ -198,12 +198,12 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent-toggle-tool-section)
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should (string-match-p "▾ Tools" visible))
-      (should (string-match-p "  · bash" visible))
-      (should (string-match-p "  · read" visible)))
+      (should (string-match-p "\n    bash" visible))
+      (should (string-match-p "\n    read" visible)))
     (pi-coding-agent-tool-activity-test--goto "Tools")
     (pi-coding-agent-toggle-tool-section)
     (should-not (string-match-p
-                 "  · bash" (pi-coding-agent-tool-activity-test--visible)))))
+                 "\n    bash" (pi-coding-agent-tool-activity-test--visible)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-tool-tab-toggles-detail ()
   "TAB on a tool row toggles its inline detail."
@@ -212,7 +212,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
      '(("bash" (:command "make test") "alpha\nbeta")))
     (pi-coding-agent-tool-activity-test--goto "Tools")
     (pi-coding-agent-toggle-tool-section)
-    (pi-coding-agent-tool-activity-test--goto "  · bash")
+    (pi-coding-agent-tool-activity-test--goto "    bash")
     (pi-coding-agent-toggle-tool-section)
     (should (string-match-p
              "    alpha\n    beta"
@@ -235,7 +235,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
         (pi-coding-agent-toggle-tool-section)
         (should called)
         (should-not (string-match-p
-                     "  · bash"
+                     "\n    bash"
                      (pi-coding-agent-tool-activity-test--visible)))))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-ret-actions ()
@@ -246,11 +246,11 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent-tool-activity-test--goto "Tools")
     (pi-coding-agent--dispatch-button (point) nil t)
     (should (string-match-p
-             "  · read" (pi-coding-agent-tool-activity-test--visible)))
+             "\n    read" (pi-coding-agent-tool-activity-test--visible)))
     (let (target)
       (cl-letf (((symbol-function 'pi-coding-agent--visit-file-target)
                  (lambda (value _toggle) (setq target value))))
-        (pi-coding-agent-tool-activity-test--goto "  · read")
+        (pi-coding-agent-tool-activity-test--goto "    read")
         (pi-coding-agent--dispatch-button (point) nil t))
       (should (equal "/tmp/pi-tool-activity/a.el"
                      (plist-get target :emacs-path)))
@@ -268,7 +268,8 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
      "c2" "bash" '(:command "two") "ok")
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should (string-match-p "▾ Tools" visible))
-      (should (= 2 (pi-coding-agent-tool-activity-test--count "  · bash"))))))
+      (should (= 2 (pi-coding-agent-tool-activity-test--count
+                    "\n    bash"))))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-record-is-lightweight ()
   "Activity records exclude complete output, diff, and write payloads."
@@ -391,13 +392,16 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent-tool-activity-test--goto "Tools")
     (let ((group-button (button-at (point))))
       (should group-button)
-      (should (eq 'pi-coding-agent-activity-group
-                  (button-get group-button 'face))))
+      (should-not (button-get group-button 'face))
+      (should (eq 'pi-coding-agent-activity-label
+                  (get-text-property (point) 'font-lock-face))))
     (pi-coding-agent-toggle-tool-section)
-    (pi-coding-agent-tool-activity-test--goto "  · bash")
+    (pi-coding-agent-tool-activity-test--goto "    bash")
     (let ((tool-button (button-at (point))))
       (should tool-button)
-      (should-not (button-get tool-button 'face)))))
+      (should-not (button-get tool-button 'face))
+      (should (eq 'pi-coding-agent-activity-tool-name
+                  (get-text-property (+ (point) 4) 'font-lock-face))))))
 
 (provide 'pi-coding-agent-tool-activity-test)
 ;;; pi-coding-agent-tool-activity-test.el ends here
