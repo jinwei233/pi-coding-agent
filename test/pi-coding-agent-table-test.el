@@ -1366,5 +1366,280 @@ When fringes like `display-line-numbers-mode' consume columns,
       (pi-coding-agent-test--decorate-all-tables)  ; resize path
       (should (equal before (buffer-string))))))
 
+
+;;; Dynamic Unicode table safety
+
+(defconst pi-coding-agent-test--unicode-table
+  "| Symbol | State |\n|--------|-------|\n| 🛠 | bare |\n| ⚙️ | selected |\n"
+  "A table containing bare and explicit Emoji presentation forms.")
+
+(defconst pi-coding-agent-test--dense-technical-table
+  (concat
+   "| char-width | string-width | wrapper width | codepoint | font-at | pixels |\n"
+   "|------------|--------------|---------------|-----------|---------|--------|\n"
+   "| 1 | 1 | 2 | U+270F+FE0F | ArialUnicodeMS.ttf | 16px |\n")
+  "A dense table whose technical tokens must never be force-broken.")
+
+(ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()
+  "Only the explicit same-base allowlist receives one VS16."
+  (dolist (base '(#x1f6e0 #x2699 #x26a0))
+    (let* ((bare (string base))
+           (normalized
+            (pi-coding-agent--normalize-table-display-cell bare)))
+      (should (equal normalized (string base #xfe0f)))
+      (should (= 2 (markdown-table-wrap-visible-width normalized)))))
+  (dolist (unchanged
+           (list (string #x2699 #xfe0f)
+                 (string #x26a0 #xfe0f)
+                 "🔧" "💭" "✅" "✎" "❯" "◽" "◾"))
+    (let ((normalized
+           (pi-coding-agent--normalize-table-display-cell unchanged)))
+      (should (equal normalized unchanged))
+      (should (= (cl-count #xfe0f normalized)
+                 (cl-count #xfe0f unchanged)))))
+  (should-not
+   (string-search "✏"
+                  (pi-coding-agent--normalize-table-display-cell "✎"))))
+
+(ert-deftest pi-coding-agent-test-table-normalization-preserves-face-properties ()
+  "The inserted VS16 inherits the base character's visual properties."
+  (let* ((cell (propertize "🛠" 'face '(:foreground "red")))
+         (normalized
+          (pi-coding-agent--normalize-table-display-cell cell)))
+    (should (= (length normalized) 2))
+    (should (equal (get-text-property 0 'face normalized)
+                   (get-text-property 1 'face normalized)))))
+
+(ert-deftest pi-coding-agent-test-table-visible-cache-stays-canonical ()
+  "Projection normalization does not contaminate visible-string cache values."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((projection
+           (pi-coding-agent--table-display-projection
+            (split-string
+             (string-trim-right pi-coding-agent-test--unicode-table)
+             "\n")
+            80)))
+      (should (plist-get projection :normalized-p))
+      (should (equal (gethash "🛠" pi-coding-agent--visible-string-cache)
+                     "🛠"))
+      (should-not
+       (string-search
+        (string #x1f6e0 #xfe0f)
+        (gethash "🛠" pi-coding-agent--visible-string-cache))))))
+
+(ert-deftest pi-coding-agent-test-table-normalization-is-display-only ()
+  "Pretty projection adds VS16 while source, copy, search, and raw stay bare."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert pi-coding-agent-test--unicode-table))
+    (font-lock-ensure)
+    (let ((source (buffer-string)))
+      (pi-coding-agent-test--decorate-all-tables)
+      (should
+       (seq-some
+        (lambda (display)
+          (string-search (string #x1f6e0 #xfe0f) display))
+        (pi-coding-agent-test--table-overlay-displays-in-region
+         (point-min) (point-max))))
+      (should (equal source (buffer-string)))
+      (goto-char (point-min))
+      (should (search-forward "🛠" nil t))
+      (should (= (char-after (1- (point))) #x1f6e0))
+      (should-not (= (or (char-after (point)) 0) #xfe0f))
+      (goto-char (point-min))
+      (pi-coding-agent-toggle-table-pretty)
+      (should (equal source (buffer-string)))
+      (should-not (pi-coding-agent-test--display-overlays)))))
+
+(ert-deftest pi-coding-agent-test-table-min-content-preserves-technical-tokens ()
+  "Sufficient width gives each technical column its atomic minimum."
+  (let* ((raw-lines
+          (split-string
+           (string-trim-right
+            pi-coding-agent-test--dense-technical-table)
+           "\n"))
+         (projection
+          (pi-coding-agent--table-display-projection raw-lines 160))
+         (text
+          (mapconcat
+           #'identity
+           (apply #'append (plist-get projection :groups))
+           "\n")))
+    (should projection)
+    (dolist (token '("char-width" "string-width" "wrapper width"
+                     "U+270F+FE0F" "ArialUnicodeMS.ttf" "16px"))
+      (should (string-search token text)))))
+
+(ert-deftest pi-coding-agent-test-table-min-content-falls-back-when-too-narrow ()
+  "Dense tables stay raw instead of force-breaking atomic tokens."
+  (let ((raw-lines
+         (split-string
+          (string-trim-right pi-coding-agent-test--dense-technical-table)
+          "\n")))
+    (should-not
+     (pi-coding-agent--table-display-projection raw-lines 48)))
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert pi-coding-agent-test--dense-technical-table))
+    (font-lock-ensure)
+    (pi-coding-agent--decorate-tables-in-region
+     (point-min) (point-max) 48)
+    (should-not (pi-coding-agent-test--display-overlays))
+    (should (string-search "char-width" (buffer-string)))
+    (should-not (string-search "char-w\n" (buffer-string)))))
+
+(ert-deftest pi-coding-agent-test-table-pixel-gate-checks-every-boundary-prefix ()
+  "A prefix mismatch fails even when the complete row width is correct."
+  (let ((line "│ a │ b │")
+        measured)
+    (cl-letf
+        (((symbol-function
+           'pi-coding-agent--table-pixel-width-in-window)
+          (lambda (string _window)
+            (push string measured)
+            (+ (* 9 (markdown-table-wrap-visible-width string))
+               (if (equal string "│ a │") 1 0)))))
+      (should-not
+       (pi-coding-agent--table-line-pixel-safe-p line 'window 9))
+      (should (member "│" measured))
+      (should (member "│ a │" measured)))))
+
+(ert-deftest pi-coding-agent-test-table-pixel-gate-accepts-aligned-boundaries ()
+  "All vertical prefixes and the complete line must match the cell grid."
+  (let ((line "│ 🛠️ │ ok │")
+        measured)
+    (cl-letf
+        (((symbol-function
+           'pi-coding-agent--table-pixel-width-in-window)
+          (lambda (string _window)
+            (push string measured)
+            (* 9 (markdown-table-wrap-visible-width string)))))
+      (should (pi-coding-agent--table-line-pixel-safe-p line 'window 9))
+      (should (= (length measured) 4)))))
+
+(ert-deftest pi-coding-agent-test-table-pixel-gate-caches-final-context ()
+  "Repeated checks reuse a decision until display context changes."
+  (with-temp-buffer
+    (let ((context 'first)
+          (line-measurements 0)
+          (groups '(("│ 🛠️ │"))))
+      (cl-letf
+          (((symbol-function
+             'pi-coding-agent--table-pixel-width-in-window)
+            (lambda (string _window)
+              (if (equal string "M")
+                  9
+                (setq line-measurements (1+ line-measurements))
+                (* 9 (markdown-table-wrap-visible-width string)))))
+           ((symbol-function 'pi-coding-agent--table-display-context)
+            (lambda (_window cell-width)
+              (list context cell-width))))
+        (should
+         (pi-coding-agent--table-groups-pixel-safe-p groups 'window))
+        (let ((first-count line-measurements))
+          (should
+           (pi-coding-agent--table-groups-pixel-safe-p groups 'window))
+          (should (= first-count line-measurements))
+          (setq context 'scaled)
+          (should
+           (pi-coding-agent--table-groups-pixel-safe-p groups 'window))
+          (should (> line-measurements first-count)))))))
+
+(ert-deftest pi-coding-agent-test-table-pixel-cache-is-buffer-local ()
+  "Identical tables in different Pi buffers do not share safety decisions."
+  (let ((groups '(("│ ⚙️ │")))
+        (measurements 0))
+    (cl-letf
+        (((symbol-function
+           'pi-coding-agent--table-pixel-width-in-window)
+          (lambda (string _window)
+            (if (equal string "M")
+                9
+              (setq measurements (1+ measurements))
+              (* 9 (markdown-table-wrap-visible-width string)))))
+         ((symbol-function 'pi-coding-agent--table-display-context)
+          (lambda (_window cell-width)
+            (list (current-buffer) cell-width))))
+      (with-temp-buffer
+        (should
+         (pi-coding-agent--table-groups-pixel-safe-p groups 'window)))
+      (let ((first-buffer-count measurements))
+        (with-temp-buffer
+          (should
+           (pi-coding-agent--table-groups-pixel-safe-p groups 'window)))
+        (should (> measurements first-buffer-count))))))
+
+(ert-deftest pi-coding-agent-test-table-ascii-fast-path-skips-pixel-probe ()
+  "ASCII classification occurs before Unicode grid borders are generated."
+  (cl-letf
+      (((symbol-function 'pi-coding-agent--chat-display-window)
+        (lambda () (error "Pixel path should not need a window"))))
+    (should
+     (pi-coding-agent--table-display-safe-p
+      '(("┌───┐" "│ a │" "└───┘")) t))))
+
+(ert-deftest pi-coding-agent-test-table-hidden-gui-fails-closed-without-measurement ()
+  "A hidden interactive GUI table waits instead of probing another context."
+  (let ((noninteractive nil))
+    (cl-letf
+        (((symbol-function 'display-graphic-p) (lambda (&optional _) t))
+         ((symbol-function 'pi-coding-agent--chat-display-window)
+          (lambda () nil))
+         ((symbol-function 'pi-coding-agent--table-groups-pixel-safe-p)
+          (lambda (&rest _)
+            (error "Hidden table must not be measured"))))
+      (should-not
+       (pi-coding-agent--table-display-safe-p '(("│ 🛠️ │")) nil)))))
+
+(ert-deftest pi-coding-agent-test-table-unsafe-projection-installs-no-overlay ()
+  "A failed final pixel gate leaves the complete canonical table raw."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((inhibit-read-only t))
+      (insert "| Symbol | State |\n|--------|-------|\n| ✎ | unsafe |\n"))
+    (font-lock-ensure)
+    (cl-letf
+        (((symbol-function 'pi-coding-agent--table-display-safe-p)
+          (lambda (&rest _) nil)))
+      (pi-coding-agent-test--decorate-all-tables))
+    (should-not (pi-coding-agent-test--display-overlays))
+    (should (string-search "✎" (buffer-string)))
+    (should-not (string-search "✏" (buffer-string)))))
+
+(ert-deftest pi-coding-agent-test-table-normalization-consistent-across-lifecycle ()
+  "Live, history, lazy, and resize paths use the same normalized projection."
+  (let ((assert-normalized
+         (lambda ()
+           (should
+            (seq-some
+             (lambda (display)
+               (string-search (string #x1f6e0 #xfe0f) display))
+             (pi-coding-agent-test--table-overlay-displays-in-region
+              (point-min) (point-max)))))))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--display-agent-start)
+      (pi-coding-agent--display-message-delta
+       pi-coding-agent-test--unicode-table)
+      (funcall assert-normalized))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (pi-coding-agent--render-history-text
+       pi-coding-agent-test--unicode-table)
+      (funcall assert-normalized))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (let ((inhibit-read-only t))
+        (insert pi-coding-agent-test--unicode-table))
+      (font-lock-ensure)
+      (pi-coding-agent--jit-decorate-tables (point-min) (point-max))
+      (funcall assert-normalized)
+      (move-marker pi-coding-agent--hot-tail-start (point-min))
+      (pi-coding-agent--refresh-hot-tail-tables 72)
+      (funcall assert-normalized))))
+
 (provide 'pi-coding-agent-table-test)
 ;;; pi-coding-agent-table-test.el ends here

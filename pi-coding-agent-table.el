@@ -85,6 +85,18 @@ functional (input text → stripped text), so entries never go stale.
 Survives across tables and resize operations, eliminating redundant
 fontification when the same cell content reappears at different widths.")
 
+(defvar-local pi-coding-agent--table-pixel-safety-cache nil
+  "Cache of final table pixel-safety decisions for this chat buffer.")
+
+(defconst pi-coding-agent--table-emoji-presentation-map
+  `((#x1f6e0 . ,(string #x1f6e0 #xfe0f))
+    (#x2699 . ,(string #x2699 #xfe0f))
+    (#x26a0 . ,(string #x26a0 #xfe0f)))
+  "Verified same-base VS16 projections for display-only table cells.
+Keys are text-default Emoji code points whose bare glyph is unsafe in the
+supported GUI font stack.  Values preserve the base code point and append one
+variation selector.  This map is intentionally small and table-local.")
+
 ;;;; Visibility and Width
 
 (defun pi-coding-agent--chat-display-window ()
@@ -461,12 +473,131 @@ used by `pi-coding-agent--render-table-row-lines'."
 
 ;;;; Display Groups
 
-(defun pi-coding-agent--table-display-groups (raw-lines width)
-  "Return prefix-aware display groups for RAW-LINES at WIDTH.
-Each result element corresponds to one raw source line and contains the
-wrapped display lines for that logical table row.  Container prefixes such as
-blockquotes or indentation are preserved on every visual continuation line.
-Plain tables (no prefix) take a fast path that skips prefix splitting."
+(defun pi-coding-agent--normalize-table-display-cell (cell)
+  "Return a display-only Emoji presentation copy of CELL.
+Only entries in `pi-coding-agent--table-emoji-presentation-map' are changed,
+and an existing VS16 is never duplicated.  Text properties on the base
+character are copied to the inserted selector."
+  (let ((index 0)
+        (length (length cell))
+        (changed nil)
+        pieces)
+    (while (< index length)
+      (let* ((character (aref cell index))
+             (replacement
+              (alist-get character
+                         pi-coding-agent--table-emoji-presentation-map)))
+        (push (substring cell index (1+ index)) pieces)
+        (when (and replacement
+                   (or (= index (1- length))
+                       (/= (aref cell (1+ index)) #xfe0f)))
+          (let ((selector (substring replacement 1)))
+            (set-text-properties
+             0 (length selector) (text-properties-at index cell) selector)
+            (push selector pieces)
+            (setq changed t))))
+      (setq index (1+ index)))
+    (if changed
+        (apply #'concat (nreverse pieces))
+      cell)))
+
+(defun pi-coding-agent--table-ascii-cells-p (headers rows)
+  "Return non-nil when every visible cell in HEADERS and ROWS is ASCII."
+  (cl-every
+   (lambda (cell)
+     (= (length cell) (string-bytes cell)))
+   (append headers (apply #'append rows))))
+
+(defun pi-coding-agent--table-cell-min-content-width
+    (raw-cell display-cell header-p)
+  "Return atomic minimum width for RAW-CELL rendered as DISPLAY-CELL.
+Headers and inline code spans stay whole.  Other cells may wrap at whitespace,
+but never force-break an individual technical or otherwise unbroken token."
+  (if (or header-p (string-match-p "`" raw-cell))
+      (markdown-table-wrap-visible-width display-cell)
+    (let ((minimum 0))
+      (dolist (token (split-string display-cell "[[:space:]]+" t))
+        (setq minimum
+              (max minimum
+                   (markdown-table-wrap-visible-width token))))
+      minimum)))
+
+(defun pi-coding-agent--table-column-minima
+    (raw-headers raw-rows display-headers display-rows num-cols)
+  "Return per-column atomic widths for raw and display table cells."
+  (let ((minima (make-vector num-cols 0)))
+    (cl-loop for raw in raw-headers
+             for display in display-headers
+             for column from 0 below num-cols
+             do
+             (aset minima column
+                   (max (aref minima column)
+                        (pi-coding-agent--table-cell-min-content-width
+                         raw display t))))
+    (cl-loop for raw-row in raw-rows
+             for display-row in display-rows
+             do
+             (cl-loop for raw in raw-row
+                      for display in display-row
+                      for column from 0 below num-cols
+                      do
+                      (aset minima column
+                            (max
+                             (aref minima column)
+                             (pi-coding-agent--table-cell-min-content-width
+                              raw display nil)))))
+    minima))
+
+(defun pi-coding-agent--table-widths-with-minima
+    (headers rows content-width num-cols minima)
+  "Allocate table widths without going below MINIMA.
+Return nil when CONTENT-WIDTH cannot hold all atomic minima and grid borders."
+  (let* ((border-overhead (+ (* 3 num-cols) 1))
+         (floors
+          (vconcat
+           (cl-loop for column below num-cols
+                    collect (max 1 (aref minima column)))))
+         (minimum-total
+          (+ border-overhead
+             (cl-loop for value across floors sum value))))
+    (when (<= minimum-total content-width)
+      (let* ((widths
+              (vconcat
+               (markdown-table-wrap-compute-widths
+                headers rows content-width num-cols)))
+             (deficits
+              (cl-loop for column below num-cols
+                       sum (max 0 (- (aref floors column)
+                                     (aref widths column))))))
+        ;; Waterfill optimizes balance but does not know Pi's atomic-token
+        ;; floors.  Move its existing budget from columns with slack.
+        (dotimes (column num-cols)
+          (let ((needed (- (aref floors column) (aref widths column))))
+            (while (> needed 0)
+              (let ((donor nil)
+                    (largest-slack 0))
+                (dotimes (candidate num-cols)
+                  (let ((slack (- (aref widths candidate)
+                                  (aref floors candidate))))
+                    (when (> slack largest-slack)
+                      (setq donor candidate
+                            largest-slack slack))))
+                (unless donor
+                  (setq needed 0
+                        deficits 1))
+                (when donor
+                  (let ((moved (min needed largest-slack)))
+                    (aset widths donor (- (aref widths donor) moved))
+                    (aset widths column (+ (aref widths column) moved))
+                    (setq needed (- needed moved)
+                          deficits (- deficits moved))))))))
+        (when (zerop deficits)
+          (append widths nil))))))
+
+(defun pi-coding-agent--table-display-projection (raw-lines width)
+  "Return the display projection plist for RAW-LINES at WIDTH.
+The plist contains `:groups', `:normalized-p', and `:ascii-cells-p'.  Nil means
+the table cannot preserve its atomic min-content widths and must stay raw."
   (let* ((no-prefix (cl-every (lambda (l) (and (> (length l) 0)
                                                (= (aref l 0) ?|)))
                               raw-lines))
@@ -496,31 +627,62 @@ Plain tables (no prefix) take a fast path that skips prefix splitting."
                                  (funcall pi-coding-agent-table-cell-render-function cell)
                                (pi-coding-agent--markdown-visible-string cell))
                              visible-cache))))
-             (display-headers (mapcar display-cell headers))
-             (display-rows
+             (visible-headers (mapcar display-cell headers))
+             (visible-rows
               (mapcar (lambda (row)
                         (mapcar display-cell row))
                       rows))
+             (display-headers
+              (mapcar #'pi-coding-agent--normalize-table-display-cell
+                      visible-headers))
+             (display-rows
+              (mapcar
+               (lambda (row)
+                 (mapcar #'pi-coding-agent--normalize-table-display-cell row))
+               visible-rows))
+             (normalized-p
+              (or (cl-some #'identity
+                           (cl-mapcar
+                            (lambda (before after)
+                              (not (string= before after)))
+                            visible-headers display-headers))
+                  (cl-some
+                   #'identity
+                   (cl-mapcar
+                    (lambda (before-row after-row)
+                      (cl-some
+                       #'identity
+                       (cl-mapcar
+                        (lambda (before after)
+                          (not (string= before after)))
+                        before-row after-row)))
+                    visible-rows display-rows))))
              (num-cols (max (length display-headers)
                             (length aligns)
                             (if display-rows
                                 (apply #'max (mapcar #'length display-rows))
                               0)))
              (content-width (max 1 (- width prefix-width)))
+             (minima
+              (pi-coding-agent--table-column-minima
+               headers rows display-headers display-rows num-cols))
              (col-widths
-              (markdown-table-wrap-compute-widths
-               display-headers display-rows content-width num-cols))
+              (pi-coding-agent--table-widths-with-minima
+               display-headers display-rows content-width num-cols minima))
              (header-lines
-              (pi-coding-agent--render-table-row-lines
-               display-headers col-widths aligns))
+              (and col-widths
+                   (pi-coding-agent--render-table-row-lines
+                    display-headers col-widths aligns)))
              (separator-line
-              (pi-coding-agent--render-table-separator-line
-               col-widths aligns))
+              (and col-widths
+                   (pi-coding-agent--render-table-separator-line
+                    col-widths aligns)))
              (row-groups
-              (mapcar (lambda (row)
-                        (pi-coding-agent--render-table-row-lines
-                         row col-widths aligns))
-                      display-rows))
+              (and col-widths
+                   (mapcar (lambda (row)
+                             (pi-coding-agent--render-table-row-lines
+                              row col-widths aligns))
+                           display-rows)))
              ;; Full web-style grid: weave border rules into the existing
              ;; per-raw-line groups so the group↔raw-line 1:1 invariant that
              ;; `pi-coding-agent--decorate-table' relies on is preserved.
@@ -531,42 +693,65 @@ Plain tables (no prefix) take a fast path that skips prefix splitting."
              (full-grid (pi-coding-agent--table-full-grid-p))
              (has-data (consp row-groups))
              (header-group
-              (if full-grid
-                  (cons (pi-coding-agent--render-table-grid-rule col-widths 'top)
+              (and col-widths
+                   (if full-grid
+                       (cons
+                        (pi-coding-agent--render-table-grid-rule col-widths 'top)
                         header-lines)
-                header-lines))
+                     header-lines)))
              (sep-group
-              (if (and full-grid (not has-data))
-                  (list separator-line
-                        (pi-coding-agent--render-table-grid-rule col-widths 'bottom))
-                (list separator-line)))
+              (and col-widths
+                   (if (and full-grid (not has-data))
+                       (list
+                        separator-line
+                        (pi-coding-agent--render-table-grid-rule
+                         col-widths 'bottom))
+                     (list separator-line))))
              (data-groups
-              (if (and full-grid has-data)
-                  (let ((mid-rule (pi-coding-agent--render-table-grid-rule
-                                   col-widths 'middle))
-                        (bottom (pi-coding-agent--render-table-grid-rule
-                                 col-widths 'bottom))
-                        (last-index (1- (length row-groups))))
-                    (cl-loop for group in row-groups
-                             for i from 0
-                             collect (append (when (> i 0) (list mid-rule))
-                                             group
-                                             (when (= i last-index) (list bottom)))))
-                row-groups)))
-        (if no-prefix
-            (append (list header-group)
-                    (list sep-group)
-                    data-groups)
-          (append
-           (list (mapcar (lambda (line) (concat (car prefixes) line))
-                         header-group))
-           (list (mapcar (lambda (line) (concat (nth 1 prefixes) line))
-                         sep-group))
-           (cl-mapcar (lambda (prefix row-lines)
-                        (mapcar (lambda (line) (concat prefix line))
-                                row-lines))
-                      (nthcdr 2 prefixes)
-                      data-groups)))))))
+              (and
+               col-widths
+               (if (and full-grid has-data)
+                   (let ((mid-rule (pi-coding-agent--render-table-grid-rule
+                                    col-widths 'middle))
+                         (bottom (pi-coding-agent--render-table-grid-rule
+                                  col-widths 'bottom))
+                         (last-index (1- (length row-groups))))
+                     (cl-loop for group in row-groups
+                              for i from 0
+                              collect
+                              (append (when (> i 0) (list mid-rule))
+                                      group
+                                      (when (= i last-index) (list bottom)))))
+                 row-groups))))
+        (when col-widths
+          (list
+           :groups
+           (if no-prefix
+               (append (list header-group)
+                       (list sep-group)
+                       data-groups)
+             (append
+              (list (mapcar (lambda (line) (concat (car prefixes) line))
+                            header-group))
+              (list (mapcar (lambda (line) (concat (nth 1 prefixes) line))
+                            sep-group))
+              (cl-mapcar (lambda (prefix row-lines)
+                           (mapcar (lambda (line) (concat prefix line))
+                                   row-lines))
+                         (nthcdr 2 prefixes)
+                         data-groups)))
+           :normalized-p normalized-p
+           :ascii-cells-p
+           (pi-coding-agent--table-ascii-cells-p
+            display-headers display-rows)))))))
+
+(defun pi-coding-agent--table-display-groups (raw-lines width)
+  "Return prefix-aware display groups for RAW-LINES at WIDTH.
+Each result element corresponds to one raw source line.  Return nil when the
+available width cannot preserve atomic technical tokens."
+  (plist-get
+   (pi-coding-agent--table-display-projection raw-lines width)
+   :groups))
 
 ;;;; Line Mapping
 
@@ -676,6 +861,127 @@ faces like `md-ts-code' inherit from `fixed-pitch'."
         (setq pos next)))
     result))
 
+;;;; Pixel Safety
+
+(defun pi-coding-agent--table-neutralize-groups (groups)
+  "Return GROUPS with every final display line font-neutralized once."
+  (mapcar
+   (lambda (group)
+     (mapcar #'pi-coding-agent--neutralize-fonts group))
+   groups))
+
+(defun pi-coding-agent--table-string-face-signature (string)
+  "Return the face-span signature of STRING for pixel-cache keys."
+  (let ((position 0)
+        (length (length string))
+        signature)
+    (while (< position length)
+      (let ((next (next-single-property-change
+                   position 'face string length)))
+        (push (list position next
+                    (get-text-property position 'face string))
+              signature)
+        (setq position next)))
+    (nreverse signature)))
+
+(defun pi-coding-agent--table-pixel-width-in-window (string window)
+  "Return pixel width of STRING in the display context of WINDOW."
+  (with-selected-window window
+    (string-pixel-width string)))
+
+(defun pi-coding-agent--table-display-context (window cell-width)
+  "Return a cache signature for WINDOW with ASCII CELL-WIDTH."
+  (let ((frame (window-frame window)))
+    (list window
+          frame
+          (current-buffer)
+          (window-body-width window)
+          (frame-parameter frame 'font)
+          (face-attribute 'default :family frame t)
+          (face-attribute 'default :height frame t)
+          (face-attribute 'default :weight frame t)
+          (face-attribute 'fixed-pitch :family frame t)
+          (face-attribute 'fixed-pitch :height frame t)
+          (copy-tree face-remapping-alist)
+          (and (boundp 'text-scale-mode-amount)
+               text-scale-mode-amount)
+          cell-width)))
+
+(defun pi-coding-agent--table-line-pixel-safe-p (line window cell-width)
+  "Return non-nil when LINE and every vertical boundary are safe in WINDOW."
+  (let ((safe t)
+        (position 0)
+        (length (length line)))
+    (while (and safe (< position length))
+      (when (memq (aref line position) '(?│ ?|))
+        (let* ((prefix (substring line 0 (1+ position)))
+               (expected
+                (* cell-width
+                   (markdown-table-wrap-visible-width prefix)))
+               (actual
+                (pi-coding-agent--table-pixel-width-in-window
+                 prefix window)))
+          (setq safe (and (numberp actual) (= actual expected)))))
+      (setq position (1+ position)))
+    (when safe
+      (let ((actual
+             (pi-coding-agent--table-pixel-width-in-window line window))
+            (expected
+             (* cell-width
+                (markdown-table-wrap-visible-width line))))
+        (setq safe (and (numberp actual) (= actual expected)))))
+    safe))
+
+(defun pi-coding-agent--table-groups-pixel-safe-p (groups window)
+  "Return non-nil when final GROUPS satisfy the cell grid in WINDOW.
+The result is cached per chat buffer by final content, face spans, and the
+complete target display context."
+  (let* ((cell-width
+          (pi-coding-agent--table-pixel-width-in-window "M" window))
+         (context
+          (and (numberp cell-width)
+               (pi-coding-agent--table-display-context window cell-width)))
+         (face-signature
+          (mapcar
+           (lambda (group)
+             (mapcar #'pi-coding-agent--table-string-face-signature group))
+           groups))
+         (key (and context (list groups face-signature context)))
+         (cache
+          (or pi-coding-agent--table-pixel-safety-cache
+              (setq pi-coding-agent--table-pixel-safety-cache
+                    (make-hash-table :test 'equal :size 32))))
+         (missing (make-symbol "missing"))
+         (cached (if key (gethash key cache missing) missing)))
+    (if (not (eq cached missing))
+        cached
+      (let ((safe
+             (and context
+                  (cl-every
+                   (lambda (group)
+                     (cl-every
+                      (lambda (line)
+                        (pi-coding-agent--table-line-pixel-safe-p
+                         line window cell-width))
+                      group))
+                   groups))))
+        (when key
+          (when (> (hash-table-count cache) 128)
+            (clrhash cache))
+          (puthash key safe cache))
+        safe))))
+
+(defun pi-coding-agent--table-display-safe-p (groups ascii-cells-p)
+  "Return non-nil when GROUPS are safe to install as display overlays.
+ASCII cell content needs no GUI probe.  Batch and terminal sessions preserve
+their existing structural rendering without invoking pixel APIs.  Interactive
+graphical sessions fail closed when no live target window is available."
+  (or ascii-cells-p
+      noninteractive
+      (not (display-graphic-p))
+      (when-let* ((window (pi-coding-agent--chat-display-window)))
+        (pi-coding-agent--table-groups-pixel-safe-p groups window))))
+
 ;;;; Overlay Creation
 
 (defun pi-coding-agent--decorate-table (beg end width)
@@ -694,12 +1000,20 @@ blank-line spacing between a table and following text is not collapsed."
          (trimmed (string-trim-right raw "\n+"))
          (trailing (substring raw (length trimmed))))
     (when-let* ((raw-lines (split-string trimmed "\n"))
-                (groups (pi-coding-agent--table-display-groups raw-lines width)))
-      (unless (and (= (length groups) (length raw-lines))
+                (projection
+                 (pi-coding-agent--table-display-projection raw-lines width))
+                (groups (plist-get projection :groups))
+                (final-groups
+                 (pi-coding-agent--table-neutralize-groups groups))
+                ((pi-coding-agent--table-display-safe-p
+                  final-groups
+                  (plist-get projection :ascii-cells-p))))
+      (unless (and (not (plist-get projection :normalized-p))
+                   (= (length final-groups) (length raw-lines))
                    (cl-every (lambda (raw-line group)
                                (and (= (length group) 1)
                                     (equal raw-line (car group))))
-                             raw-lines groups))
+                             raw-lines final-groups))
         (let ((n (length raw-lines)))
           (save-excursion
             (goto-char table-beg)
@@ -708,13 +1022,12 @@ blank-line spacing between a table and following text is not collapsed."
                      (line-end (if (= i (1- n))
                                    end ; last line: cover trailing newlines
                                  (min (1+ (line-end-position)) end)))
-                     (group (nth i groups))
+                     (group (nth i final-groups))
                      (display-str (concat
                                    (mapconcat #'identity group "\n")
                                    (if (= i (1- n)) trailing "\n")))
                      (ov (make-overlay line-beg line-end nil nil nil)))
-                (overlay-put ov 'display
-                             (pi-coding-agent--neutralize-fonts display-str))
+                (overlay-put ov 'display display-str)
                 (overlay-put ov 'face 'default)
                 (overlay-put ov 'pi-coding-agent-table-display t)
                 (overlay-put ov 'evaporate t))

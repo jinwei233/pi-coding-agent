@@ -33,6 +33,112 @@
                     (lambda (left right)
                       (< (overlay-start left) (overlay-start right))))))))
 
+(defconst pi-coding-agent-gui-test--native-unicode-baseline
+  `((:text "M" :codepoints (#x4d) :char-widths (1)
+     :string-width 1 :wrapper-width 1 :font "LXGW WenKai Mono" :pixels 9)
+    (:text "✎" :codepoints (#x270e) :char-widths (1)
+     :string-width 1 :wrapper-width 1 :font "Arial Unicode MS" :pixels 16)
+    (:text "🛠" :codepoints (#x1f6e0) :char-widths (1)
+     :string-width 1 :wrapper-width 1 :font nil :pixels 22)
+    (:text ,(string #x1f6e0 #xfe0f) :codepoints (#x1f6e0 #xfe0f)
+     :char-widths (1 0) :string-width 2 :wrapper-width 2
+     :font-components ("Twemoji LXGW") :pixels 18)
+    (:text "⚙" :codepoints (#x2699) :char-widths (1)
+     :string-width 1 :wrapper-width 1 :font "Menlo" :pixels 11)
+    (:text ,(string #x2699 #xfe0f) :codepoints (#x2699 #xfe0f)
+     :char-widths (1 0) :string-width 2 :wrapper-width 2
+     :font-components ("Menlo" "Twemoji LXGW") :pixels 18)
+    (:text ,(string #x26a0 #xfe0f) :codepoints (#x26a0 #xfe0f)
+     :char-widths (1 0) :string-width 2 :wrapper-width 2
+     :font-components ("LXGW WenKai Mono" "Twemoji LXGW") :pixels 18)
+    (:text "❯" :codepoints (#x276f) :char-widths (1)
+     :string-width 1 :wrapper-width 1
+     :font "Symbols Nerd Font Mono" :pixels 18)
+    (:text "◽" :codepoints (#x25fd) :char-widths (2)
+     :string-width 2 :wrapper-width 2 :font "Twemoji LXGW" :pixels 18
+     :legacy-char-widths (1) :legacy-string-width 1 :legacy-wrapper-width 1)
+    (:text "◾" :codepoints (#x25fe) :char-widths (2)
+     :string-width 2 :wrapper-width 2 :font "Twemoji LXGW" :pixels 18
+     :legacy-char-widths (1) :legacy-string-width 1 :legacy-wrapper-width 1)
+    (:text "🔧" :codepoints (#x1f527) :char-widths (2)
+     :string-width 2 :wrapper-width 2 :font "Twemoji LXGW" :pixels 18)
+    (:text "💭" :codepoints (#x1f4ad) :char-widths (2)
+     :string-width 2 :wrapper-width 2 :font "Twemoji LXGW" :pixels 18)
+    (:text "✅" :codepoints (#x2705) :char-widths (2)
+     :string-width 2 :wrapper-width 2 :font "Twemoji LXGW" :pixels 18))
+  "Measured macOS NS Emacs 31.1 character acceptance baseline.")
+
+(defconst pi-coding-agent-gui-test--legacy-table-row-pixels
+  '(("ordinary" . 558)
+    ("pencil-lower-right" . 565)
+    ("bare-hammer-and-wrench" . 571)
+    ("bare-gear" . 560)
+    ("turn-marker" . 567)
+    ("white-squares" . 576)
+    ("presentation" . 567))
+  "Pre-fix pixel evidence from 62-column rows in the reported table.")
+
+(defconst pi-coding-agent-gui-test--reported-symbol-table
+  (concat
+   "| Fixture | Character | Result |\n"
+   "|---------|-----------|--------|\n"
+   "| ordinary | ASCII | baseline |\n"
+   "| pencil-lower-right | ✎ | raw fallback |\n"
+   "| bare-hammer-and-wrench | 🛠 | normalize |\n"
+   "| bare-gear | ⚙ | normalize |\n"
+   "| turn-marker | ❯ | raw fallback |\n"
+   "| white-squares | ◽ ◾ | two cells each |\n"
+   "| presentation | 🛠️ ⚙️ ⚠️ 🔧 💭 ✅ | two cells each |\n")
+  "Three-column mixed-symbol regression fixture.")
+
+(defconst pi-coding-agent-gui-test--reported-measurement-table
+  (concat
+   "| char-width | string-width | wrapper width | codepoint | font-at | pixels |\n"
+   "|------------|--------------|---------------|-----------|---------|--------|\n"
+   "| 1 | 1 | 1 | U+270E | Arial Unicode MS | 16px |\n"
+   "| 1 | 1 | 1 | U+1F6E0 | nil | 22px |\n"
+   "| 1/0 | 2 | 2 | U+1F6E0+FE0F | Twemoji LXGW | 18px |\n")
+  "Six-column dense measurement fixture that must fall back when narrow.")
+
+(defconst pi-coding-agent-gui-test--u270e-font-scan
+  '(("Menlo" . 11)
+    ("Lucida Grande" . 14)
+    ("Arial Unicode MS" . 16))
+  "Measured U+270E advances; none equals the 9px ASCII cell.")
+
+(defun pi-coding-agent-gui-test--configured-native-font-stack-p ()
+  "Return non-nil for the supported configured macOS NS test frame."
+  (and (display-graphic-p)
+       (eq window-system 'ns)
+       (equal (face-attribute 'default :family nil t)
+              "LXGW WenKai Mono")
+       (= (string-pixel-width "M") 9)))
+
+(defun pi-coding-agent-gui-test--measure-native-string (text window)
+  "Measure TEXT in WINDOW and return stable width/font metadata."
+  (let* ((font (font-at 1 window))
+         (family (and font (font-get font :family))))
+    (list :text text
+          :codepoints (string-to-list text)
+          :char-widths (mapcar #'char-width (string-to-list text))
+          :string-width (string-width text)
+          :wrapper-width (markdown-table-wrap-visible-width text)
+          :font (and family
+                     (replace-regexp-in-string
+                      "\\\\ " " " (format "%s" family)))
+          :pixels (string-pixel-width text))))
+
+(defun pi-coding-agent-gui-test--table-overlays-in (buffer beg end)
+  "Return ordered table display overlays in BUFFER between BEG and END."
+  (with-current-buffer buffer
+    (sort
+     (seq-filter
+      (lambda (overlay)
+        (overlay-get overlay 'pi-coding-agent-table-display))
+      (overlays-in beg end))
+     (lambda (left right)
+       (< (overlay-start left) (overlay-start right))))))
+
 (defun pi-coding-agent-gui-test--thinking-scroll-lines (prefix count)
   "Return COUNT newline-separated lines starting with PREFIX."
   (mapconcat (lambda (n) (format "%s %02d" prefix n))
@@ -463,6 +569,177 @@ logical block and should not start following later streamed output."
               (should (= line-before (pi-coding-agent-gui-test-top-line-number)))))
         (set-frame-size frame orig-width (frame-height))
         (redisplay)))))
+
+(ert-deftest pi-coding-agent-gui-test-native-unicode-character-baseline ()
+  "Configured NS frame matches the recorded character-width evidence."
+  (skip-unless
+   (pi-coding-agent-gui-test--configured-native-font-stack-p))
+  (let ((buffer (generate-new-buffer " *pi-native-unicode-baseline*"))
+        (window (selected-window)))
+    (unwind-protect
+        (save-window-excursion
+          (set-window-buffer window buffer)
+          (with-current-buffer buffer
+            (dolist (fixture pi-coding-agent-gui-test--native-unicode-baseline)
+              (let ((text (plist-get fixture :text)))
+                (erase-buffer)
+                (insert text)
+                (redisplay t)
+                (let ((actual
+                       (pi-coding-agent-gui-test--measure-native-string
+                        text window)))
+                  (dolist (field
+                           '(:codepoints :char-widths :string-width
+                             :wrapper-width :pixels))
+                    (should
+                     (equal (plist-get actual field)
+                            (plist-get fixture field))))
+                  (when-let* ((expected-font (plist-get fixture :font)))
+                    (should
+                     (equal (plist-get actual :font) expected-font))))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest pi-coding-agent-gui-test-native-u270e-font-scan-baseline ()
+  "Known U+270E fonts remain non-cellular, preserving raw fallback."
+  (skip-unless
+   (pi-coding-agent-gui-test--configured-native-font-stack-p))
+  (let ((buffer (generate-new-buffer " *pi-u270e-font-scan*"))
+        (window (selected-window))
+        advances)
+    (unwind-protect
+        (save-window-excursion
+          (set-window-buffer window buffer)
+          (with-current-buffer buffer
+            (dolist (fixture pi-coding-agent-gui-test--u270e-font-scan)
+              (erase-buffer)
+              (insert
+               (propertize "✎" 'face `(:family ,(car fixture))))
+              (redisplay t)
+              (let ((pixels (string-pixel-width
+                             (buffer-substring (point-min) (point-max)))))
+                (push pixels advances)
+                (should (= pixels (cdr fixture)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))
+    (should-not (memq 9 advances))
+    (should
+     (equal "✎"
+            (pi-coding-agent--normalize-table-display-cell "✎")))))
+
+(ert-deftest pi-coding-agent-gui-test-native-table-pixel-gate-and-fallback ()
+  "Unsafe tables stay raw while safe normalized grids align at every border."
+  (skip-unless
+   (pi-coding-agent-gui-test--configured-native-font-stack-p))
+  (let ((buffer (generate-new-buffer " *pi-native-table-safety*"))
+        (window (selected-window))
+        unsafe-beg unsafe-end safe-beg safe-end)
+    (unwind-protect
+        (save-window-excursion
+          (set-window-buffer window buffer)
+          (with-current-buffer buffer
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (setq unsafe-beg (point))
+              (insert
+               "| Symbol | Result |\n"
+               "|--------|--------|\n"
+               "| ✎ | raw |\n"
+               "| ❯ | raw |\n")
+              (setq unsafe-end (point))
+              (insert "\n")
+              (setq safe-beg (point))
+              (insert
+               "| Symbol | Result |\n"
+               "|--------|--------|\n"
+               "| 🛠 | normalized |\n"
+               "| ⚙ | normalized |\n"
+               "| ⚠️ | selected |\n"
+               "| `🔧` | inline code |\n")
+              (setq safe-end (point)))
+            (font-lock-ensure)
+            (pi-coding-agent--decorate-tables-in-region
+             (point-min) (point-max) 80)
+            (redisplay t)
+            (should-not
+             (pi-coding-agent-gui-test--table-overlays-in
+              buffer unsafe-beg unsafe-end))
+            (let* ((overlays
+                    (pi-coding-agent-gui-test--table-overlays-in
+                     buffer safe-beg safe-end))
+                   (display-lines
+                    (apply
+                     #'append
+                     (mapcar
+                      (lambda (overlay)
+                        (split-string
+                         (string-trim-right
+                          (overlay-get overlay 'display) "\n+")
+                         "\n"))
+                      overlays)))
+                   (row-lines
+                    (seq-filter
+                     (lambda (line) (string-search "│" line))
+                     display-lines))
+                   (border-positions
+                    (mapcar
+                     (lambda (line)
+                       (let (positions)
+                         (dotimes (index (length line))
+                           (when (= (aref line index) ?│)
+                             (push
+                              (string-pixel-width
+                               (substring line 0 (1+ index)))
+                              positions)))
+                         (nreverse positions)))
+                     row-lines))
+                   (pixel-widths
+                    (mapcar #'string-pixel-width display-lines)))
+              (should overlays)
+              (should
+               (seq-some
+                (lambda (line)
+                  (string-search (string #x1f6e0 #xfe0f) line))
+                display-lines))
+              (should
+               (seq-some
+                (lambda (line)
+                  (string-search (string #x2699 #xfe0f) line))
+                display-lines))
+              (should (= 1 (length (delete-dups pixel-widths))))
+              (should (= 1 (length (delete-dups border-positions))))
+              (should
+               (cl-every
+                (lambda (line)
+                  (pi-coding-agent--table-line-pixel-safe-p
+                   line window 9))
+                display-lines)))
+            (should
+             (string-search "| ✎ | raw |" (buffer-string)))
+            (should
+             (string-search "| 🛠 | normalized |" (buffer-string)))
+            (should-not
+             (string-search
+              (string #x1f6e0 #xfe0f)
+              (buffer-string)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest pi-coding-agent-gui-test-reported-table-fixtures-are-complete ()
+  "Regression fixtures retain every reported row and legacy pixel datum."
+  (should
+   (equal (mapcar #'cdr pi-coding-agent-gui-test--legacy-table-row-pixels)
+          '(558 565 571 560 567 576 567)))
+  (dolist (needle '("✎" "🛠" "⚙" "⚙️" "⚠️" "❯"
+                    "◽" "◾" "🔧" "💭" "✅"))
+    (should
+     (string-search needle
+                    pi-coding-agent-gui-test--reported-symbol-table)))
+  (dolist (needle '("char-width" "string-width" "wrapper width"
+                    "U+270E" "U+1F6E0+FE0F" "font-at" "16px"))
+    (should
+     (string-search needle
+                    pi-coding-agent-gui-test--reported-measurement-table))))
 
 ;;;; Content Tests
 
