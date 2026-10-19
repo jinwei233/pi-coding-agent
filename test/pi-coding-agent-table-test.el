@@ -1403,6 +1403,16 @@ When fringes like `display-line-numbers-mode' consume columns,
    "`[ssoForwardProxy] setup failed, stage=%s error=%s` |\n")
   "A three-column comparison table that needs a stacked narrow layout.")
 
+(defconst pi-coding-agent-test--narrow-environment-table
+  (concat
+   "| 项 | canary | single_dc |\n"
+   "|---|---|---|\n"
+   "| SSO_FORWARD_PROXY_ENABLED | true | true |\n"
+   "| SSO_FORWARD_PROXY_URL | "
+   "http://proxy-3xczsnw2w145t654mm0b.byteproxyrnt.net:8080 | 同左 |\n"
+   "| TCE_PSM | fe.vconsole.universal_server_i18n | 同左 |\n")
+  "A narrow environment table containing an overlong URL token.")
+
 (ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()
   "Only the explicit same-base allowlist receives one VS16."
   (dolist (base '(#x1f6e0 #x2699 #x26a0))
@@ -1556,6 +1566,34 @@ When fringes like `display-line-numbers-mode' consume columns,
                "error=%s"))
       (should (string-search token text)))
     (should-not (string-search "[ ssoForwardProxy]" text))
+    (should
+     (cl-every
+      (lambda (line)
+        (= (markdown-table-wrap-visible-width line) 55))
+      display-lines))))
+
+(ert-deftest pi-coding-agent-test-table-stacked-layout-breaks-long-url-readably ()
+  "A URL wider than a stacked row wraps without rejecting the table."
+  (let* ((url "http://proxy-3xczsnw2w145t654mm0b.byteproxyrnt.net:8080")
+         (fragments
+          (pi-coding-agent--break-visible-technical-token url 51))
+         (raw-lines
+          (split-string
+           (string-trim-right
+            pi-coding-agent-test--narrow-environment-table)
+           "\n"))
+         (projection
+          (pi-coding-agent--table-display-projection raw-lines 55))
+         (display-lines
+          (and projection
+               (apply #'append (plist-get projection :groups)))))
+    (should (equal (apply #'concat fragments) url))
+    (should
+     (cl-every
+      (lambda (fragment)
+        (<= (markdown-table-wrap-visible-width fragment) 51))
+      fragments))
+    (should (eq (plist-get projection :layout) 'stacked))
     (should
      (cl-every
       (lambda (line)

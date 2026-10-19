@@ -355,6 +355,32 @@ Cells with no inline syntax characters are returned as-is."
 
 ;;;; Cell Rendering
 
+(defun pi-coding-agent--break-visible-technical-token (word width)
+  "Break overlong visible WORD into WIDTH-sized readable fragments.
+ASCII technical tokens prefer a break after URL/path/identifier punctuation.
+Other text uses the wrapper's display-width-aware fallback.  Text properties
+and canonical buffer content are preserved."
+  (if (or (/= (length word) (string-bytes word))
+          (<= (length word) width))
+      (markdown-table-wrap--force-break-plain word width)
+    (let ((start 0)
+          (length (length word))
+          fragments)
+      (while (> (- length start) width)
+        (let* ((limit (+ start width))
+               (minimum (+ start (max 1 (/ width 2))))
+               (break
+                (cl-loop for position downfrom limit above minimum
+                         when (memq (aref word (1- position))
+                                    '(?/ ?. ?- ?_ ?: ?? ?& ?= ?#))
+                         return position)))
+          (setq break (or break limit))
+          (push (substring word start break) fragments)
+          (setq start break)))
+      (when (< start length)
+        (push (substring word start) fragments))
+      (nreverse fragments))))
+
 (defun pi-coding-agent--wrap-visible-table-cell (text width)
   "Wrap already-extracted visible TEXT to WIDTH without reparsing Markdown.
 Visible cells no longer contain active Markdown delimiters, so punctuation such
@@ -375,7 +401,8 @@ token.  Text properties are preserved by substring-based splitting."
               (setq current-line ""
                     current-width 0))
             (dolist (fragment
-                     (markdown-table-wrap--force-break-plain word width))
+                     (pi-coding-agent--break-visible-technical-token
+                      word width))
               (unless (string-empty-p current-line)
                 (push current-line lines))
               (setq current-line fragment
@@ -650,16 +677,14 @@ Return nil when CONTENT-WIDTH cannot hold all atomic minima and grid borders."
     (concat "│ " text (make-string padding ?\s) " │")))
 
 (defun pi-coding-agent--stacked-table-groups
-    (headers rows width num-cols minima)
+    (headers rows width num-cols _minima)
   "Return narrow responsive display groups, or nil when unsafe.
 This layout is limited to two through four columns.  Each raw data row becomes
 a framed row title plus labeled field lines, preserving the raw-line mapping."
   (let ((inner-width (- width 4)))
     (when (and pi-coding-agent-prettify-tables
                (<= 2 num-cols 4)
-               (>= inner-width 16)
-               (cl-loop for minimum across minima
-                        always (<= minimum inner-width)))
+               (>= inner-width 16))
       (let* ((padded-headers
               (append headers
                       (make-list (max 0 (- num-cols (length headers))) "")))
