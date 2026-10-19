@@ -20,7 +20,7 @@ SELECTOR ?=
 # Example: make test VERBOSE=1
 VERBOSE ?=
 
-.PHONY: test test-unit test-core test-ui test-render test-transcript test-table test-input test-menu test-build
+.PHONY: test test-unit test-core test-ui test-render test-transcript test-tool-activity test-table test-input test-menu test-build
 .PHONY: test-integration test-integration-fake test-integration-real test-integration-ci test-integration-ci-real test-gui test-gui-ci test-all
 .PHONY: bench bench-batch bench-reload-resume bench-reload-resume-batch bench-reload-resume-smoke bench-large-output-batch
 .PHONY: check check-parens compile lint lint-checkdoc lint-package clean clean-cache help
@@ -97,6 +97,7 @@ test: .deps-stamp
 		-l pi-coding-agent-render-test \
 		-l pi-coding-agent-summary-test \
 		-l pi-coding-agent-transcript-test \
+		-l pi-coding-agent-tool-activity-test \
 		-l pi-coding-agent-table-test \
 		-l pi-coding-agent-input-test \
 		-l pi-coding-agent-menu-test \
@@ -132,6 +133,8 @@ test-render: .deps-stamp
 	@$(BATCH_TEST) -l pi-coding-agent-render-test $(ERT_RUN)
 test-transcript: .deps-stamp
 	@$(BATCH_TEST) -l pi-coding-agent-transcript-test $(ERT_RUN)
+test-tool-activity: .deps-stamp
+	@$(BATCH_TEST) -l pi-coding-agent-tool-activity-test $(ERT_RUN)
 test-table: .deps-stamp
 	@$(BATCH_TEST) -l pi-coding-agent-table-test $(ERT_RUN)
 test-input: .deps-stamp

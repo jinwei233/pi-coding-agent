@@ -152,6 +152,16 @@ the query when no table can be present.")
 (defvar-local pi-coding-agent--assistant-text-start-marker nil
   "Start marker for the current live assistant text unit.")
 
+(defvar-local pi-coding-agent--tool-activity-display nil
+  "Effective tool activity display mode for this chat buffer.
+Nil means use `pi-coding-agent-tool-activity-display'.")
+
+(defvar-local pi-coding-agent--tool-activity-revealed nil
+  "List of user turn ordinals whose tool activity is currently revealed.")
+
+(defvar-local pi-coding-agent--hidden-tool-count 0
+  "Number of completed tool calls currently hidden in this buffer.")
+
 (defconst pi-coding-agent--history-render-state-variables
   '(pi-coding-agent--canonical-messages
     pi-coding-agent--hot-tail-start
@@ -187,6 +197,9 @@ the query when no table can be present.")
     pi-coding-agent--streaming-table-candidate
     pi-coding-agent--last-table-display-width
     pi-coding-agent--table-decoration-pending
+    pi-coding-agent--tool-activity-display
+    pi-coding-agent--tool-activity-revealed
+    pi-coding-agent--hidden-tool-count
     pi-coding-agent--visible-string-cache)
   "Buffer-local state that belongs to rendered transcript text.")
 
@@ -895,16 +908,33 @@ Normalizes any existing newline run to two newlines."
      ((> newline-count 2)
       (delete-region (+ start 2) (+ start newline-count))))))
 
+(defun pi-coding-agent--preceding-hidden-line-p ()
+  "Return non-nil when the text before point is hidden transcript structure.
+Hidden turn headings and hidden tool activity contribute no visible line, so a
+paragraph gap before the next block would show up as a stray blank line."
+  (let ((probe (1- (point))))
+    (and (> probe (point-min))
+         (or (and (get-text-property
+                   probe pi-coding-agent--tool-activity-region-property)
+                  (pi-coding-agent--tool-activity-hidden-p probe))
+             (and (get-text-property probe 'pi-coding-agent-cold-tool-block)
+                  (pi-coding-agent--tool-activity-hidden-p probe))
+             (and (get-text-property probe pi-coding-agent--hidden-turn-structure-property)
+                  (invisible-p (get-text-property probe 'invisible)))))))
+
 (defun pi-coding-agent--ensure-blank-line-before-block ()
   "Ensure point is on a fresh line with a blank line above.
 Used before inserting a new block (thinking, tool) so it is visually
-separated from preceding content."
-  (unless (bolp)
-    (insert "\n"))
-  (unless (save-excursion
-            (forward-line -1)
-            (looking-at-p "^$"))
-    (insert "\n")))
+separated from preceding content.  A preceding hidden tool block already
+has no visible line, so it does not get a second gap."
+  (if (pi-coding-agent--preceding-hidden-line-p)
+      (unless (bolp) (insert "\n"))
+    (unless (bolp)
+      (insert "\n"))
+    (unless (save-excursion
+              (forward-line -1)
+              (looking-at-p "^$"))
+      (insert "\n"))))
 
 (defun pi-coding-agent--reset-thinking-state ()
   "Detach and clear all thinking-stream state for the current turn."
@@ -1941,6 +1971,11 @@ Returns a plist with:
               :hidden-lines (if (and truncated-first-line (= hidden 0)) 1 hidden)
               :line-map line-map-vec)))))
 
+(defun pi-coding-agent--reset-tool-activity-state ()
+  "Reset per-buffer tool activity reveal state and hidden counter."
+  (setq pi-coding-agent--tool-activity-revealed nil)
+  (setq pi-coding-agent--hidden-tool-count 0))
+
 (defun pi-coding-agent--clear-render-artifacts ()
   "Delete pi-owned render artifacts in the current chat buffer.
 This removes completed/pending tool overlays, diff overlays, and lightweight
@@ -1974,6 +2009,7 @@ left alone."
   (when pi-coding-agent--transient-tool-pairs
     (clrhash pi-coding-agent--transient-tool-pairs))
   (pi-coding-agent--cleanup-tool-detail-buffers)
+  (pi-coding-agent--reset-tool-activity-state)
   (when pi-coding-agent--live-tool-blocks
     (clrhash pi-coding-agent--live-tool-blocks)))
 
@@ -2166,6 +2202,10 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
 
 (defconst pi-coding-agent--tool-summary-error-bytes 2048
   "Maximum prefix size scanned for a one-line completed tool summary.")
+
+(defun pi-coding-agent--line-count-label (count)
+  "Return COUNT formatted as a singular or plural line label."
+  (format "%d line%s" count (if (eql count 1) "" "s")))
 
 (defun pi-coding-agent--tool-text-line-count (text)
   "Return the physical line count of TEXT without splitting it."
@@ -2547,6 +2587,9 @@ until an authoritative tool execution/history event supplies it."
                  block (pi-coding-agent--tool-arg-path args))))))))
     (setq pi-coding-agent--pending-tool-overlay
           (pi-coding-agent--tool-block-overlay block))
+    (when (and block (pi-coding-agent--tool-activity-hidden-mode-p))
+      (pi-coding-agent--hide-tool-block-header block)
+      (pi-coding-agent--display-tool-running-line block))
     (pi-coding-agent--tool-block-register block)))
 
 (defun pi-coding-agent--tool-block-finalize (block face)
@@ -2961,10 +3004,13 @@ PARTIAL-RESULT has the same structure as a tool result plist with
 `:content'.  Extracts text from content blocks and delegates to
 `pi-coding-agent--display-tool-streaming-text'."
   (when partial-result
-    (let* ((content-blocks (plist-get partial-result :content))
-           (raw-output (pi-coding-agent--extract-text-from-content content-blocks)))
-      (pi-coding-agent--display-tool-streaming-text
-       raw-output pi-coding-agent-bash-preview-lines nil block))))
+    (if (pi-coding-agent--tool-activity-hidden-mode-p)
+        (pi-coding-agent--display-tool-running-line
+         (or block (pi-coding-agent--current-tool-block)))
+      (let* ((content-blocks (plist-get partial-result :content))
+             (raw-output (pi-coding-agent--extract-text-from-content content-blocks)))
+        (pi-coding-agent--display-tool-streaming-text
+         raw-output pi-coding-agent-bash-preview-lines nil block)))))
 
 (defun pi-coding-agent--markdown-fence-delimiter (content)
   "Return a markdown fence delimiter safe for CONTENT.
@@ -3094,6 +3140,7 @@ if none exists, render the result at point without a live overlay."
          (path (pi-coding-agent--tool-path-string
                 (pi-coding-agent--tool-arg-path args)))
          (first-line (pi-coding-agent--first-nonempty-line raw))
+         (command (pi-coding-agent--tool-arg-get args :command))
          (detail-locator (list :tool-call-id tool-call-id))
          summary)
     (setq summary
@@ -3101,7 +3148,8 @@ if none exists, render the result at point without a live overlay."
            (if error-p
                (if first-line
                    (format "failed · %s" first-line)
-                 (format "failed · %d lines" lines))
+                 (format "failed · %s"
+                         (pi-coding-agent--line-count-label lines)))
              (pcase tool-name
                ("edit"
                 (let* ((diff (pi-coding-agent--tool-arg-get details :diff))
@@ -3110,21 +3158,23 @@ if none exists, render the result at point without a live overlay."
                ("write"
                 (let ((written (or (pi-coding-agent--tool-arg-get args :content)
                                    "")))
-                  (format "%d lines · %s"
-                          (pi-coding-agent--tool-text-line-count written)
+                  (format "%s · %s"
+                          (pi-coding-agent--line-count-label
+                           (pi-coding-agent--tool-text-line-count written))
                           (pi-coding-agent--tool-byte-label written))))
                ("read"
                 (let* ((offset (pi-coding-agent--tool-arg-get args :offset))
                        (end (and offset (> lines 0) (+ offset lines -1))))
-                  (format "%s%d lines"
+                  (format "%s%s"
                           (if offset
                               (format "L%d-L%d · " offset (or end offset))
                             "")
-                          lines)))
+                          (pi-coding-agent--line-count-label lines))))
                ("bash"
                 (if first-line
-                    (format "%d lines · %s" lines first-line)
-                  (format "%d lines" lines)))
+                    (format "%s · %s"
+                            (pi-coding-agent--line-count-label lines) first-line)
+                  (pi-coding-agent--line-count-label lines)))
                (_
                 (let ((args-summary (pi-coding-agent--tool-generic-summary args))
                       (details-summary
@@ -3139,11 +3189,227 @@ if none exists, render the result at point without a live overlay."
           :tool-name tool-name
           :error error-p
           :path path
+          :command (and (stringp command) command)
           :offset (pi-coding-agent--tool-arg-get args :offset)
           :line-count lines
           :summary summary
           :images (pi-coding-agent--tool-result-images content)
           :detail-locator detail-locator)))
+
+;;;; Tool Activity Visibility (hidden mode)
+
+(defun pi-coding-agent--tool-activity-hidden-mode-p ()
+  "Return non-nil when completed tool activity is hidden until revealed."
+  (eq (or pi-coding-agent--tool-activity-display
+          pi-coding-agent-tool-activity-display)
+      'hidden))
+
+(defun pi-coding-agent--tool-activity-turn-ordinal (&optional position)
+  "Return the 0-based user turn ordinal containing POSITION.
+Orphaned content before the first user heading (for example a compacted
+history window that starts mid-turn) uses the synthetic ordinal -1 so its
+tool activity can still be revealed."
+  (save-excursion
+    (when position (goto-char position))
+    (or (pi-coding-agent--user-turn-index-at-point) -1)))
+
+(defun pi-coding-agent--tool-activity-revealed-p (&optional ordinal)
+  "Return non-nil when turn ORDINAL currently shows its tool activity."
+  (and (integerp ordinal)
+       (memql ordinal pi-coding-agent--tool-activity-revealed)))
+
+(defun pi-coding-agent--tool-activity-command-hint (command)
+  "Return a short hint for COMMAND without echoing the whole command line.
+Only the first word is kept so the reveal line never shows the full command,
+its flags, or escaped newlines."
+  (when (and (stringp command) (not (string-empty-p (string-trim command))))
+    (let ((token (car (split-string (string-trim command) "[ \t\n]+"))))
+      (pi-coding-agent--truncate-middle token 24))))
+
+(defun pi-coding-agent--tool-activity-target-label (record)
+  "Return the compact target label for RECORD.
+Prefers a project-relative path; tools without a path fall back to a short
+command hint."
+  (let ((path (plist-get record :path)))
+    (if (and (stringp path) (not (string-empty-p path)))
+        (let* ((dir (or (and (boundp 'pi-coding-agent--canonical-session-directory)
+                             pi-coding-agent--canonical-session-directory)
+                        default-directory))
+               (relative (condition-case nil
+                             (file-relative-name path dir)
+                           (error path))))
+          (pi-coding-agent--truncate-middle relative 44))
+      (pi-coding-agent--tool-activity-command-hint (plist-get record :command)))))
+
+(defun pi-coding-agent--tool-activity-line (record)
+  "Return the single-line reduced activity text for RECORD."
+  (let* ((name (or (plist-get record :tool-name) "tool"))
+         (target (pi-coding-agent--tool-activity-target-label record))
+         (counter (plist-get record :summary))
+         (counter (and (stringp counter)
+                       (not (string-empty-p counter))
+                       counter)))
+    (pi-coding-agent--single-line-preview
+     (string-join (delq nil (list name target counter)) " · "))))
+
+(defun pi-coding-agent--tool-activity-body-text (record)
+  "Return the visible-by-reveal body text for RECORD."
+  (if (pi-coding-agent--tool-activity-hidden-mode-p)
+      (pi-coding-agent--tool-activity-line record)
+    (or (plist-get record :summary) "")))
+
+(defun pi-coding-agent--set-tool-activity-revealed (ordinal revealed)
+  "Record that turn ORDINAL shows or hides its tool activity per REVEALED."
+  (if revealed
+      (unless (memql ordinal pi-coding-agent--tool-activity-revealed)
+        (setq pi-coding-agent--tool-activity-revealed
+              (cons ordinal pi-coding-agent--tool-activity-revealed)))
+    (setq pi-coding-agent--tool-activity-revealed
+          (delq ordinal pi-coding-agent--tool-activity-revealed))))
+
+(defun pi-coding-agent--tool-activity-body-runs (&optional ordinal)
+  "Return (START . END) runs of reduced tool activity text.
+When ORDINAL is non-nil only runs inside that turn are returned."
+  (let ((position (point-min))
+        runs)
+    (while (< position (point-max))
+      (let ((end (next-single-char-property-change
+                  position pi-coding-agent--tool-activity-region-property
+                  nil (point-max))))
+        (when (and (eq (get-text-property
+                        position pi-coding-agent--tool-activity-region-property)
+                       'body)
+                   (or (null ordinal)
+                       (eql ordinal
+                            (pi-coding-agent--tool-activity-turn-ordinal
+                             position))))
+          (push (cons position end) runs))
+        (setq position end)))
+    (nreverse runs)))
+
+(defun pi-coding-agent--tool-activity-any-p (&optional ordinal)
+  "Return non-nil when the buffer has reduced tool activity.
+When ORDINAL is non-nil only that turn is considered."
+  (or (pi-coding-agent--tool-activity-body-runs ordinal)
+      (and (not (pi-coding-agent--tool-activity-hidden-mode-p))
+           nil)))
+
+(defun pi-coding-agent--reveal-tool-activity-in-turn (ordinal)
+  "Show the reduced tool activity of turn ORDINAL."
+  (when (integerp ordinal)
+    (dolist (run (pi-coding-agent--tool-activity-body-runs ordinal))
+      (pi-coding-agent--show-tool-activity (car run) (cdr run)))
+    (pi-coding-agent--set-tool-activity-revealed ordinal t)
+    (pi-coding-agent--update-hidden-tool-count)
+    (force-mode-line-update t)))
+
+(defun pi-coding-agent--hide-tool-activity-in-turn (ordinal)
+  "Hide the tool activity of turn ORDINAL again."
+  (when (integerp ordinal)
+    (with-current-buffer (current-buffer)
+      (let ((inhibit-read-only t))
+        ;; Collapse expanded details first so only the reduced line is rewritten.
+        (dolist (overlay (overlays-in (point-min) (point-max)))
+          (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
+                     (overlay-get overlay 'pi-coding-agent-tool-detail-expanded)
+                     (eql ordinal
+                          (pi-coding-agent--tool-activity-turn-ordinal
+                           (overlay-start overlay))))
+            (let ((block (pi-coding-agent--tool-block-from-overlay overlay)))
+              (when block
+                (pi-coding-agent--collapse-tool-detail block)))))
+        (dolist (run (pi-coding-agent--tool-activity-body-runs ordinal))
+          (let ((kind (get-text-property (car run)
+                                         pi-coding-agent--tool-activity-region-property)))
+            (pi-coding-agent--hide-tool-activity (car run) (cdr run) kind)))))
+    (pi-coding-agent--set-tool-activity-revealed ordinal nil)
+    (pi-coding-agent--update-hidden-tool-count)
+    (force-mode-line-update t)))
+
+(defun pi-coding-agent--update-hidden-tool-count ()
+  "Recompute the number of hidden completed tool calls in this buffer.
+Counts hot blocks with a completed summary and cold metadata runs whose
+turn is not currently revealed."
+  (let ((count 0))
+    (unless (pi-coding-agent--tool-activity-hidden-mode-p)
+      (setq count 0)
+      (setq pi-coding-agent--hidden-tool-count 0))
+    (when (pi-coding-agent--tool-activity-hidden-mode-p)
+    (dolist (overlay (overlays-in (point-min) (point-max)))
+      (when (and (overlay-get overlay 'pi-coding-agent-tool-block)
+                 (overlay-get overlay 'pi-coding-agent-tool-summary)
+                 (not (overlay-get overlay 'pi-coding-agent-tool-detail-expanded)))
+        (unless (pi-coding-agent--tool-activity-revealed-p
+                 (pi-coding-agent--tool-activity-turn-ordinal
+                  (overlay-start overlay)))
+          (setq count (1+ count)))))
+    (let ((position (point-min)))
+      (while (< position (point-max))
+        (let ((end (next-single-char-property-change
+                    position 'pi-coding-agent-cold-tool-block nil (point-max))))
+          (when (get-text-property position 'pi-coding-agent-cold-tool-block)
+            (unless (pi-coding-agent--tool-activity-revealed-p
+                     (pi-coding-agent--tool-activity-turn-ordinal position))
+              (setq count (1+ count))))
+          (setq position end)))))
+    (setq pi-coding-agent--hidden-tool-count count)))
+
+(defun pi-coding-agent--display-tool-running-line (block)
+  "Ensure BLOCK's body is the single reduced running line."
+  (when-let* ((ov (pi-coding-agent--tool-block-overlay block))
+              (header-end (pi-coding-agent--tool-block-header-end block))
+              (end-marker (pi-coding-agent--tool-block-end-marker block))
+              (start (marker-position header-end))
+              (end (marker-position end-marker)))
+    (let* ((name (or (overlay-get ov 'pi-coding-agent-tool-name) "tool"))
+           (line (format "▸ %s · running" name)))
+      (unless (equal (buffer-substring-no-properties start end)
+                     (concat line "\n"))
+        (let ((inhibit-read-only t))
+          (pi-coding-agent--with-scroll-preservation
+            (save-excursion
+              (goto-char start)
+              (delete-region start end)
+              (insert line "\n")
+              (set-marker end-marker (point))
+              (pi-coding-agent--tool-block-refresh-overlay block))))))))
+
+(defun pi-coding-agent--hide-tool-block-header (block)
+  "Hide BLOCK's header text, keeping it in the buffer."
+  (when-let* ((ov (pi-coding-agent--tool-block-overlay block))
+              (header-end (pi-coding-agent--tool-block-header-end block)))
+    (let ((start (overlay-start ov))
+          (end (marker-position header-end)))
+      (when (< start end)
+        (pi-coding-agent--hide-tool-activity start end 'header)))))
+
+(defun pi-coding-agent--collapse-tool-detail (block)
+  "Collapse BLOCK's expanded detail back to its reduced activity line."
+  (when-let* ((ov (pi-coding-agent--tool-block-overlay block))
+              (header-end (pi-coding-agent--tool-block-header-end block))
+              (end-marker (pi-coding-agent--tool-block-end-marker block)))
+    (let ((inhibit-read-only t)
+          (record (overlay-get ov 'pi-coding-agent-tool-summary)))
+      (pi-coding-agent--with-scroll-preservation
+        (save-excursion
+          (goto-char (marker-position header-end))
+          (delete-region (point) (marker-position end-marker))
+          (pi-coding-agent--insert-tool-summary record)
+          (set-marker end-marker (point))
+          (pi-coding-agent--tool-block-refresh-overlay block)
+          (overlay-put ov 'pi-coding-agent-tool-detail-expanded nil))))))
+
+(defun pi-coding-agent--toggle-tool-activity-at-point ()
+  "Toggle tool activity visibility for the turn at point.
+Returns non-nil when the turn had tool activity and was toggled."
+  (when (pi-coding-agent--tool-activity-hidden-mode-p)
+    (let* ((ordinal (pi-coding-agent--tool-activity-turn-ordinal))
+           (runs (and ordinal (pi-coding-agent--tool-activity-body-runs ordinal))))
+      (when (and ordinal runs)
+        (if (pi-coding-agent--tool-activity-revealed-p ordinal)
+            (pi-coding-agent--hide-tool-activity-in-turn ordinal)
+          (pi-coding-agent--reveal-tool-activity-in-turn ordinal))
+        t))))
 
 (defun pi-coding-agent--insert-tool-summary-fragment (text)
   "Insert summary TEXT without exposing open Markdown block delimiters.
@@ -3167,12 +3433,18 @@ openers that could consume later assistant content."
     (insert (substring text copy-start))))
 
 (defun pi-coding-agent--insert-tool-summary (record)
-  "Insert the visible one-line summary for RECORD as a whole-line button.
+  "Insert the one-line activity or summary text for RECORD as a button.
+In `hidden' mode the line is the reduced `<tool> · <target> · <count>'
+text and stays hidden until the turn is revealed; failures stay visible.
 The button carries the toggle metadata that TAB dispatch, RET activation and
 cold-history collapsed detection rely on.  It has no visible expand label and
 no button face: discoverability comes from `help-echo' only."
-  (let* ((summary (or (plist-get record :summary) ""))
-         (tool-call-id (plist-get record :tool-call-id)))
+  (let* ((hidden-mode (pi-coding-agent--tool-activity-hidden-mode-p))
+         (error-p (plist-get record :error))
+         (summary (pi-coding-agent--tool-activity-body-text record))
+         (tool-call-id (plist-get record :tool-call-id))
+         (ordinal (pi-coding-agent--tool-activity-turn-ordinal))
+         (reveal-p (pi-coding-agent--tool-activity-revealed-p ordinal)))
     (let ((inhibit-read-only t)
           (start (point)))
       (pi-coding-agent--insert-tool-summary-fragment summary)
@@ -3185,9 +3457,16 @@ no button face: discoverability comes from `help-echo' only."
        'help-echo "TAB/click: expand tool detail"
        'pi-coding-agent-tool-toggle t
        'pi-coding-agent-tool-call-id tool-call-id
-       'pi-coding-agent-summary summary
+       'pi-coding-agent-summary (plist-get record :summary)
+       'pi-coding-agent-tool-record record
        'pi-coding-agent-tool-images (plist-get record :images)
-       'pi-coding-agent-expanded nil))
+       'pi-coding-agent-expanded nil)
+      ;; Successful activity lines stay revealable; only their visibility
+      ;; depends on the turn state.  Failure lines stay visible unconditionally.
+      (when (and hidden-mode (not error-p))
+        (if reveal-p
+            (pi-coding-agent--mark-tool-activity-visible start (point))
+          (pi-coding-agent--hide-tool-activity start (point) 'body))))
     (pi-coding-agent--insert-output-image-blocks
      (plist-get record :images)
      pi-coding-agent--defer-history-postprocessing)))
@@ -3212,8 +3491,11 @@ no button face: discoverability comes from `help-echo' only."
     (unless pair
       (user-error "Tool detail unavailable for %s: pair not found" tool-call-id))
     (save-excursion
-      (goto-char (marker-position header-end))
-      (delete-region (point) (marker-position end-marker))
+      (goto-char (if (pi-coding-agent--tool-activity-hidden-mode-p)
+                     (marker-position end-marker)
+                   (marker-position header-end)))
+      (unless (pi-coding-agent--tool-activity-hidden-mode-p)
+        (delete-region (point) (marker-position end-marker)))
       (pi-coding-agent--insert-rendered-tool-content detail lang edit-p)
       (pi-coding-agent--insert-output-image-blocks
        (pi-coding-agent--tool-result-images
@@ -3226,6 +3508,9 @@ no button face: discoverability comes from `help-echo' only."
        'pi-coding-agent-tool-toggle t
        'pi-coding-agent-tool-call-id tool-call-id
        'pi-coding-agent-summary summary
+       'pi-coding-agent-tool-record
+       (and block (overlay-get (pi-coding-agent--tool-block-overlay block)
+                               'pi-coding-agent-tool-summary))
        'pi-coding-agent-tool-images
        (pi-coding-agent--tool-result-images
         (plist-get tool-result :content))
@@ -3234,13 +3519,22 @@ no button face: discoverability comes from `help-echo' only."
       (set-marker end-marker (point))
       (pi-coding-agent--tool-block-refresh-overlay block)
       (overlay-put (pi-coding-agent--tool-block-overlay block)
-                   'pi-coding-agent-tool-detail-expanded t))))
+                   'pi-coding-agent-tool-detail-expanded t)
+      ;; The reduced activity line keeps its own button; mark it expanded so a
+      ;; second TAB collapses instead of appending another copy of the detail.
+      (let* ((body-start (marker-position header-end))
+             (first-button (or (button-at body-start)
+                               (save-excursion
+                                 (goto-char body-start)
+                                 (next-button (point))))))
+        (when (and first-button
+                   (button-get first-button 'pi-coding-agent-tool-toggle))
+          (button-put first-button 'pi-coding-agent-expanded t))))))
 
 (defun pi-coding-agent--toggle-tool-summary (button)
   "Expand, collapse, or open the lazily resolved detail for BUTTON."
   (let* ((tool-call-id (button-get button 'pi-coding-agent-tool-call-id))
          (summary (button-get button 'pi-coding-agent-summary))
-         (images (button-get button 'pi-coding-agent-tool-images))
          (expanded (button-get button 'pi-coding-agent-expanded))
          (overlay (seq-find
                    (lambda (candidate)
@@ -3251,19 +3545,9 @@ no button face: discoverability comes from `help-echo' only."
     (unless tool-call-id
       (user-error "Tool detail unavailable: missing toolCallId"))
     (if expanded
-        (let ((header-end (pi-coding-agent--tool-block-header-end block))
-              (end-marker (pi-coding-agent--tool-block-end-marker block))
-              (inhibit-read-only t))
-          (save-excursion
-            (goto-char (marker-position header-end))
-            (delete-region (point) (marker-position end-marker))
-            (pi-coding-agent--insert-tool-summary
-             (list :tool-call-id tool-call-id
-                   :summary summary
-                   :images images))
-            (set-marker end-marker (point))
-            (pi-coding-agent--tool-block-refresh-overlay block)
-            (overlay-put overlay 'pi-coding-agent-tool-detail-expanded nil)))
+        (progn
+          (pi-coding-agent--collapse-tool-detail block)
+          (pi-coding-agent--update-hidden-tool-count))
       (let* ((pair (pi-coding-agent--resolve-tool-detail-pair tool-call-id))
              (detail (and pair (pi-coding-agent--tool-detail-text pair))))
         (unless pair
@@ -3273,7 +3557,8 @@ no button face: discoverability comes from `help-echo' only."
                pi-coding-agent--tool-inline-detail-byte-limit)
             (pi-coding-agent--open-tool-detail-buffer tool-call-id)
           (pi-coding-agent--render-tool-detail-inline
-           block tool-call-id summary))))))
+           block tool-call-id summary))
+        (pi-coding-agent--update-hidden-tool-count)))))
 
 (defun pi-coding-agent--display-tool-end-summary
     (tool-name args content details is-error &optional block)
@@ -3293,6 +3578,8 @@ no button face: discoverability comes from `help-echo' only."
               (delete-region (point) (marker-position end-marker))
               (pi-coding-agent--insert-tool-summary record)
               (set-marker end-marker (point))
+              (when (pi-coding-agent--tool-activity-hidden-mode-p)
+                (pi-coding-agent--hide-tool-block-header block))
               (when (equal tool-name "read")
                 (pi-coding-agent--tool-block-set-offset
                  block (pi-coding-agent--tool-arg-get args :offset)))
@@ -3306,7 +3593,12 @@ no button face: discoverability comes from `help-echo' only."
                block))
           (goto-char (point-max))
           (pi-coding-agent--insert-tool-summary record))
-        (when (eobp)
+        (pi-coding-agent--update-hidden-tool-count)
+        (force-mode-line-update t)
+        ;; A hidden block already ends with its own (folded) newline, so an
+        ;; extra one would show up as a stray blank line.
+        (when (and (eobp)
+                   (not (pi-coding-agent--tool-activity-hidden-mode-p)))
           (insert "\n"))))))
 
 (defun pi-coding-agent--display-tool-end
@@ -3594,15 +3886,17 @@ command falls back to `outline-cycle' for turn folding."
                 ;; overlay, breaking the next toggle.
                 (when-let* ((new-bounds (pi-coding-agent--find-tool-block-bounds)))
                   (goto-char (min original-pos (1- (cdr new-bounds))))))
-            ;; No button found - short output, use outline-cycle
-            (outline-cycle))
+            ;; No button in this block: fall back to the turn-level toggle.
+            (or (pi-coding-agent--toggle-tool-activity-at-point)
+                (outline-cycle)))
         (if-let* ((cold-block (pi-coding-agent--cold-tool-block-at-point))
                   (tool-call-id
                    (plist-get (plist-get cold-block :metadata)
                               :tool-call-id)))
             (pi-coding-agent--open-tool-detail-buffer tool-call-id)
-          ;; Not in a tool block
-          (outline-cycle))))))
+          ;; Not in a tool block: reveal or hide this turn's tool activity.
+          (or (pi-coding-agent--toggle-tool-activity-at-point)
+              (outline-cycle)))))))
 
 ;;;; Tool Block Cooling
 ;;
@@ -3718,6 +4012,41 @@ count because cold history must stay preview-only."
                                  (> hidden-count 0)
                                  hidden-count))))))
 
+(defun pi-coding-agent--cool-tool-overlay-hidden (overlay metadata header-end)
+  "Cool OVERLAY with METADATA in hidden tool activity mode.
+HEADER-END marks the boundary between the hidden header and the activity
+line.  Keeps both in place, drops overlay, button and diff interactivity, and
+records lightweight cold metadata so the activity line can be revealed and its
+detail opened later."
+  (let* ((ov-start (overlay-start overlay))
+         (ov-end (overlay-end overlay))
+         (target-metadata (plist-get metadata :target-metadata))
+         (ordinal (pi-coding-agent--tool-activity-turn-ordinal ov-start))
+         (reveal-p (pi-coding-agent--tool-activity-revealed-p ordinal))
+         (inhibit-read-only t))
+    (remove-overlays ov-start ov-end 'pi-coding-agent-diff-overlay t)
+    (remove-text-properties
+     ov-start ov-end '(pi-coding-agent-cold-tool-block nil))
+    (delete-overlay overlay)
+    (save-excursion
+      (goto-char header-end)
+      (let* ((body-start (point))
+             (line-end (progn (forward-line 1) (point)))
+             (activity-line (buffer-substring-no-properties body-start line-end)))
+        ;; Drop expanded detail text, keeping only the reduced activity line.
+        (when (< line-end ov-end)
+          (delete-region line-end ov-end))
+        (pi-coding-agent--hide-tool-activity ov-start (1- header-end) 'header)
+        (unless reveal-p
+          (pi-coding-agent--hide-tool-activity body-start line-end 'body))
+        (pi-coding-agent--ensure-cold-tool-property-nonsticky)
+        (add-text-properties
+         ov-start (point)
+         `(pi-coding-agent-cold-tool-block
+           ,(plist-put (copy-sequence target-metadata)
+                       :activity-line activity-line)))))
+    t))
+
 (defun pi-coding-agent--cool-tool-overlay (overlay)
   "Rewrite completed tool OVERLAY into its cold plain-history form.
 Preserves the header and visible preview, drops overlays, buttons, and
@@ -3727,6 +4056,8 @@ diff annotations."
                 (visible-body (plist-get metadata :visible-body))
                 (header-end (marker-position
                              (overlay-get overlay 'pi-coding-agent-header-end))))
+      (if (pi-coding-agent--tool-activity-hidden-mode-p)
+          (pi-coding-agent--cool-tool-overlay-hidden overlay metadata header-end)
       (let* ((inhibit-read-only t)
              (hidden-count (plist-get metadata :hidden-count))
              (target-metadata (plist-get metadata :target-metadata))
@@ -3756,7 +4087,7 @@ diff annotations."
           (add-text-properties
            ov-start (point)
            `(pi-coding-agent-cold-tool-block ,target-metadata)))
-        t))))
+        t)))))
 
 (defun pi-coding-agent--cool-completed-tool-blocks (overlays)
   "Cool the given completed tool OVERLAYS.
@@ -3770,7 +4101,9 @@ rewrites do not disturb remaining candidates."
     (pi-coding-agent--with-scroll-preservation
       (save-excursion
         (dolist (overlay sorted)
-          (pi-coding-agent--cool-tool-overlay overlay))))))
+          (pi-coding-agent--cool-tool-overlay overlay)))))
+  (pi-coding-agent--update-hidden-tool-count)
+  (force-mode-line-update t))
 
 (defun pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail ()
   "Cool completed tool blocks that fall before the hot-tail boundary.
@@ -6379,7 +6712,9 @@ all overlapping tool headers, live or finalized."
                     (when fl-face
                       (put-text-property pos next 'face fl-face))
                     (setq pos next))))
-              (put-text-property hdr-beg hdr-end 'fontified t))))))))
+              (put-text-property hdr-beg hdr-end 'fontified t)
+              ;; Hidden tool headers must stay invisible after this cleanup.
+              (pi-coding-agent--restore-hidden-structure hdr-beg hdr-end))))))))
 
 ;;;; History Display
 
@@ -6830,6 +7165,7 @@ Tool calls are rendered with headers, output, overlays, and toggles."
   (pi-coding-agent--set-streaming-marker nil)
   (pi-coding-agent--update-hot-tail-boundary)
   (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail)
+  (pi-coding-agent--update-hidden-tool-count)
   (pi-coding-agent--postprocess-history-buffer)
   (goto-char (point-max))
   (pi-coding-agent--schedule-parser-reconciliation))

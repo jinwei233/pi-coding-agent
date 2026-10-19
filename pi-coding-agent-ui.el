@@ -370,6 +370,18 @@ rebuilds, reloads, or whole-chat display-mode changes."
                  (const :tag "Hidden" hidden))
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-tool-activity-display 'summary
+  "How completed tool activity appears in the chat transcript.
+`summary' keeps the established presentation: the tool header followed by
+one summary line.  `hidden' hides successful tool activity completely and
+shows one `<tool> · <target> · <count>' line per turn only after a
+turn-level TAB reveal; running tools keep one line and failed tools keep
+one diagnosable line in both modes.  This option is the package default;
+set it in your init file to opt into the quieter `hidden' mode."
+  :type '(choice (const :tag "Header plus summary line" summary)
+                 (const :tag "Hidden until revealed" hidden))
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-thinking-hidden-preview t
   "Whether hidden completed thinking should preview its first line.
 This option is obsolete and ignored: collapsed completed thinking always
@@ -1454,6 +1466,10 @@ This is a read-only buffer showing the conversation history."
   (setq-local filter-buffer-substring-function
               #'pi-coding-agent--filter-buffer-substring)
   (setq-local pi-coding-agent--thinking-display pi-coding-agent-thinking-display)
+  (setq-local pi-coding-agent--tool-activity-display
+              pi-coding-agent-tool-activity-display)
+  (setq-local pi-coding-agent--tool-activity-revealed nil)
+  (setq-local pi-coding-agent--hidden-tool-count 0)
   (setq-local pi-coding-agent--tool-args-cache (make-hash-table :test 'equal))
   (setq-local pi-coding-agent--transient-tool-pairs
               (make-hash-table :test 'equal))
@@ -1481,7 +1497,7 @@ This is a read-only buffer showing the conversation history."
 
   ;; Structural turn headings are hidden with `invisible', which md-ts
   ;; fontification clears.  Restore them after every fontification pass.
-  (jit-lock-register #'pi-coding-agent--restore-hidden-turn-structure)
+  (jit-lock-register #'pi-coding-agent--restore-hidden-structure)
 
   ;; Decorate pipe tables lazily as they scroll into view.  History replay
   ;; eagerly decorates only the hot tail; this jit-lock pass renders older
@@ -2558,36 +2574,146 @@ property is not font-lock managed and lets
 `pi-coding-agent--restore-hidden-turn-structure' put `invisible' back
 after every fontification pass.")
 
-(defun pi-coding-agent--hide-turn-structure (start end)
-  "Hide turn structure text between START and END.
-START..END keeps its buffer text so turn navigation, fork-at-point,
-hot-tail boundaries and outline scanning still find the original
-headings.  Newlines inside the range get an empty `display' property
-because `invisible' does not remove line breaks."
+(defconst pi-coding-agent--tool-activity-region-property
+  'pi-coding-agent-tool-activity-region
+  "Text property marking tool activity regions.
+Values are `header' for the always-hidden tool header and `body' for the
+one-line activity text that a turn-level reveal can show.  Like
+`pi-coding-agent--hidden-turn-structure-property' this survives
+tree-sitter fontification because it is not font-lock managed.")
+
+(defconst pi-coding-agent--tool-activity-shown-property
+  'pi-coding-agent-tool-activity-shown
+  "Text property present on tool activity text a reveal has made visible.")
+
+(defun pi-coding-agent--hide-region (start end property value)
+  "Mark START..END as hidden structure recorded in PROPERTY with VALUE.
+The text stays in the buffer; `invisible' hides the characters and every
+newline inside the range gets an empty `display' property because
+`invisible' does not remove line breaks."
   (when (< start end)
     (let ((inhibit-read-only t))
       (add-text-properties start end
-                           (list pi-coding-agent--hidden-turn-structure-property t
+                           (list property value
                                  'invisible t))
       (save-excursion
         (goto-char start)
         (while (search-forward "\n" end t)
           (put-text-property (1- (point)) (point) 'display ""))))))
 
+(defun pi-coding-agent--show-region (start end property)
+  "Remove hidden structure PROPERTY from START..END and reveal the text."
+  (when (< start end)
+    (let ((inhibit-read-only t)
+          (pos start))
+      (while (< pos end)
+        (let ((next (next-single-char-property-change pos property nil end)))
+          (remove-text-properties
+           pos next
+           (list property nil 'invisible nil 'display nil))
+          (setq pos next))))))
+
+(defun pi-coding-agent--hide-turn-structure (start end)
+  "Hide turn structure text between START and END.
+START..END keeps its buffer text so turn navigation, fork-at-point,
+hot-tail boundaries and outline scanning still find the original
+headings."
+  (pi-coding-agent--hide-region start end
+                                pi-coding-agent--hidden-turn-structure-property
+                                t))
+
+(defun pi-coding-agent--hide-tool-activity (start end kind)
+  "Hide tool activity text between START and END as activity KIND.
+KIND is `header' for the always-hidden header or `body' for the one-line
+reduced activity text."
+  (when (< start end)
+    (let ((inhibit-read-only t))
+      (remove-text-properties start end
+                              (list pi-coding-agent--tool-activity-shown-property nil))
+      (pi-coding-agent--hide-region start end
+                                    pi-coding-agent--tool-activity-region-property
+                                    kind))))
+
+(defun pi-coding-agent--show-tool-activity (start end)
+  "Reveal hidden tool activity text between START and END."
+  (when (< start end)
+    (let ((inhibit-read-only t)
+          (pos start))
+      (while (< pos end)
+        (let ((next (next-single-char-property-change pos 'invisible nil end)))
+          (when (eq t (get-text-property pos 'invisible))
+            (remove-text-properties pos next '(invisible nil)))
+          (setq pos next)))
+      ;; Drop only our folded newlines; md-ts markup hiding uses its own value.
+      (let ((pos start))
+        (while (< pos end)
+          (let ((next (next-single-char-property-change pos 'display nil end)))
+            (when (equal "" (get-text-property pos 'display))
+              (remove-text-properties pos next '(display nil)))
+            (setq pos next))))
+      (add-text-properties start end
+                           (list pi-coding-agent--tool-activity-shown-property t)))))
+
+(defun pi-coding-agent--mark-tool-activity-visible (start end)
+  "Mark START..END as revealable tool activity that is currently visible."
+  (when (< start end)
+    (let ((inhibit-read-only t))
+      (add-text-properties start end
+                           (list pi-coding-agent--tool-activity-region-property
+                                 'body
+                                 pi-coding-agent--tool-activity-shown-property
+                                 t)))))
+
+(defun pi-coding-agent--tool-activity-hidden-p (pos)
+  "Return non-nil when tool activity at POS is currently hidden."
+  (and (get-text-property pos pi-coding-agent--tool-activity-region-property)
+       (not (get-text-property pos pi-coding-agent--tool-activity-shown-property))
+       (eq t (get-text-property pos 'invisible))))
+
+(defun pi-coding-agent--restore-hidden-structure (beg end)
+  "Restore invisibility for hidden turn and tool structure in BEG..END.
+Runs as a `jit-lock-register' pass so tree-sitter markdown fontification
+cannot reveal the structural headings or the hidden tool activity."
+  (let ((inhibit-read-only t))
+    ;; Turn structure is always hidden.
+    (let ((pos beg))
+      (while (< pos end)
+        (let ((next (next-single-char-property-change
+                     pos pi-coding-agent--hidden-turn-structure-property
+                     nil end)))
+          (when (get-text-property pos pi-coding-agent--hidden-turn-structure-property)
+            (put-text-property pos next 'invisible t))
+          (setq pos next))))
+    ;; Tool activity is hidden unless the current turn was revealed.
+    (let ((pos beg))
+      (while (< pos end)
+        (let ((next (next-single-char-property-change
+                     pos pi-coding-agent--tool-activity-region-property
+                     nil end)))
+          (when (and (get-text-property pos pi-coding-agent--tool-activity-region-property)
+                     (not (get-text-property pos pi-coding-agent--tool-activity-shown-property)))
+            (put-text-property pos next 'invisible t))
+          (setq pos next))))))
+
 (defun pi-coding-agent--restore-hidden-turn-structure (beg end)
-  "Restore invisibility for hidden turn structure in BEG..END.
-Runs as a `jit-lock-register' pass so tree-sitter markdown
-fontification cannot reveal the structural headings."
-  (let ((inhibit-read-only t)
-        (pos beg))
-    (while (< pos end)
-      (let ((next (next-single-char-property-change
-                   pos pi-coding-agent--hidden-turn-structure-property
-                   nil end)))
-        (when (eq t (get-text-property
-                     pos pi-coding-agent--hidden-turn-structure-property))
-          (put-text-property pos next 'invisible t))
-        (setq pos next)))))
+  "Restore hidden structure between BEG and END.
+Compatibility wrapper for `pi-coding-agent--restore-hidden-structure'."
+  (pi-coding-agent--restore-hidden-structure beg end))
+
+(defun pi-coding-agent--truncate-middle (text columns)
+  "Return TEXT shortened to COLUMNS display columns from the middle.
+Both the leading and trailing ends are kept; the ellipsis counts toward
+COLUMNS."
+  (let ((text (or text "")))
+    (if (<= (string-width text) columns)
+        text
+      (let* ((ellipsis "…")
+             (budget (max 4 (- columns 1)))
+             (head (ceiling (* budget 0.45)))
+             (tail (- budget head)))
+        (concat (substring text 0 (min (length text) head))
+                ellipsis
+                (substring text (max 0 (- (length text) (max 1 tail)))))))))
 
 (defun pi-coding-agent--insert-turn-heading (label &optional timestamp)
   "Insert a hidden setext LABEL heading at the end of the chat buffer.
@@ -3138,13 +3264,25 @@ Accesses state from the linked chat buffer."
                              "idle"))
          (activity-phase-str
           (propertize (format "%-8s" activity-phase)
-                      'face 'pi-coding-agent-activity-phase)))
+                      'face 'pi-coding-agent-activity-phase))
+         (hidden-tools (and chat-buf
+                            (buffer-local-value 'pi-coding-agent--hidden-tool-count
+                                                chat-buf))))
     (concat
      (pi-coding-agent--header-format-identity
       model-short thinking activity-phase-str)
      (pi-coding-agent--header-format-stats stats)
      (pi-coding-agent--header-format-context-group session-name)
+     (pi-coding-agent--header-format-tool-activity hidden-tools)
      (pi-coding-agent--header-format-extension-group ext-status working-message))))
+
+(defun pi-coding-agent--header-format-tool-activity (hidden-count)
+  "Format HIDDEN-COUNT hidden tool calls for the header line.
+Returns an empty string when nothing is hidden."
+  (if (and (integerp hidden-count) (> hidden-count 0))
+      (concat " │" (propertize (format " tools %d" hidden-count)
+                               'face 'pi-coding-agent-activity-phase))
+    ""))
 
 ;;; State Management
 

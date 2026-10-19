@@ -194,16 +194,24 @@ as =search-forward=, =occur= or =replace-string= work on buffer text and can
 still match the hidden structure, which is a known limit of the quiet
 presentation.
 
-Completed tool calls show their existing header (which may span several
-lines for long arguments) followed by exactly one summary line, for
-example =$ run-tests= plus =42 lines · collected 10 items=.  The summary
-never repeats output tails, hidden-line counts or expand hints.  The
-whole summary line is the expand entry: press =TAB= on either the header
-line or anywhere in the summary line to show the full detail, and press
-=TAB= again to collapse it.  Pressing =RET= on the summary line also
-expands it; =RET= on a header or detail line keeps visiting file
-targets.  Long-running commands stream output live, file operations
-(=read=, =write=, =edit=) get syntax highlighting, and edit diffs
+Completed tool calls normally show their existing header (which may span
+several lines for long arguments) followed by exactly one summary line, for
+example =$ run-tests= plus =42 lines · collected 10 items=.  Set
+=pi-coding-agent-tool-activity-display= to =hidden= to drop that machinery
+from the transcript entirely: a successful tool then occupies no visible line,
+and the chat header line carries a =tools N= counter instead.  In that mode
+=TAB= in a turn reveals one reduced line per tool
+(=bash · npm · 42 lines=, =edit src/app.el · +4 -1=, =read src/app.el · 120
+lines=), =TAB= on such a line opens the full detail, and =TAB= in the turn
+body hides the activity again.  Running tools keep one =▸ bash · running=
+line and failed tools keep one =failed · <first line>= line so progress and
+errors stay visible.  The shortened line never echoes the whole command and
+shows project-relative paths.  The summary never repeats output tails,
+hidden-line counts or expand hints.
+
+Press =RET= on a summary or reveal line to expand it; =RET= on a detail line
+keeps visiting file targets.  Long-running commands stream output live, file
+operations (=read=, =write=, =edit=) get syntax highlighting, and edit diffs
 highlight what changed.
 
 Markdown pipe tables get a display-only treatment: wide tables are
@@ -506,6 +514,9 @@ Less common tuning knobs:
 
 ;; Let Pi's saved project trust decisions decide whether .pi resources load:
 ;; (setopt pi-coding-agent-project-trust-policy 'default)
+
+;; Hide successful tool activity from the transcript (TAB reveals it):
+;; (setopt pi-coding-agent-tool-activity-display 'hidden)
 
 ;; `pi-coding-agent-thinking-hidden-preview' is obsolete: collapsed thinking
 ;; always previews its first line, so setting it no longer changes anything.

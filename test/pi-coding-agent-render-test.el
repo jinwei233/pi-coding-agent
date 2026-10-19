@@ -2250,7 +2250,7 @@ and DISPLAY controls how completed thinking is rendered."
       (should (< git-pos read-pos)))
     (should (string-match-p "On branch master" (buffer-string)))
     (should-not (string-match-p "import sys" (buffer-string)))
-    (should (string-match-p "read src/main\\.py\n1 lines"
+    (should (string-match-p "read src/main\\.py\n1 line"
                             (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tools-across-assistant-messages ()
@@ -2283,7 +2283,7 @@ and DISPLAY controls how completed thinking is rendered."
     (should (string-match-p "/home/user" (buffer-string)))
     (should (string-match-p "read foo\\.el" (buffer-string)))
     (should-not (string-match-p "(defun foo ())" (buffer-string)))
-    (should (string-match-p "read foo\\.el\n1 lines"
+    (should (string-match-p "read foo\\.el\n1 line"
                             (buffer-string)))))
 
 (ert-deftest pi-coding-agent-test-history-renders-tool-error ()
@@ -11949,9 +11949,9 @@ Regression test: streaming output with no newlines should still be capped."
     (let ((content (buffer-substring-no-properties (point-min) (point-max))))
       (should (equal content
                      (concat "$ echo one\n"
-                             "1 lines · final alpha\n\n"
+                             "1 line · final alpha\n\n"
                              "$ echo two\n"
-                             "1 lines · final bravo\n\n")))
+                             "1 line · final bravo\n\n")))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo one" content)))
       (should (= 1 (pi-coding-agent-test--count-matches "\\$ echo two" content))))
     (should (= 0 (hash-table-count pi-coding-agent--live-tool-blocks)))))
@@ -12739,7 +12739,7 @@ Multiple deltas should replace the preview instead of appending forever."
     (let ((content (buffer-string)))
       (should (= 1 (pi-coding-agent-test--count-matches
                       "write /tmp/foo\\.py" content)))
-      (should (string-match-p "1 lines · 13 B" content))
+      (should (string-match-p "1 line · 13 B" content))
       (should-not (string-match-p "final content" content)))))
 
 (ert-deftest pi-coding-agent-test-toolcall-non-write-shows-header-only ()
