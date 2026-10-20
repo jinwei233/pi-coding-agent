@@ -6,7 +6,7 @@ Communicates with the pi CLI via JSON-over-stdio (RPC).
 
 ## Module Architecture
 
-Eight source modules with a strict dependency chain (no cycles), plus
+Nine source modules with a strict dependency chain (no cycles), plus
 an optional Evil integration module:
 
 ```
@@ -15,6 +15,7 @@ pi-coding-agent.el              ← entry point, autoloads
   ├── pi-coding-agent-input.el  ← input buffer, history, completion
   └── pi-coding-agent-render.el ← chat rendering, tool output
         ├── pi-coding-agent-table.el  ← display-only table decoration
+        ├── pi-coding-agent-reading.el ← turn indexes, thinking groups, navigation
         └── pi-coding-agent-ui.el ← shared state, faces, modes
               ├── pi-coding-agent-core.el ← JSON/RPC protocol
               └── pi-coding-agent-grammars.el ← tree-sitter grammar recipes
@@ -44,6 +45,7 @@ module, direct `setq` is fine.
 | `pi-coding-agent-ui.el` | Shared state, faces, customization, modes, display primitives, header-line |
 | `pi-coding-agent-render.el` | Streaming chat rendering, tool output, fontification, diffs |
 | `pi-coding-agent-table.el` | Display-only pipe table decoration, wrapping, overlay management |
+| `pi-coding-agent-reading.el` | Turn indexes, grouped thinking, answer/failure navigation, window reading hints |
 | `pi-coding-agent-input.el` | Input history, isearch, send/abort, file/path/slash completion, queuing |
 | `pi-coding-agent-menu.el` | Transient menu, session management, model selection, commands |
 | `pi-coding-agent-grammars.el` | Tree-sitter grammar recipes, install prompts, `M-x pi-coding-agent-install-grammars` |

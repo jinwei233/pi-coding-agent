@@ -432,6 +432,32 @@ If the menu complains about =transient=, set
 #+html: </details>
 
 #+html: <a id="how-it-compares"></a>
+* Reading long sessions
+
+Set =pi-coding-agent-thinking-activity-display= to =grouped= to collapse
+each user turn's thinking into one row.  TAB opens its ordered previews;
+TAB on a preview opens the full thought, including a live thought.
+The default =blocks= preserves individual previews.  Explicit
+=pi-coding-agent-thinking-display= =visible= shows full thinking.
+After changing the grouping setting, reload the session to rebuild
+its projection; session data does not change.
+
+The Pi menu includes =a= (this turn's answer), =A= (latest answer),
+=]= / =[= (next / previous failed tool), and =G= (resume following).
+Navigation from Input preserves its draft and focus.  Use the mark ring
+to return to the previous Output position.  Answer navigation does not
+enable following.
+
+Tool summaries count successful =edited= and =read= paths separately.
+=ops +N -N= counts reported operation lines, not a net Git diff.
+=call failed= describes a failed tool invocation; test results appear
+only when the tool supplies structured evidence.  Error summaries read
+a bounded prefix; full tool output remains available on demand.
+
+=pi-coding-agent-reading-status= provides an optional window-specific
+mode-line hint: history reading, with or without new output.
+Set =pi-coding-agent-reading-hints= to nil to suppress it.
+
 * How does it compare to other Emacs LLM helpers? 🧭
 
 =pi-coding-agent= is the Emacs frontend for Pi.  Pi is an open,

@@ -99,6 +99,7 @@ test: .deps-stamp
 		-l pi-coding-agent-summary-test \
 		-l pi-coding-agent-transcript-test \
 		-l pi-coding-agent-tool-activity-test \
+		-l pi-coding-agent-reading-test \
 		-l pi-coding-agent-table-test \
 		-l pi-coding-agent-input-test \
 		-l pi-coding-agent-menu-test \
@@ -311,6 +312,7 @@ ollama-status:
 
 check-parens:
 	@echo "=== Check Parens ==="
+	@$(BATCH) --eval '(with-current-buffer (find-file-noselect "pi-coding-agent-reading.el") (check-parens))'
 	@OUTPUT=$$($(BATCH) --eval '(condition-case err (dolist (f (list "scripts/pi-coding-agent-build.el" "scripts/install-deps.el" "scripts/install-ts-grammars.el" "pi-coding-agent-core.el" "pi-coding-agent-grammars.el" "pi-coding-agent-ui.el" "pi-coding-agent-table.el" "pi-coding-agent-render.el" "pi-coding-agent-input.el" "pi-coding-agent-menu.el" "pi-coding-agent.el")) (with-current-buffer (find-file-noselect f) (check-parens) (message "%s OK" f))) (user-error (message "FAIL: %s" (error-message-string err)) (kill-emacs 1)))' 2>&1); \
 	echo "$$OUTPUT" | grep -E "OK$$|FAIL:"; \
 	echo "$$OUTPUT" | grep -q "FAIL:" && exit 1 || true
@@ -323,7 +325,7 @@ compile: .deps-stamp
 		--eval "(package-initialize)" \
 		$(LOCAL_LOAD_PATH) \
 		--eval "(setq byte-compile-error-on-warn t)" \
-		-f batch-byte-compile scripts/pi-coding-agent-build.el scripts/install-deps.el scripts/install-ts-grammars.el pi-coding-agent-core.el pi-coding-agent-grammars.el pi-coding-agent-ui.el pi-coding-agent-table.el pi-coding-agent-render.el pi-coding-agent-input.el pi-coding-agent-menu.el pi-coding-agent.el
+		-f batch-byte-compile scripts/pi-coding-agent-build.el scripts/install-deps.el scripts/install-ts-grammars.el pi-coding-agent-core.el pi-coding-agent-grammars.el pi-coding-agent-ui.el pi-coding-agent-table.el pi-coding-agent-render.el pi-coding-agent-reading.el pi-coding-agent-input.el pi-coding-agent-menu.el pi-coding-agent.el
 
 lint: lint-checkdoc lint-package
 
@@ -340,6 +342,7 @@ lint-checkdoc:
 		--eval "(checkdoc-file \"pi-coding-agent-ui.el\")" \
 		--eval "(checkdoc-file \"pi-coding-agent-table.el\")" \
 		--eval "(checkdoc-file \"pi-coding-agent-render.el\")" \
+		--eval "(checkdoc-file \"pi-coding-agent-reading.el\")" \
 		--eval "(checkdoc-file \"pi-coding-agent-input.el\")" \
 		--eval "(checkdoc-file \"pi-coding-agent-menu.el\")" \
 		--eval "(checkdoc-file \"pi-coding-agent.el\")" 2>&1); \
@@ -357,7 +360,7 @@ lint-package:
 		          (package-install 'package-lint))" \
 		--eval "(require 'package-lint)" \
 		--eval "(setq package-lint-main-file \"pi-coding-agent.el\")" \
-		-f package-lint-batch-and-exit pi-coding-agent.el pi-coding-agent-ui.el pi-coding-agent-table.el pi-coding-agent-render.el pi-coding-agent-input.el pi-coding-agent-menu.el pi-coding-agent-core.el pi-coding-agent-grammars.el
+		-f package-lint-batch-and-exit pi-coding-agent.el pi-coding-agent-ui.el pi-coding-agent-table.el pi-coding-agent-render.el pi-coding-agent-reading.el pi-coding-agent-input.el pi-coding-agent-menu.el pi-coding-agent-core.el pi-coding-agent-grammars.el
 
 check: compile lint test
 

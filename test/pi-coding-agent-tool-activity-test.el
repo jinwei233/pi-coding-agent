@@ -117,7 +117,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent--handle-display-event '(:type "agent_end"))
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
-      (should (string-match-p "1 file" visible))
+      (should (string-match-p "edited 1" visible))
       (should (string-match-p "+1 -1" visible))
       (should (string-match-p "2 calls" visible))
       (should-not (string-match-p "secret" visible))
@@ -188,7 +188,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent--handle-display-event '(:type "agent_end"))
     (let ((settled (pi-coding-agent-tool-activity-test--visible)))
       (should-not (string-match-p "working" settled))
-      (should (string-match-p "1 file" settled))
+      (should (string-match-p "read 1" settled))
       (should (string-match-p "2 calls" settled)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-failure-has-priority ()
@@ -198,7 +198,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
      '(("bash" (:command "false") "boom\nprivate tail" nil t)
        ("read" (:path "/tmp/pi-tool-activity/a.el") "ok")))
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
-      (should (string-match-p "1 failed" visible))
+      (should (string-match-p "1 call failed" visible))
       (should-not (string-match-p "private tail" visible)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-structured-test-status ()
@@ -453,7 +453,11 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
   (pi-coding-agent-tool-activity-test--with-chat
     (pi-coding-agent-tool-activity-test--render-history
      '(("write" (:path "lisp/a.el" :content "one\ntwo") "done")))
-    (let (detail-buffer)
+    ;; A preceding menu test may leave its transient keymap installed.
+    ;; This contract concerns the detail buffer's own RET binding.
+    (let ((overriding-terminal-local-map nil)
+          (overriding-local-map nil)
+          detail-buffer)
       (cl-letf (((symbol-function 'display-buffer)
                  (lambda (buffer &rest _) (setq detail-buffer buffer))))
         (pi-coding-agent--open-tool-detail-buffer "call-1"))
@@ -518,7 +522,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
     (pi-coding-agent--activity-interrupt-live-turn)
     (let ((visible (pi-coding-agent-tool-activity-test--visible)))
       (should-not (string-match-p "working" visible))
-      (should (string-match-p "1 failed" visible)))))
+      (should (string-match-p "1 call failed" visible)))))
 
 (ert-deftest pi-coding-agent-test-tool-activity-priority-and-tiny-budget ()
   "Summary omission is priority ordered and never exceeds tiny windows."
@@ -623,9 +627,9 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
             :turn-id 0 :calls 6 :running nil :failed 0
             :file-counts files :added 0 :removed 0
             :test-passed 0 :test-failed 0)))
-      (dolist (case '((emoji "▸ 🔧 · 6 files" "◌ 🔧 · working")
-                      (text "▸ Tools · 6 files" "◌ Tools · working")
-                      (none "▸ 6 files" "◌ working")))
+      (dolist (case '((emoji "▸ 🔧 · edited 6" "◌ 🔧 · working")
+                      (text "▸ Tools · edited 6" "◌ Tools · working")
+                      (none "▸ edited 6" "◌ working")))
         (let ((pi-coding-agent-activity-icon-style (car case)))
           (should (string-prefix-p
                    (nth 1 case)
@@ -653,7 +657,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
                      (lambda () 16)))
             (let ((row (pi-coding-agent--activity-group-text record)))
               (should (<= (string-width row) 16))
-              (should (string-match-p "1 file" row))))))
+              (should (string-match-p "edited 1" row))))))
       (let* ((pi-coding-agent-activity-icon-style 'emoji)
              (row (pi-coding-agent--activity-group-text record)))
         (should (= 4 (string-width
@@ -703,7 +707,7 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
              '(:status failed :tool-name "bash" :summary "boom"))))
       (should (string-match-p "🔧" success-row))
       (should (string-match-p "🔧" failure-row))
-      (should (string-match-p "1 failed" failure-row))
+      (should (string-match-p "1 call failed" failure-row))
       (should (eq 'pi-coding-agent-activity-label
                   (get-text-property 0 'font-lock-face success-row)))
       (should (eq 'pi-coding-agent-activity-failed

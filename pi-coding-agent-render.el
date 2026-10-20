@@ -43,6 +43,7 @@
 
 (require 'pi-coding-agent-ui)
 (require 'pi-coding-agent-table)
+(require 'pi-coding-agent-reading)
 (require 'cl-lib)
 (require 'ansi-color)
 (require 'thingatpt)
@@ -216,6 +217,10 @@ Nil means use `pi-coding-agent-tool-activity-display'.")
     pi-coding-agent--activity-turn-counter
     pi-coding-agent--current-activity-turn
     pi-coding-agent--history-activity-initializations
+    pi-coding-agent--reading-turns
+    pi-coding-agent--reading-current
+    pi-coding-agent--reading-title
+    pi-coding-agent--reading-welcome-hidden
     pi-coding-agent--visible-string-cache)
   "Buffer-local state that belongs to rendered transcript text.")
 
@@ -239,6 +244,7 @@ is hidden, and TIMESTAMP reaches the user only through the marker's
       (when (pi-coding-agent--history-postprocessing-deferred-p)
         (pi-coding-agent--activity-flush-history-record))
       (pi-coding-agent--activity-begin-turn)
+      (pi-coding-agent--reading-begin-turn text)
       (pi-coding-agent--insert-turn-heading "You" timestamp)
       (pi-coding-agent--insert-user-turn-marker timestamp)
       (pi-coding-agent--append-to-chat (concat text "\n"))
@@ -668,6 +674,7 @@ to keep our setext H1 separators as the top-level document structure.
 Modification hooks fire normally so jit-lock marks inserted text for
 fontification; tree-sitter re-parses at the C level on each insert."
   (when (and delta pi-coding-agent--streaming-marker)
+    (pi-coding-agent--reading-text delta)
     (let* ((delta (pi-coding-agent--render-safe-string delta))
            ;; Wrapper probing owns blank margins; plain output keeps trimming.
            (delta (if (or pi-coding-agent-normalize-markdown-wrappers
@@ -690,7 +697,9 @@ fontification; tree-sitter re-parses at the C level on each insert."
              (pi-coding-agent--project-assistant-stream-delta delta)))
         (when (eq pi-coding-agent--assistant-projection-mode 'plain)
           (setq pi-coding-agent--assistant-wrapper-raw-chunks nil))
-        (pi-coding-agent--insert-message-fragment projected)))))
+        (pi-coding-agent--insert-message-fragment projected)
+        (unless (string-empty-p projected)
+          (pi-coding-agent--reading-text-inserted))))))
 
 (defun pi-coding-agent--thinking-insert-position ()
   "Return insertion position for thinking text.
@@ -1135,6 +1144,27 @@ clamped so the window remains filled when possible."
      result))
 
 (defun pi-coding-agent--display-thinking-start ()
+  "Start a thinking fragment using the configured presentation."
+  (if (pi-coding-agent--reading-grouped-p)
+      (setq pi-coding-agent--reading-chunks nil
+            pi-coding-agent--in-thinking-block t)
+    (pi-coding-agent--display-thinking-block-start)))
+
+(defun pi-coding-agent--display-thinking-delta (delta)
+  "Project thinking DELTA using the configured presentation."
+  (if (pi-coding-agent--reading-grouped-p)
+      (pi-coding-agent--reading-thought-delta (or delta ""))
+    (pi-coding-agent--display-thinking-block-delta delta)))
+
+(defun pi-coding-agent--display-thinking-end (content)
+  "Complete thinking CONTENT using the configured presentation."
+  (if (pi-coding-agent--reading-grouped-p)
+      (progn
+        (pi-coding-agent--reading-thought-end content)
+        (setq pi-coding-agent--in-thinking-block nil))
+    (pi-coding-agent--display-thinking-block-end content)))
+
+(defun pi-coding-agent--display-thinking-block-start ()
   "Insert the stable live thinking stub."
   (when pi-coding-agent--streaming-marker
     (setq pi-coding-agent--in-thinking-block t)
@@ -1160,7 +1190,7 @@ clamped so the window remains filled when possible."
             (setq pi-coding-agent--thinking-marker
                   (copy-marker (point) nil))))))))
 
-(defun pi-coding-agent--display-thinking-delta (delta)
+(defun pi-coding-agent--display-thinking-block-delta (delta)
   "Display streaming thinking DELTA in the current thinking block.
 Normalizes boundary and paragraph whitespace while streaming."
   (when (and delta pi-coding-agent--streaming-marker)
@@ -1194,7 +1224,7 @@ Normalizes boundary and paragraph whitespace while streaming."
               (when pi-coding-agent--thinking-marker
                 (set-marker pi-coding-agent--thinking-marker (point))))))))))
 
-(defun pi-coding-agent--display-thinking-end (content)
+(defun pi-coding-agent--display-thinking-block-end (content)
   "End thinking block (blockquote).
 Non-empty string CONTENT is authoritative; otherwise streamed chunks are used."
   (when pi-coding-agent--streaming-marker
@@ -1280,6 +1310,7 @@ follow-up as a fresh prompt.")
 (defun pi-coding-agent--display-agent-end ()
   "Finalize agent turn: normalize whitespace, handle abort, schedule queue."
   (pi-coding-agent--finish-assistant-text)
+  (pi-coding-agent--reading-finish pi-coding-agent--aborted)
   ;; Reset per-turn state for clean next turn.
   (setq pi-coding-agent--local-user-message nil)
   (setq pi-coding-agent--in-thinking-block nil)
@@ -1840,6 +1871,7 @@ which asks upfront before any buffers are touched."
              (plist-get response :exitCode))
             (process-put process 'pi-coding-agent-exit-error-rendered t))
         (pi-coding-agent--activity-interrupt-live-turn)
+        (pi-coding-agent--reading-finish t)
         (pi-coding-agent--set-process nil)
         (pi-coding-agent--set-activity-phase "idle")
         (setq pi-coding-agent--local-user-message nil)
@@ -1853,6 +1885,7 @@ which asks upfront before any buffers are touched."
   "Display visible custom CONTENT in the current chat buffer."
   (when (and (stringp content)
              (not (string-empty-p content)))
+    (pi-coding-agent--reading-hide-welcome)
     (let ((start (point-max)))
       (pi-coding-agent--append-to-chat (concat "\n" content "\n"))
       (pi-coding-agent--decorate-tables-unless-deferred start (point-max)))
@@ -1864,11 +1897,19 @@ which asks upfront before any buffers are touched."
 Updates buffer-local state and renders display updates."
   ;; Update state first (now buffer-local)
   (pi-coding-agent--update-state-from-event event)
+  (when (or (member (plist-get event :type)
+                    '("tool_execution_start" "tool_execution_update" "tool_execution_end"))
+            (and (equal (plist-get event :type) "message_update")
+                 (member (plist-get (plist-get event :assistantMessageEvent) :type)
+                         '("text_delta" "thinking_delta" "toolcall_start"
+                           "toolcall_delta" "toolcall_end"))))
+    (pi-coding-agent--reading-content-event))
   ;; Then handle display
   (pcase (plist-get event :type)
     ("agent_start"
      (pi-coding-agent--invalidate-prompt-start-wait)
      (pi-coding-agent--cancel-followup-drain-timer)
+     (pi-coding-agent--reading-run-start)
      (pi-coding-agent--display-agent-start))
     ("message_start"
      (let* ((message (plist-get event :message))
@@ -1904,6 +1945,7 @@ Updates buffer-local state and renders display updates."
              (plist-get message :content))))
          (_
           ;; Assistant message - show header if needed, reset markers
+          (pi-coding-agent--reading-message-start)
           (pi-coding-agent--reset-assistant-markdown-state)
           (setq pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
@@ -1957,6 +1999,10 @@ Updates buffer-local state and renders display updates."
             (assistant-p (equal (plist-get message :role) "assistant")))
        (when assistant-p
          (pi-coding-agent--finish-assistant-text))
+       (when (and assistant-p
+                  (member (plist-get message :stopReason) '("error" "aborted")))
+         (setf (pi-coding-agent--reading-turn-state
+                (pi-coding-agent--reading-current)) 'interrupted))
        ;; Display error if message ended with error (e.g., API error)
        (when (equal (plist-get message :stopReason) "error")
          (pi-coding-agent--display-error (plist-get message :errorMessage)))
@@ -2175,6 +2221,7 @@ live-tool state, cached execution args, and the compatibility pending overlay
 slot so buffer and render state stay consistent.  Tree-sitter overlays are
 left alone."
   (pi-coding-agent--reset-assistant-markdown-state)
+  (pi-coding-agent--reading-clear)
   (setq pi-coding-agent--assistant-projection-mode nil)
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-tool-block t)
   (remove-overlays (point-min) (point-max) 'pi-coding-agent-diff-overlay t)
@@ -2396,7 +2443,7 @@ headers should also use `pi-coding-agent--escape-control-chars-for-display'."
 
 (defun pi-coding-agent--line-count-label (count)
   "Return COUNT formatted as a singular or plural line label."
-  (format "%d line%s" count (if (eql count 1) "" "s")))
+  (if count (format "%d line%s" count (if (eql count 1) "" "s")) "output"))
 
 (defun pi-coding-agent--tool-text-line-count (text)
   "Return the physical line count of TEXT without splitting it."
@@ -3343,9 +3390,10 @@ if none exists, render the result at point without a live overlay."
 (defun pi-coding-agent--tool-summary-record
     (tool-call-id tool-name args content details is-error)
   "Build a lightweight summary record for one completed tool."
-  (let* ((raw (pi-coding-agent--tool-result-text content))
+  (let* ((bounded (pi-coding-agent--tool-result-prefix content))
+         (raw (car bounded))
          (error-p (eq is-error t))
-         (lines (pi-coding-agent--tool-text-line-count raw))
+         (lines (unless (cdr bounded) (pi-coding-agent--tool-text-line-count raw)))
          (path (pi-coding-agent--tool-path-string
                 (pi-coding-agent--tool-arg-path args)))
          (first-line (pi-coding-agent--first-nonempty-line raw))
@@ -3355,10 +3403,8 @@ if none exists, render the result at point without a live overlay."
     (setq summary
           (pi-coding-agent--single-line-preview
            (if error-p
-               (if first-line
-                   (format "failed · %s" first-line)
-                 (format "failed · %s"
-                         (pi-coding-agent--line-count-label lines)))
+               (format "failed · %s"
+                       (pi-coding-agent--tool-error-summary raw details))
              (pcase tool-name
                ("edit"
                 (let* ((diff (pi-coding-agent--tool-arg-get details :diff))
@@ -3372,8 +3418,10 @@ if none exists, render the result at point without a live overlay."
                            (pi-coding-agent--tool-text-line-count written))
                           (pi-coding-agent--tool-byte-label written))))
                ("read"
-                (let* ((offset (pi-coding-agent--tool-arg-get args :offset))
-                       (end (and offset (> lines 0) (+ offset lines -1))))
+                (let* ((raw-offset (pi-coding-agent--tool-arg-get args :offset))
+                       (offset (if (stringp raw-offset) (string-to-number raw-offset)
+                                 raw-offset))
+                       (end (and offset lines (> lines 0) (+ offset lines -1))))
                   (format "%s%s"
                           (if offset
                               (format "L%d-L%d · " offset (or end offset))
@@ -3407,6 +3455,36 @@ if none exists, render the result at point without a live overlay."
 
 ;;;; Turn Tool Activity
 
+(defun pi-coding-agent--tool-result-prefix (content)
+  "Return (PREFIX . TRUNCATED) without formatting full tool CONTENT."
+  (let ((remaining pi-coding-agent--tool-summary-error-bytes) chunks truncated)
+    (catch 'full
+      (dolist (block (pi-coding-agent--content-block-list content))
+        (when (equal (plist-get block :type) "text")
+          (let ((text (plist-get block :text)))
+            (when (stringp text)
+              (if (> (length text) remaining)
+                  (progn (push (substring text 0 remaining) chunks)
+                         (setq truncated t) (throw 'full nil))
+                (push text chunks)
+                (setq remaining (max 0 (- remaining (length text) 1)))))))))
+    (cons (string-join (nreverse chunks) "\n") truncated)))
+
+(defun pi-coding-agent--tool-error-summary (prefix details)
+  "Extract an explicit error from bounded PREFIX or structured DETAILS."
+  (let ((structured (or (pi-coding-agent--tool-arg-get details :errorMessage)
+                        (pi-coding-agent--tool-arg-get details :error)))
+        (code (pi-coding-agent--tool-arg-get details :exitCode)))
+    (or (and (stringp structured)
+             (pi-coding-agent--first-nonempty-line structured))
+        (let ((case-fold-search t))
+          (when (string-match
+                 "^.*\\(?:error\\|exception\\|fatal\\|permission denied\\|not found\\|fail\\(?:ed\\|ure\\)\\|exit code [1-9][0-9]*\\).*$"
+                 prefix)
+            (pi-coding-agent--first-nonempty-line (match-string 0 prefix))))
+        (and code (format "exit %s" code))
+        "tool call failed")))
+
 (cl-defstruct (pi-coding-agent--activity-record
                (:constructor pi-coding-agent--make-activity-record))
   turn-id
@@ -3424,7 +3502,8 @@ if none exists, render the result at point without a live overlay."
   added
   removed
   test-passed
-  test-failed)
+  test-failed
+  (read-counts (make-hash-table :test 'equal)))
 
 (defun pi-coding-agent--tool-activity-mode ()
   "Return the effective tool activity display mode.
@@ -3480,6 +3559,7 @@ The former `hidden' value is a compatibility alias for `grouped'."
                 :running nil
                 :failed 0
                 :file-counts (make-hash-table :test 'equal)
+                :read-counts (make-hash-table :test 'equal)
                 :added 0
                 :removed 0
                 :test-passed 0
@@ -3533,10 +3613,11 @@ The former `hidden' value is a compatibility alias for `grouped'."
                pi-coding-agent--tool-activity-index))
     tool))
 
-(defun pi-coding-agent--activity-adjust-file-count (record path delta)
+(defun pi-coding-agent--activity-adjust-file-count (record path delta &optional read)
   "Adjust PATH's count in activity RECORD by DELTA."
   (when path
-    (let* ((table (pi-coding-agent--activity-record-file-counts record))
+    (let* ((table (if read (pi-coding-agent--activity-record-read-counts record)
+                    (pi-coding-agent--activity-record-file-counts record)))
            (count (+ (gethash path table 0) delta)))
       (if (> count 0)
           (puthash path count table)
@@ -3561,14 +3642,18 @@ The former `hidden' value is a compatibility alias for `grouped'."
       ('failed
        (setf (pi-coding-agent--activity-record-failed record)
              (+ (pi-coding-agent--activity-record-failed record) delta))))
-    (pi-coding-agent--activity-adjust-file-count
-     record (plist-get tool :path) delta)
+    (when (and (eq (plist-get tool :status) 'succeeded)
+               (member (plist-get tool :tool-name) '("read" "edit" "write")))
+      (pi-coding-agent--activity-adjust-file-count
+       record (plist-get tool :path) delta
+       (equal (plist-get tool :tool-name) "read")))
+    (when (eq (plist-get tool :status) 'succeeded)
     (setf (pi-coding-agent--activity-record-added record)
           (+ (pi-coding-agent--activity-record-added record)
              (* delta (or (plist-get tool :added) 0)))
           (pi-coding-agent--activity-record-removed record)
           (+ (pi-coding-agent--activity-record-removed record)
-             (* delta (or (plist-get tool :removed) 0))))
+             (* delta (or (plist-get tool :removed) 0)))))
     (pcase (plist-get tool :test-status)
       ('passed
        (setf (pi-coding-agent--activity-record-test-passed record)
@@ -3663,6 +3748,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
    :failed (pi-coding-agent--activity-record-failed record)
    :files
    (hash-table-count (pi-coding-agent--activity-record-file-counts record))
+   :read (hash-table-count (pi-coding-agent--activity-record-read-counts record))
    :added (pi-coding-agent--activity-record-added record)
    :removed (pi-coding-agent--activity-record-removed record)
    :test-status
@@ -3675,6 +3761,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
   (let* ((aggregate (pi-coding-agent--activity-aggregates record))
          (failed (plist-get aggregate :failed))
          (files (plist-get aggregate :files))
+         (reads (plist-get aggregate :read))
          (added (plist-get aggregate :added))
          (removed (plist-get aggregate :removed))
          (tests (plist-get aggregate :test-status))
@@ -3682,7 +3769,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
          (calls (plist-get aggregate :calls))
          parts)
     (when (> failed 0)
-      (push (propertize (format "%d failed" failed)
+      (push (propertize (format "%d call%s failed" failed (if (= failed 1) "" "s"))
                         'font-lock-face 'pi-coding-agent-activity-failed)
             parts))
     (when (eq tests 'failed)
@@ -3690,7 +3777,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
                         'font-lock-face 'pi-coding-agent-activity-failed)
             parts))
     (when (> files 0)
-      (push (propertize (format "%d file%s" files (if (= files 1) "" "s"))
+      (push (propertize (format "edited %d" files)
                         'font-lock-face 'pi-coding-agent-activity-summary)
             parts))
     (when (or (> added 0) (> removed 0))
@@ -3703,7 +3790,10 @@ canonical or transient pair storage; IS-ERROR records completion status."
           (push (propertize (format "-%d" removed)
                             'font-lock-face 'pi-coding-agent-activity-removed)
                 counts))
-        (push (string-join (nreverse counts) " ") parts)))
+        (push (concat "ops " (string-join (nreverse counts) " ")) parts)))
+    (when (> reads 0)
+      (push (propertize (format "read %d" reads)
+                        'font-lock-face 'pi-coding-agent-activity-summary) parts))
     (pcase tests
       ('passed
        (push (propertize "tests passed"
@@ -3770,7 +3860,17 @@ canonical or transient pair storage; IS-ERROR records completion status."
               (setq content candidate-content
                     result candidate)
             (throw 'full nil)))))
-    (truncate-string-to-width result budget nil nil "…")))
+    (when (and (not content) (car parts)
+               (<= (+ 2 (string-width (car parts))) budget))
+      (setq content (car parts)
+            result (concat (propertize cue 'font-lock-face cue-face) " " content)))
+    (when (and (or (> (pi-coding-agent--activity-record-failed record) 0)
+                   (> (pi-coding-agent--activity-record-test-failed record) 0))
+               (not content)
+               (not (pi-coding-agent--activity-record-live record)))
+      (setq result (if (>= budget 6) "failed" "!")))
+    (propertize (truncate-string-to-width result budget nil nil "…")
+                'help-echo (string-join parts " · "))))
 
 (defun pi-coding-agent--activity-tool-prefix (cue cue-face)
   "Return the fixed-width tool-row prefix for CUE using CUE-FACE."
@@ -4009,6 +4109,7 @@ Expanded groups continue to refresh their per-tool rows."
   "Add or update grouped TOOL-CALL-ID with TOOL-NAME and ARGS.
 When LIVE is non-nil, keep a folded projection stable until agent end."
   (when (pi-coding-agent--tool-activity-grouped-mode-p)
+    (pi-coding-agent--reading-current)
     (let* ((turn-id (pi-coding-agent--activity-current-turn))
            (record (pi-coding-agent--activity-record-for-turn turn-id t))
            (was-live (pi-coding-agent--activity-record-live record)))
@@ -4035,6 +4136,7 @@ When LIVE is non-nil, keep a folded projection stable until agent end."
   "Complete TOOL-CALL-ID with TOOL-NAME, ARGS, CONTENT, and DETAILS.
 IS-ERROR non-nil records a failed completion.  When LIVE is non-nil,
 keep a folded projection stable until agent end."
+  (pi-coding-agent--reading-current)
   (let* ((record
           (or (pi-coding-agent--activity-record-for-tool tool-call-id)
               (pi-coding-agent--activity-record-for-turn
@@ -4111,6 +4213,11 @@ keep a folded projection stable until agent end."
         (pi-coding-agent--activity-record-detail-tool-call-id record)
         nil)
   (pi-coding-agent--activity-render-record record))
+
+(defun pi-coding-agent--reading-expand-tools (record)
+  "Expand tools in RECORD without changing any other turn."
+  (setf (pi-coding-agent--activity-record-expanded record) t
+        (pi-coding-agent--activity-record-detail-tool-call-id record) nil))
 
 (defun pi-coding-agent--activity-toggle-group-button (button)
   "Toggle the activity group owned by BUTTON."
@@ -4867,7 +4974,8 @@ Returns (START . END) if inside a tool block, nil otherwise."
 Completed thinking toggles first, then grouped activity, then legacy tool
 output.  Other text falls back to `outline-cycle'."
   (interactive)
-  (unless (pi-coding-agent--toggle-thinking-block-at-point)
+  (unless (or (pi-coding-agent--reading-toggle)
+              (pi-coding-agent--toggle-thinking-block-at-point))
     (unless (and (pi-coding-agent--tool-activity-grouped-mode-p)
                  (pi-coding-agent--activity-toggle-at-point))
       (let ((original-pos (point)))
@@ -7797,8 +7905,10 @@ Returns nil when TEXT normalizes to no visible thinking content."
 (defun pi-coding-agent--render-history-thinking (text)
   "Render completed thinking TEXT during session history replay.
 Uses the current buffer's completed-thinking display mode."
-  (when-let* ((rendered (pi-coding-agent--completed-thinking-rendered-text text)))
-    (pi-coding-agent--render-history-text rendered)))
+  (if (pi-coding-agent--reading-grouped-p)
+      (pi-coding-agent--reading-thought-end text)
+    (when-let* ((rendered (pi-coding-agent--completed-thinking-rendered-text text)))
+      (pi-coding-agent--render-history-text rendered))))
 
 (defun pi-coding-agent--build-tool-result-index (messages)
   "Build hash-table mapping toolCallId to toolResult message from MESSAGES."
@@ -7873,6 +7983,7 @@ Display-only table decoration is applied after deferred history insertion."
                 (pi-coding-agent--get-chat-buffer)
               (point-max))))
       (pi-coding-agent--append-to-chat (concat presented boundary))
+      (pi-coding-agent--reading-text-inserted)
       (with-current-buffer (pi-coding-agent--get-chat-buffer)
         ;; History replay should keep rendering even if markdown
         ;; fontification trips over a tree-sitter/runtime mismatch.
@@ -7916,14 +8027,18 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
 RESULTS maps toolCallId strings to matching toolResult messages."
   (let ((content (plist-get message :content))
         (pending-text nil))
+    (pi-coding-agent--reading-message-start)
     (cl-labels ((flush-text ()
                   (when pending-text
+                    (pi-coding-agent--reading-text
+                     (string-join (reverse pending-text) ""))
                     (pi-coding-agent--render-history-text
                      (string-join (nreverse pending-text) ""))
                     (setq pending-text nil))))
       (cond
        ((stringp content)
         (unless (string-empty-p content)
+          (pi-coding-agent--reading-text content)
           (pi-coding-agent--render-history-text content)))
        ((vectorp content)
         (dolist (block (pi-coding-agent--content-block-list content))
@@ -8135,6 +8250,14 @@ assistant is still working, and MODE is used when that block completes."
       (user-error "No pi session buffer"))
     (with-current-buffer chat-buf
       (pi-coding-agent--set-thinking-display mode)
+      ;; Switching from visible legacy blocks back to grouped thinking needs
+      ;; the canonical order; never replay over an unfinished live response.
+      (if (and (eq pi-coding-agent-thinking-activity-display 'grouped)
+               (not pi-coding-agent--streaming-marker)
+               (vectorp pi-coding-agent--canonical-messages))
+          (pi-coding-agent--rerender-canonical-history)
+        (dolist (turn pi-coding-agent--reading-turns)
+          (pi-coding-agent--reading-render turn)))
       (let ((buffer (current-buffer))
             (saved-windows (pi-coding-agent--capture-window-rewrite-states)))
         (when-let* ((replacements
@@ -8166,6 +8289,10 @@ IDs to their result messages."
        (unless (equal previous-role "assistant")
          (pi-coding-agent--insert-turn-heading "Assistant"))
        (pi-coding-agent--render-history-assistant-content message results)
+       (setf (pi-coding-agent--reading-turn-state
+              (pi-coding-agent--reading-current))
+             (if (member (plist-get message :stopReason) '("error" "aborted"))
+                 'interrupted 'complete))
        "assistant")
       ("custom"
        (when (plist-get message :display)
@@ -8207,6 +8334,7 @@ Tool calls are rendered with headers, output, overlays, and toggles."
 (defun pi-coding-agent--finish-session-history-display ()
   "Finalize a complete history replay in the current chat buffer."
   (pi-coding-agent--activity-flush-history-record)
+  (pi-coding-agent--reading-finish)
   (goto-char (point-max))
   (unless (bolp)
     (insert "\n"))
@@ -8287,12 +8415,21 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
     (with-current-buffer target-buffer
       (let ((inhibit-read-only t)
             (inhibit-modification-hooks t)
-            (inhibit-redisplay t))
-        (buffer-swap-text render-buffer))
-      (dolist (variable pi-coding-agent--history-render-state-variables)
-        (set (make-local-variable variable)
-             (buffer-local-value variable render-buffer)))
-      (pi-coding-agent--restore-treesit-state-after-text-swap))
+            (inhibit-redisplay t)
+            (overlays
+             (with-current-buffer render-buffer
+               (mapcar (lambda (overlay)
+                         (list overlay (overlay-start overlay) (overlay-end overlay)))
+                       (append (car (overlay-lists)) (cdr (overlay-lists)))))))
+        (buffer-swap-text render-buffer)
+        (dolist (variable pi-coding-agent--history-render-state-variables)
+          (set (make-local-variable variable)
+               (buffer-local-value variable render-buffer)))
+        (pi-coding-agent--restore-treesit-state-after-text-swap)
+        ;; treesit-major-mode-setup deletes overlays.  Reattach the same
+        ;; projection objects afterwards so indexes retain valid identities.
+        (dolist (entry overlays)
+          (move-overlay (car entry) (nth 1 entry) (nth 2 entry) target-buffer))))
     (with-current-buffer target-buffer
       (pi-coding-agent--schedule-parser-reconciliation))
     (dolist (state window-state)

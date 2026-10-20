@@ -1691,7 +1691,13 @@ Uses commands from pi's `get_commands' RPC."
     (pi-coding-agent-menu-default-thinking-display)]
    ["Info"
     ("i" "stats" pi-coding-agent-session-stats)
-    ("y" "copy last" pi-coding-agent-copy-last-message)]])
+    ("y" "copy last" pi-coding-agent-copy-last-message)]]
+  [["Read"
+    ("a" "turn answer" pi-coding-agent-goto-turn-answer)
+    ("A" "latest answer" pi-coding-agent-goto-latest-answer)
+    ("]" "next failed call" pi-coding-agent-next-failed-tool)
+    ("[" "previous failed call" pi-coding-agent-previous-failed-tool)
+    ("G" "resume following" pi-coding-agent-resume-following)]])
 
 (defun pi-coding-agent-refresh-commands ()
   "Refresh commands from pi via RPC."

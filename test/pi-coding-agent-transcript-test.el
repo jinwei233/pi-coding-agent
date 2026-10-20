@@ -391,7 +391,7 @@ single tool call helper."
       (let ((record (pi-coding-agent--tool-summary-record
                      "call-x" "bash" '(:command "false")
                      (vector (list :type "text" :text payload)) nil t)))
-        (should (equal "failed \u00b7 2050 lines" (plist-get record :summary)))))))
+        (should (equal "failed \u00b7 tool call failed" (plist-get record :summary)))))))
 
 ;;;; 1.9 Summary text cannot break Markdown
 
@@ -400,7 +400,8 @@ single tool call helper."
   (let ((error-text "```js | a | b |"))
     (pi-coding-agent-transcript-test--with-history
         (pi-coding-agent-transcript-test--tool-messages
-         "bash" '(:command "false") error-text nil t)
+         "bash" '(:command "false") error-text
+         (list :errorMessage error-text) t)
       (should-not (string-match-p "^```" (pi-coding-agent-transcript-test--visible)))
       (should (string-match-p
                (regexp-quote "```js | a | b |")

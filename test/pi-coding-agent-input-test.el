@@ -2314,9 +2314,10 @@ This ensures history loads correctly when callback runs in arbitrary context."
           (with-temp-buffer
             (funcall rpc-callback
                      '(:success t :data (:messages [(:role "user" :content "test")]))))
-          ;; Chat buffer should have been updated (has startup header)
+          ;; Nonempty history replaces startup help with its first message.
           (with-current-buffer chat-buf
-            (should (string-match-p "C-c C-c" (buffer-string)))))
+            (should (string-match-p "test" (buffer-string)))
+            (should-not (string-match-p "C-c C-c" (buffer-string)))))
       (when (and proc (process-live-p proc))
         (delete-process proc))
       (when (buffer-live-p chat-buf)
