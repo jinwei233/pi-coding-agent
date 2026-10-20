@@ -15,6 +15,10 @@
 (require 'ert)
 (require 'pi-coding-agent)
 (require 'pi-coding-agent-test-common)
+(load (expand-file-name
+       "fixtures/viewport-baseline.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil t)
 
 ;;; Response Display
 
@@ -1609,11 +1613,13 @@ agent_end + next section's leading newline must not create triple newlines."
               (dotimes (index 20)
                 (insert (format "local tail %02d\n" index))))
             (setq-local pi-coding-agent-history-replay-stable-viewport t)
+            (setq-local pi-coding-agent-follow-tail-padding-lines 2)
             (goto-char (point-max))
             (set-window-point window (point-max))
             (set-window-start window (line-beginning-position -4))
             (let ((initial-content (buffer-string))
                   (initial-start (window-start window))
+                  (initial-settles pi-coding-agent--tail-settle-count)
                   (pi-coding-agent-history-replay-slice-size 1)
                   (pi-coding-agent-history-replay-slice-seconds 10))
               (cl-letf (((symbol-function 'run-at-time)
@@ -1636,6 +1642,7 @@ agent_end + next section's leading newline must not create triple newlines."
                 (should completion)
                 (should (equal (buffer-string) expected))
                 (should (= (window-point window) (point-max)))
+                (should (> pi-coding-agent--tail-settle-count initial-settles))
                 (should (treesit-parser-list nil nil t))
                 (font-lock-ensure (point-min) (point-max))
                 (with-selected-window window
@@ -2068,6 +2075,7 @@ and DISPLAY controls how completed thinking is rendered."
     (pi-coding-agent-test--with-long-live-thinking-buffer (buf 'hidden)
       (let ((win (display-buffer buf)))
         (with-selected-window win
+          (setq-local pi-coding-agent-follow-tail-padding-lines 2)
           (goto-char (point-max))
           (recenter -1)
           (should (pi-coding-agent-test--window-mostly-filled-p win))
@@ -2083,6 +2091,7 @@ and DISPLAY controls how completed thinking is rendered."
         (pi-coding-agent--display-thinking-end ""))
       (let ((win (display-buffer buf)))
         (with-selected-window win
+          (setq-local pi-coding-agent-follow-tail-padding-lines 2)
           (goto-char (point-max))
           (recenter -1)
           (should (pi-coding-agent-test--window-mostly-filled-p win))
@@ -2502,82 +2511,87 @@ and DISPLAY controls how completed thinking is rendered."
 
 ;;; Auto-scroll
 
-(ert-deftest pi-coding-agent-test-agent-start-creates-one-scroll-generation ()
-  "A new assistant header creates one scroll generation; retries reuse it."
+(ert-deftest pi-coding-agent-test-agent-start-does-not-create-scroll-generation ()
+  "Assistant startup does not create block-scoped viewport state."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
-    (let ((generation pi-coding-agent--streaming-scroll-generation)
-          (anchor (marker-position
-                   pi-coding-agent--streaming-scroll-anchor-marker)))
-      (should (= generation 1))
-      (should (< anchor
-                 (marker-position pi-coding-agent--message-start-marker)))
-      (pi-coding-agent--display-agent-start)
-      (should (= pi-coding-agent--streaming-scroll-generation generation))
-      (should (= (marker-position
-                  pi-coding-agent--streaming-scroll-anchor-marker)
-                 anchor)))))
+    (should-not
+     (local-variable-p 'pi-coding-agent--streaming-scroll-generation))
+    (should-not
+     (local-variable-p 'pi-coding-agent--streaming-scroll-anchor-marker))))
 
-(ert-deftest pi-coding-agent-test-streaming-scroll-rearms-for-visible-blocks ()
-  "Thinking and text blocks each receive an independent scroll generation."
+(ert-deftest pi-coding-agent-test-visible-blocks-do-not-rearm-scroll-state ()
+  "Thinking and text boundaries do not create viewport generations."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (pi-coding-agent--display-agent-start)
-    (let ((header-generation pi-coding-agent--streaming-scroll-generation))
-      (pi-coding-agent--handle-display-event
-       '(:type "message_update"
-         :assistantMessageEvent (:type "thinking_start")))
-      (should (= pi-coding-agent--streaming-scroll-generation
-                 (1+ header-generation)))
-      (let ((thinking-generation pi-coding-agent--streaming-scroll-generation))
-        (pi-coding-agent--handle-display-event
-         '(:type "message_update"
-           :assistantMessageEvent (:type "text_start")))
-        (should (= pi-coding-agent--streaming-scroll-generation
-                   (1+ thinking-generation)))))))
+    (pi-coding-agent--handle-display-event
+     '(:type "message_update"
+       :assistantMessageEvent (:type "thinking_start")))
+    (pi-coding-agent--handle-display-event
+     '(:type "message_update"
+       :assistantMessageEvent (:type "text_start")))
+    (should-not
+     (local-variable-p 'pi-coding-agent--streaming-scroll-generation))
+    (should-not
+     (local-variable-p 'pi-coding-agent--streaming-scroll-anchor-marker))))
 
-(ert-deftest pi-coding-agent-test-streaming-scroll-reanchors-once-per-window ()
-  "An overflowing opted-in block reanchors each window only once."
+(ert-deftest pi-coding-agent-test-streaming-scroll-settles-following-window ()
+  "A following window uses the shared tail-settle path after insertion."
   (with-temp-buffer
-    (insert "context\nAssistant\n=========\nreply")
-    (setq-local pi-coding-agent-streaming-scroll-context-lines 2)
-    (setq pi-coding-agent--streaming-scroll-generation 4
-          pi-coding-agent--streaming-scroll-anchor-marker (copy-marker 9)
-          pi-coding-agent--message-start-marker (copy-marker 30))
-    (let (stored-generation window-start)
-      (cl-letf (((symbol-function 'window-parameter)
-                 (lambda (_window _parameter) stored-generation))
-                ((symbol-function 'set-window-parameter)
-                 (lambda (_window _parameter value)
-                   (setq stored-generation value)))
-                ((symbol-function 'pos-visible-in-window-p)
-                 (lambda (&rest _) nil))
-                ((symbol-function 'vertical-motion)
+    (insert "context\n")
+    (let (settled)
+      (cl-letf (((symbol-function 'get-buffer-window-list)
+                 (lambda (&rest _) '(window)))
+                ((symbol-function 'window-point)
+                 (lambda (_window) (point-max)))
+                ((symbol-function 'window-live-p)
+                 (lambda (_window) t))
+                ((symbol-function 'set-window-point)
                  (lambda (&rest _)
-                   (goto-char 3)))
-                ((symbol-function 'set-window-start)
-                 (lambda (_window start &optional _noforce)
-                   (setq window-start start))))
-        (should (pi-coding-agent--maybe-reanchor-streaming-window 'window))
-        (should (= stored-generation 4))
-        (should (= window-start 3))
-        (should-not
-         (pi-coding-agent--maybe-reanchor-streaming-window 'window))))))
+                   (ert-fail "Following windows must use tail settle")))
+                ((symbol-function 'pi-coding-agent--settle-following-window)
+                 (lambda (window)
+                   (setq settled window))))
+        (pi-coding-agent--with-scroll-preservation
+          (goto-char (point-max))
+          (insert "reply\n"))
+        (should (eq settled 'window))))))
 
-(ert-deftest pi-coding-agent-test-streaming-scroll-disabled-keeps-tail-policy ()
-  "Nil context configuration disables reply reanchoring."
+(ert-deftest pi-coding-agent-test-tail-padding-default-keeps-natural-following ()
+  "Tail padding defaults to nil for standalone chats."
   (with-temp-buffer
-    (insert "Assistant\n=========\nreply")
-    (setq-local pi-coding-agent-streaming-scroll-context-lines nil)
-    (setq pi-coding-agent--streaming-scroll-generation 1
-          pi-coding-agent--streaming-scroll-anchor-marker (copy-marker 1)
-          pi-coding-agent--message-start-marker (copy-marker 21))
-    (cl-letf (((symbol-function 'pos-visible-in-window-p)
-               (lambda (&rest _)
-                 (ert-fail "Disabled anchoring must not query visibility"))))
-      (should-not
-       (pi-coding-agent--maybe-reanchor-streaming-window 'window)))))
+    (pi-coding-agent-chat-mode)
+    (should-not pi-coding-agent-follow-tail-padding-lines)))
+
+(ert-deftest pi-coding-agent-test-rewrite-tail-restores-through-shared-settle ()
+  "A rewrite tail state delegates final geometry to the shared settle helper."
+  (let ((buffer (generate-new-buffer " *pi-rewrite-tail-settle*"))
+        (window (selected-window))
+        (original-buffer (window-buffer))
+        settled)
+    (unwind-protect
+        (progn
+          (set-window-buffer window buffer)
+          (with-current-buffer buffer
+            (pi-coding-agent-chat-mode)
+            (let ((inhibit-read-only t))
+              (insert "rewritten tail"))
+            (cl-letf (((symbol-function
+                        'pi-coding-agent--settle-following-window)
+                       (lambda (target) (setq settled target))))
+              (pi-coding-agent--restore-window-rewrite-state
+               (list :window window
+                     :point (point-max)
+                     :start (point-min)
+                     :row 0
+                     :tail-p t))))
+          (should (eq settled window)))
+      (when (window-live-p window)
+        (set-window-buffer window original-buffer))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest pi-coding-agent-test-window-following-p-at-end ()
   "pi-coding-agent--window-following-p detects when window-point is at end."

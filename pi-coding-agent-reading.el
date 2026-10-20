@@ -349,7 +349,7 @@
      (goto-char (point-max))
      (set-window-parameter (selected-window) 'pi-reading-follow t)
      (set-window-parameter (selected-window) 'pi-reading-new nil)
-     (recenter -1)
+     (pi-coding-agent--settle-following-window (selected-window))
      (force-mode-line-update))))
 
 (defun pi-coding-agent--reading-content-event ()

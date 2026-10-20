@@ -21,6 +21,10 @@
 (require 'ert)
 (require 'pi-coding-agent-gui-test-utils)
 (require 'pi-coding-agent-test-common)
+(load (expand-file-name
+       "fixtures/viewport-baseline.el"
+       (file-name-directory (or load-file-name buffer-file-name)))
+      nil t)
 
 (defun pi-coding-agent-gui-test--table-display-strings (beg end)
   "Return ordered table overlay display strings between BEG and END."
@@ -235,10 +239,12 @@
 
 ;;;; Scroll Preservation Tests
 
-(ert-deftest pi-coding-agent-gui-test-streaming-reanchors-on-first-overflow ()
-  "A block reanchors once, resumes following, and leaves input untouched."
-  (let ((buffer (generate-new-buffer " *pi-stream-anchor-gui*"))
-        (input-buffer (generate-new-buffer " *pi-stream-anchor-input*")))
+(ert-deftest pi-coding-agent-gui-test-streaming-keeps-fixed-tail-padding ()
+  "Batch appends keep a 46-row Output pinned above two blank rows."
+  (let ((buffer (generate-new-buffer " *pi-stream-tail-gui*"))
+        (input-buffer (generate-new-buffer " *pi-stream-tail-input*"))
+        (frame (selected-frame))
+        (original-height (frame-height)))
     (unwind-protect
         (save-window-excursion
           (delete-other-windows)
@@ -246,6 +252,8 @@
                  (input-window (split-window window -4 'below)))
             (set-window-buffer window buffer)
             (set-window-buffer input-window input-buffer)
+            (pi-coding-agent-test-viewport-set-body-height
+             window pi-coding-agent-test-viewport-body-height)
             (with-current-buffer input-buffer
               (insert "Input draft\nsecond line\n"))
             (set-window-start input-window (point-min))
@@ -253,63 +261,204 @@
             (let ((input-start (window-start input-window))
                   (input-point (window-point input-window)))
               (with-current-buffer buffer
-		(pi-coding-agent-chat-mode)
-		(setq-local pi-coding-agent-streaming-scroll-context-lines 2)
-		(let ((inhibit-read-only t))
-                  (dotimes (index (+ 5 (window-body-height window)))
-                    (insert (format "Earlier line %02d\n" index))))
-		(set-window-point window (point-max))
-		(with-selected-window window
-                  (goto-char (point-max))
-                  (recenter -1))
-		(setq pi-coding-agent--status 'streaming)
-		(pi-coding-agent--display-agent-start)
-		(let ((generation pi-coding-agent--streaming-scroll-generation)
-                      (limit (+ 10 (window-body-height window)))
-                      (index 0))
-                  (while (and (< index limit)
-                              (not (equal
-                                    (window-parameter
-                                     window
-                                     'pi-coding-agent-streaming-scroll-generation)
-                                    generation)))
-                    (pi-coding-agent--display-message-delta
-                     (format "Reply line %02d\n" index))
-                    (redisplay t)
-                    (setq index (1+ index)))
-                  (should (equal
-                           (window-parameter
-                            window 'pi-coding-agent-streaming-scroll-generation)
-                           generation))
-                  (let ((anchored-start (window-start window)))
-                    (should
-                     (= (count-screen-lines
-			 anchored-start
-			 (marker-position
-                          pi-coding-agent--streaming-scroll-anchor-marker)
-			 nil window)
-			2))
-                    (dotimes (tail-index (+ 5 (window-body-height window)))
-                      (pi-coding-agent--display-message-delta
-                       (format "Later line %02d\n" tail-index))
-                      (redisplay t))
-                    (should (> (window-start window) anchored-start))
-                    (should (pi-coding-agent--window-following-p window))
-                    (goto-char pi-coding-agent--streaming-scroll-anchor-marker)
-                    (set-window-start window (point) t)
-                    (set-window-point window (point))
-                    (redisplay t)
-                    (let ((reader-start (window-start window)))
-                      (pi-coding-agent--display-message-delta
-                       "Delta after manual scroll\n")
+                (pi-coding-agent-chat-mode)
+                (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+                (let ((inhibit-read-only t))
+                  (insert
+                   (pi-coding-agent-test-viewport-lines
+                    "Earlier line"
+                    (+ 10 pi-coding-agent-test-viewport-body-height))))
+                (set-window-point window (point-max))
+                (pi-coding-agent--settle-following-window window)
+                (select-window input-window)
+                (let ((offset 0))
+                  (dolist (delta pi-coding-agent-test-viewport-deltas)
+                    (let ((before
+                           (with-current-buffer buffer
+                             (line-number-at-pos (window-start window)))))
+                      (with-current-buffer buffer
+                        (pi-coding-agent-test-viewport-append-lines
+                         "Reply line" delta offset))
+                      (setq offset (+ offset delta))
                       (redisplay t)
-                      (should (= (window-start window) reader-start))))
-                  (should (= (window-start input-window) input-start))
-                  (should (= (window-point input-window) input-point)))))))
+                      (with-current-buffer buffer
+                        (pi-coding-agent-test-viewport-assert-fixed-tail
+                         window 2)
+                        (pi-coding-agent-test-viewport-assert-bounded-append
+                         before
+                         (line-number-at-pos (window-start window))
+                         delta)))))
+                (should (eq (selected-window) input-window))
+                (should (= (window-start input-window) input-start))
+                (should (= (window-point input-window) input-point))
+                (should
+                 (equal
+                  (with-current-buffer input-buffer (buffer-string))
+                  "Input draft\nsecond line\n"))))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer))
       (when (buffer-live-p input-buffer)
-        (kill-buffer input-buffer)))))
+        (kill-buffer input-buffer))
+      (set-frame-height frame original-height))))
+
+(ert-deftest pi-coding-agent-gui-test-tail-padding-content-matrix ()
+  "Tail padding survives whitespace, wrapping, Unicode, code, and tables."
+  (let ((buffer (generate-new-buffer " *pi-tail-content-matrix*"))
+        (frame (selected-frame))
+        (original-width (frame-width)))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((window (selected-window))
+                (cases
+                 '(("plain tail" "")
+                   ("plain tail" "\n")
+                   ("plain tail" "\n\n")
+                   ("plain tail" " \t\n\n")
+                   ("中文结尾" "\n\n")
+                   ("emoji 🙂 tail" "\n\n")
+                   ("This final line is intentionally long enough to wrap across several visual rows in a narrow Output window while preserving the same tail boundary."
+                    "\n")
+                   ("```elisp\n(message \"tail\")\n```" "\n\n")
+                   ("| key | value |\n|---|---|\n| tail | 中文🙂 |" "\n\n"))))
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+              (dolist (width '(70 96))
+                (set-frame-width frame width)
+                (redisplay t)
+                (dolist (case cases)
+                  (let ((inhibit-read-only t))
+                    (erase-buffer)
+                    (insert
+                     (pi-coding-agent-test-viewport-lines "Earlier line" 60))
+                    (insert (car case) (cadr case)))
+                  (when (string-prefix-p "|" (car case))
+                    (pi-coding-agent--decorate-tables-in-region
+                     (line-beginning-position -5) (point-max)
+                     (window-body-width window)))
+                  (set-window-point window (point-max))
+                  (pi-coding-agent--settle-following-window window)
+                  (redisplay t)
+                  (ert-info ((format "width=%d content=%S suffix=%S"
+                                     width (car case) (cadr case)))
+                    (if (string-match-p "[^[:ascii:]]" (car case))
+                        (let ((geometry
+                               (pi-coding-agent-test-viewport-geometry window)))
+                          (should (<= 2 (plist-get geometry :blank-rows) 3))
+                          (should (zerop (plist-get geometry :vscroll)))
+                          (should (= (plist-get geometry :point)
+                                     (plist-get geometry :point-max))))
+                      (pi-coding-agent-test-viewport-assert-fixed-tail
+                       window 2))
+                    (let ((start (window-start window)))
+                      (pi-coding-agent--settle-following-window window)
+                      (redisplay t)
+                      (should (= (window-start window) start))
+                      (if (string-match-p "[^[:ascii:]]" (car case))
+                          (let ((geometry
+                                 (pi-coding-agent-test-viewport-geometry window)))
+                            (should
+                             (<= 2 (plist-get geometry :blank-rows) 3)))
+                        (pi-coding-agent-test-viewport-assert-fixed-tail
+                         window 2)))))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (set-frame-width frame original-width))))
+
+(ert-deftest pi-coding-agent-gui-test-resize-settles-projection-contraction ()
+  "A wider, shorter Output immediately settles its contracted projection."
+  (let ((buffer (generate-new-buffer " *pi-tail-resize-gui*"))
+        (input-buffer (generate-new-buffer " *pi-tail-resize-input*"))
+        (frame (selected-frame))
+        (original-width (frame-width))
+        (original-height (frame-height)))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (set-frame-width frame 70)
+          (let* ((window (selected-window))
+                 (input-window (split-window window -4 'below)))
+            (set-window-buffer window buffer)
+            (set-window-buffer input-window input-buffer)
+            (pi-coding-agent-test-viewport-set-body-height
+             window pi-coding-agent-test-viewport-body-height)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+              (let ((inhibit-read-only t))
+                (dotimes (index 80)
+                  (insert
+                   (format
+                    "line %03d wraps at seventy columns but contracts after the frame becomes wider\n"
+                    index))))
+              (set-window-point window (point-max))
+              (pi-coding-agent--settle-following-window window)
+              (redisplay t)
+              (pi-coding-agent-test-viewport-assert-fixed-tail window 2)
+              (let ((before-screen-lines
+                     (count-screen-lines
+                      (point-min)
+                      (pi-coding-agent-test-viewport-last-content-position)
+                      nil window))
+                    (before-body-height (window-body-height window))
+                    (before-settles pi-coding-agent--tail-settle-count))
+                (select-window input-window)
+                (set-frame-size
+                 frame 96 (- (frame-height frame) 8))
+                (redisplay t)
+                (should
+                 (pi-coding-agent-test-wait-until
+                  (lambda ()
+                    (with-current-buffer buffer
+                      (let ((geometry
+                             (pi-coding-agent-test-viewport-geometry window)))
+                        (and (/= (window-body-height window)
+                                 before-body-height)
+                             (= (plist-get geometry :blank-rows) 2)
+                             (zerop (plist-get geometry :vscroll))))))
+                  2 0.05))
+                (with-current-buffer buffer
+                  (should
+                   (< (count-screen-lines
+                       (point-min)
+                       (pi-coding-agent-test-viewport-last-content-position)
+                       nil window)
+                      before-screen-lines))
+                  (should (> pi-coding-agent--tail-settle-count
+                             before-settles))
+                  (pi-coding-agent-test-viewport-assert-fixed-tail window 2))
+                (should (eq (selected-window) input-window))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (buffer-live-p input-buffer)
+        (kill-buffer input-buffer))
+      (set-frame-size frame original-width original-height)
+      (redisplay t))))
+
+(ert-deftest pi-coding-agent-gui-test-natural-tail-preserves-pixel-vscroll ()
+  "Nil and zero padding do not clear native pixel vscroll."
+  (let ((buffer (generate-new-buffer " *pi-natural-tail-vscroll*")))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (let ((window (selected-window)))
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (insert
+                 (pi-coding-agent-test-viewport-lines "Natural line" 60)))
+              (dolist (padding '(nil 0))
+                (setq-local pi-coding-agent-follow-tail-padding-lines padding)
+                (set-window-point window (point-max))
+                (set-window-vscroll window 1)
+                (let ((vscroll (window-vscroll window)))
+                  (pi-coding-agent--settle-following-window window)
+                  (should (= (window-vscroll window) vscroll)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest pi-coding-agent-gui-test-scroll-preserved-streaming ()
   "Test scroll position is preserved while a fake stream updates below."

@@ -2791,7 +2791,171 @@ Binds `chat-win' and `input-win' for use in BODY."
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (should (memq #'pi-coding-agent--maybe-rebalance-windows
+                  window-size-change-functions))
+    (should (memq #'pi-coding-agent--maybe-settle-frame-following-windows
                   window-size-change-functions))))
+
+(ert-deftest pi-coding-agent-test-obsolete-scroll-setting-warns-once ()
+  "The removed block-reanchor setting produces one process-level warning."
+  (let ((pi-coding-agent--legacy-scroll-warning-shown nil)
+        (warnings 0))
+    (cl-progv '(pi-coding-agent-streaming-scroll-context-lines) '(2)
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (&rest _args) (cl-incf warnings))))
+        (with-temp-buffer
+          (pi-coding-agent-chat-mode))
+        (with-temp-buffer
+          (pi-coding-agent-chat-mode))))
+    (should (= warnings 1))))
+
+(ert-deftest pi-coding-agent-test-unset-obsolete-scroll-setting-does-not-warn ()
+  "The default obsolete setting stays silent."
+  (let ((pi-coding-agent--legacy-scroll-warning-shown nil)
+        (warnings 0))
+    (cl-progv '(pi-coding-agent-streaming-scroll-context-lines) '(nil)
+      (cl-letf (((symbol-function 'display-warning)
+                 (lambda (&rest _args) (cl-incf warnings))))
+        (with-temp-buffer
+          (pi-coding-agent-chat-mode))))
+    (should (zerop warnings))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-nil-and-zero-use-natural-path ()
+  "Nil and zero padding only update window point through native following."
+  (dolist (padding '(nil 0))
+    (pi-coding-agent-test-with-split-layout
+      (let ((inhibit-read-only t))
+        (insert "tail"))
+      (setq-local pi-coding-agent-follow-tail-padding-lines padding)
+      (set-window-vscroll chat-win 1)
+      (cl-letf (((symbol-function 'recenter)
+                 (lambda (&rest _args)
+                   (ert-fail "Natural following must not recenter")))
+                ((symbol-function 'set-window-vscroll)
+                 (lambda (&rest _args)
+                   (ert-fail "Natural following must preserve pixel vscroll"))))
+        (pi-coding-agent--settle-following-window chat-win))
+      (should (= (window-point chat-win) (point-max))))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-clamps-small-windows ()
+  "One-row windows use natural following and taller windows clamp padding."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 20)
+        (insert (format "line %d\n" index))))
+    (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+    (dolist (height '(1 2 3 4 5))
+      (let (recenter-arg)
+        (cl-letf (((symbol-function 'window-body-height)
+                   (lambda (_window &optional _pixelwise) height))
+                  ((symbol-function 'frame-visible-p) (lambda (_frame) t))
+                  ((symbol-function 'vertical-motion)
+                   (lambda (lines &rest _args) lines))
+                  ((symbol-function 'count-screen-lines)
+                   (lambda (&rest _args)
+                     (ert-fail
+                      "Tail settlement must not scan the full transcript")))
+                  ((symbol-function 'recenter)
+                   (lambda (arg &optional _redisplay)
+                     (setq recenter-arg arg)))
+                  ((symbol-function 'set-window-vscroll) #'ignore))
+          (pi-coding-agent--settle-following-window chat-win))
+        (if (= height 1)
+            (should-not recenter-arg)
+          (should (= recenter-arg
+                     (- (1+ (min 2 (1- height)))))))))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-keeps-short-transcript-at-top ()
+  "Positive padding does not push a short transcript to the window bottom."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "one\ntwo\nthree"))
+    (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+    (cl-letf (((symbol-function 'recenter)
+               (lambda (&rest _args)
+                 (ert-fail "Short transcripts must keep natural top layout"))))
+      (pi-coding-agent--settle-following-window chat-win))
+    (should (= (window-start chat-win) (point-min)))
+    (should (= (window-point chat-win) (point-max)))))
+
+(ert-deftest pi-coding-agent-test-hidden-frame-defers-tail-measurement ()
+  "Positive padding on a hidden frame avoids all visual-line measurement."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "tail"))
+    (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+    (cl-letf (((symbol-function 'frame-visible-p) (lambda (_frame) nil))
+              ((symbol-function 'vertical-motion)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden frames must not measure visual lines")))
+              ((symbol-function 'count-screen-lines)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden frames must not measure visual lines")))
+              ((symbol-function 'recenter)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden frames must not recenter"))))
+      (pi-coding-agent--settle-following-window chat-win))
+    (should (= (window-point chat-win) (point-max)))))
+
+(ert-deftest pi-coding-agent-test-visible-frame-recovers-deferred-tail-settle ()
+  "A visible-frame notification settles geometry deferred while hidden."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+    (let ((visible nil)
+          recenter-arg
+          (before pi-coding-agent--tail-settle-count))
+      (cl-letf (((symbol-function 'frame-visible-p)
+                 (lambda (_frame) (and visible t)))
+                ((symbol-function 'vertical-motion)
+                 (lambda (lines &rest _args) lines))
+                ((symbol-function 'recenter)
+                 (lambda (arg &optional _redisplay)
+                   (setq recenter-arg arg)))
+                ((symbol-function 'set-window-vscroll) #'ignore))
+        (pi-coding-agent--settle-following-window chat-win)
+        (should-not recenter-arg)
+        (setq visible t)
+        (pi-coding-agent--maybe-settle-frame-following-windows
+         (window-frame chat-win)))
+      (should (= recenter-arg -3))
+      (should (= pi-coding-agent--tail-settle-count (+ before 2))))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-signature-detects-real-change ()
+  "Recorded geometry becomes stale when the configured padding changes."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "tail"))
+    (pi-coding-agent--settle-following-window chat-win)
+    (should-not
+     (pi-coding-agent--following-window-settle-stale-p chat-win))
+    (setq-local pi-coding-agent-follow-tail-padding-lines 2)
+    (should
+     (pi-coding-agent--following-window-settle-stale-p chat-win))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-signature-ignores-manual-scroll ()
+  "Content and manual scroll changes do not request resize settlement."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (pi-coding-agent--settle-following-window chat-win)
+    (let ((inhibit-read-only t))
+      (goto-char (point-max))
+      (insert "changed\n"))
+    (set-window-start chat-win (point-min))
+    (set-window-vscroll chat-win 1)
+    (should-not
+     (pi-coding-agent--following-window-settle-stale-p chat-win))))
+
+(ert-deftest pi-coding-agent-test-tail-settle-reentrancy-guard ()
+  "A nested settle request cannot mutate geometry or increment its count."
+  (pi-coding-agent-test-with-split-layout
+    (let ((before pi-coding-agent--tail-settle-count)
+          (pi-coding-agent--settling-following-window t))
+      (pi-coding-agent--settle-following-window chat-win)
+      (should (= pi-coding-agent--tail-settle-count before)))))
 
 (provide 'pi-coding-agent-ui-test)
 ;;; pi-coding-agent-ui-test.el ends here

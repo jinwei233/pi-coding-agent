@@ -314,5 +314,52 @@
         (kill-buffer first)
         (kill-buffer second)))))
 
+(ert-deftest pi-coding-agent-test-resume-following-settles-output-from-input ()
+  "Resume uses shared tail settlement while preserving Input focus and draft."
+  (save-window-excursion
+    (delete-other-windows)
+    (let ((chat (generate-new-buffer " *pi-resume-output*"))
+          (input (generate-new-buffer " *pi-resume-input*"))
+          settled)
+      (unwind-protect
+          (let* ((output-window (selected-window))
+                 (input-window (split-window output-window -5 'below)))
+            (set-window-buffer output-window chat)
+            (set-window-buffer input-window input)
+            (with-current-buffer chat
+              (pi-coding-agent-chat-mode)
+              (setq-local pi-coding-agent--input-buffer input)
+              (let ((inhibit-read-only t))
+                (dotimes (index 40)
+                  (insert (format "line %d\n" index)))))
+            (with-current-buffer input
+              (pi-coding-agent-input-mode)
+              (setq-local pi-coding-agent--chat-buffer chat)
+              (insert "keep this draft"))
+            (select-window input-window)
+            (let ((original
+                   (symbol-function
+                    'pi-coding-agent--settle-following-window)))
+              (cl-letf (((symbol-function
+                          'pi-coding-agent--settle-following-window)
+                         (lambda (window)
+                           (setq settled window)
+                           (funcall original window))))
+                (with-current-buffer input
+                  (pi-coding-agent-resume-following))))
+            (should (eq settled output-window))
+            (should (eq (selected-window) input-window))
+            (should
+             (equal (with-current-buffer input (buffer-string))
+                    "keep this draft"))
+            (should
+             (window-parameter output-window 'pi-reading-follow))
+            (should-not
+             (window-parameter output-window 'pi-reading-new)))
+        (when (buffer-live-p chat)
+          (kill-buffer chat))
+        (when (buffer-live-p input)
+          (kill-buffer input))))))
+
 (provide 'pi-coding-agent-reading-test)
 ;;; pi-coding-agent-reading-test.el ends here

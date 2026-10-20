@@ -151,17 +151,47 @@ total window height, e.g. 0.3 means 30% for input."
                  (float :tag "Fraction (0.0–1.0)"))
   :group 'pi-coding-agent)
 
-(defcustom pi-coding-agent-streaming-scroll-context-lines nil
-  "Visual lines to retain before a streamed assistant reply when reanchoring.
-When this is a non-negative integer, a window following output reanchors once
-per visible streaming block when the block first overflows the viewport, then
-continues following the latest output.  Nil keeps the existing always-follow
-behavior.
+(defcustom pi-coding-agent-follow-tail-padding-lines nil
+  "Complete visual lines kept below the last non-blank output line.
+A positive integer pins following Output windows above this fixed breathing
+room.  Nil or zero preserves Pi's natural tail-following behavior.  Very small
+windows reduce the effective padding so at least one content line remains
+visible.
 
 This option may be set buffer-locally by integrations such as Agent Workspace."
   :type '(choice (const :tag "Disabled" nil)
+                 (natnum :tag "Padding lines"))
+  :group 'pi-coding-agent)
+(make-variable-buffer-local 'pi-coding-agent-follow-tail-padding-lines)
+
+(defcustom pi-coding-agent-streaming-scroll-context-lines nil
+  "Obsolete block-start context setting.
+Block-scoped streaming reanchoring has been removed.  Use
+`pi-coding-agent-follow-tail-padding-lines' for fixed tail breathing room."
+  :type '(choice (const :tag "Disabled" nil)
                  (natnum :tag "Context lines"))
   :group 'pi-coding-agent)
+(make-obsolete-variable
+ 'pi-coding-agent-streaming-scroll-context-lines
+ 'pi-coding-agent-follow-tail-padding-lines
+ "2026-10-20")
+
+(defvar pi-coding-agent--legacy-scroll-warning-shown nil
+  "Non-nil after warning about the obsolete block reanchor setting.")
+
+(defun pi-coding-agent--warn-obsolete-scroll-setting ()
+  "Warn once when the obsolete block reanchor setting is still enabled."
+  (when (and (not pi-coding-agent--legacy-scroll-warning-shown)
+             (boundp 'pi-coding-agent-streaming-scroll-context-lines)
+             (symbol-value 'pi-coding-agent-streaming-scroll-context-lines))
+    (setq pi-coding-agent--legacy-scroll-warning-shown t)
+    (display-warning
+     'pi-coding-agent
+     (concat
+      "`pi-coding-agent-streaming-scroll-context-lines' no longer reanchors "
+      "streaming blocks; use `pi-coding-agent-follow-tail-padding-lines' "
+      "for fixed tail breathing room.")
+     :warning)))
 
 (defcustom pi-coding-agent-parser-lifecycle-enabled t
   "Whether Pi chat buffers reclaim local Tree-sitter parsers from cold history.
@@ -1557,6 +1587,7 @@ This is a read-only buffer showing the conversation history."
   (setq-local pi-coding-agent--history-load-generation 0)
   (setq-local pi-coding-agent--session-transition-generation 0)
   (setq-local pi-coding-agent--session-transition-active nil)
+  (pi-coding-agent--warn-obsolete-scroll-setting)
   ;; Disable hl-line-mode: its post-command-hook overlay update causes
   ;; scroll oscillation in buffers with invisible text + variable heights.
   (setq-local global-hl-line-mode nil)
@@ -1590,10 +1621,14 @@ This is a read-only buffer showing the conversation history."
             #'pi-coding-agent--maybe-refresh-hot-tail-tables nil t)
   (add-hook 'window-configuration-change-hook
             #'pi-coding-agent--schedule-parser-reconciliation nil t)
+  (add-hook 'window-configuration-change-hook
+            #'pi-coding-agent--maybe-settle-current-window t t)
   (add-hook 'window-scroll-functions
             #'pi-coding-agent--parser-window-scrolled nil t)
   (add-hook 'window-size-change-functions
             #'pi-coding-agent--maybe-rebalance-windows)
+  (add-hook 'window-size-change-functions
+            #'pi-coding-agent--maybe-settle-frame-following-windows t)
   (add-hook 'kill-buffer-query-functions
             #'pi-coding-agent--session-kill-buffer-query nil t)
   (add-hook 'kill-buffer-hook #'pi-coding-agent--cleanup-on-kill nil t))
@@ -2022,27 +2057,6 @@ Used to replace raw markdown with rendered Org on message completion.")
   "Set the message start MARKER."
   (setq pi-coding-agent--message-start-marker marker))
 
-(defvar-local pi-coding-agent--streaming-scroll-generation 0
-  "Generation identifying the current visible block for scroll anchoring.")
-
-(defvar-local pi-coding-agent--streaming-scroll-anchor-marker nil
-  "Marker at the current visible block for contextual scroll anchoring.")
-
-(defun pi-coding-agent--begin-streaming-scroll-anchor ()
-  "Start scroll-anchor state for a visible streaming block."
-  (when (markerp pi-coding-agent--streaming-scroll-anchor-marker)
-    (set-marker pi-coding-agent--streaming-scroll-anchor-marker nil))
-  (setq pi-coding-agent--streaming-scroll-generation
-        (1+ pi-coding-agent--streaming-scroll-generation)
-        pi-coding-agent--streaming-scroll-anchor-marker
-        (copy-marker (point-max) nil)))
-
-(defun pi-coding-agent--clear-streaming-scroll-anchor ()
-  "Detach and clear the current streaming scroll anchor."
-  (when (markerp pi-coding-agent--streaming-scroll-anchor-marker)
-    (set-marker pi-coding-agent--streaming-scroll-anchor-marker nil))
-  (setq pi-coding-agent--streaming-scroll-anchor-marker nil))
-
 (defvar-local pi-coding-agent--tool-args-cache nil
   "Hash table mapping toolCallId to authoritative execution args.
 Needed because `tool_execution_end' events do not include args.  This is
@@ -2438,6 +2452,22 @@ Intended for `window-size-change-functions'."
         (unless (eq win input-win)
           (pi-coding-agent--rebalance-input-window win input-win))))))
 
+(defvar pi-coding-agent--settling-following-window nil
+  "Non-nil while Pi is changing following-window geometry.")
+
+(defun pi-coding-agent--maybe-settle-frame-following-windows (frame)
+  "Settle stale following Pi Output windows on visible FRAME.
+This runs after input-window rebalancing in `window-size-change-functions'."
+  (when (and (not pi-coding-agent--settling-following-window)
+             (eq (frame-visible-p frame) t))
+    (dolist (window (window-list frame 'no-mini))
+      (when (window-live-p window)
+        (with-current-buffer (window-buffer window)
+          (when (and (derived-mode-p 'pi-coding-agent-chat-mode)
+                     (pi-coding-agent--window-following-p window)
+                     (pi-coding-agent--following-window-settle-stale-p window))
+            (pi-coding-agent--settle-following-window window)))))))
+
 (defun pi-coding-agent--windows-by-height (&optional windows)
   "Return live WINDOWS sorted by descending height.
 If WINDOWS is nil, use all non-minibuffer windows in the selected frame."
@@ -2558,34 +2588,105 @@ larger window when the selected one cannot be split."
   "Return non-nil if WINDOW is following output (point at end of buffer)."
   (>= (window-point window) (1- (point-max))))
 
-(defun pi-coding-agent--streaming-scroll-anchor-start (window)
-  "Return contextual viewport start for the current block in WINDOW."
-  (save-excursion
-    (goto-char pi-coding-agent--streaming-scroll-anchor-marker)
-    (vertical-motion (- pi-coding-agent-streaming-scroll-context-lines) window)
-    (point)))
+(defvar-local pi-coding-agent--tail-settle-count 0
+  "Number of effective tail-settle operations in this chat buffer.")
 
-(defun pi-coding-agent--maybe-reanchor-streaming-window (window)
-  "Reanchor following WINDOW on the first overflow of this streaming block.
-Return non-nil when WINDOW was reanchored."
-  (let ((generation pi-coding-agent--streaming-scroll-generation))
-    (when (and (integerp pi-coding-agent-streaming-scroll-context-lines)
-               (>= pi-coding-agent-streaming-scroll-context-lines 0)
-               (markerp pi-coding-agent--streaming-scroll-anchor-marker)
-               (marker-position pi-coding-agent--streaming-scroll-anchor-marker)
-               (markerp pi-coding-agent--message-start-marker)
-               (marker-position pi-coding-agent--message-start-marker)
-               (not (equal
-                     (window-parameter
-                      window 'pi-coding-agent-streaming-scroll-generation)
-                     generation))
-               (not (pos-visible-in-window-p
-                     (max (point-min) (1- (point-max))) window t)))
+(defun pi-coding-agent--following-window-settle-signature (window)
+  "Return the current tail-settle geometry signature for WINDOW."
+  (with-current-buffer (window-buffer window)
+    (list (current-buffer)
+          (window-body-height window)
+          (window-body-width window)
+          pi-coding-agent-follow-tail-padding-lines
+          (frame-visible-p (window-frame window)))))
+
+(defun pi-coding-agent--following-window-settle-stale-p (window)
+  "Return non-nil when following WINDOW needs tail geometry settlement."
+  (not (equal
+        (window-parameter window 'pi-coding-agent-tail-settle-signature)
+        (pi-coding-agent--following-window-settle-signature window))))
+
+(defun pi-coding-agent--record-following-window-settle (window)
+  "Record WINDOW's current settled tail geometry."
+  (set-window-parameter
+   window 'pi-coding-agent-tail-settle-signature
+   (pi-coding-agent--following-window-settle-signature window)))
+
+(defun pi-coding-agent--settle-following-window (window)
+  "Settle following WINDOW at its buffer's configured output tail.
+Nil or zero padding keeps the native `set-window-point' behavior.  Positive
+padding uses the last non-whitespace display position and native `recenter' to
+leave complete visual lines below real content.  Hidden frames defer visual
+measurement until their next visible window notification."
+  (when (and (window-live-p window)
+             (not pi-coding-agent--settling-following-window))
+    (let ((pi-coding-agent--settling-following-window t)
+          (buffer (window-buffer window)))
+      (with-current-buffer buffer
+        (cl-incf pi-coding-agent--tail-settle-count))
+      (let* ((point-max (with-current-buffer buffer (point-max)))
+             (padding
+              (buffer-local-value
+               'pi-coding-agent-follow-tail-padding-lines buffer))
+             (body-height (max 0 (window-body-height window)))
+             (effective-padding
+              (if (and (integerp padding) (> padding 0))
+                  (min padding (max 0 (1- body-height)))
+                0)))
+        (cond
+         ((or (zerop effective-padding)
+              (not (eq (frame-visible-p (window-frame window)) t)))
+          (set-window-point window point-max))
+         (t
+          (save-current-buffer
+            ;; Callers may bind the Output buffer while Input stays selected.
+            ;; Align these before `with-selected-window' saves Input's point.
+            (set-buffer (window-buffer (selected-window)))
+            (with-selected-window window
+              (let* ((tail
+                      (save-excursion
+                        (goto-char point-max)
+                        (skip-chars-backward " \t\n\r")
+                        (point)))
+                     (required-backward-lines
+                      (max 0
+                           (1- (- body-height effective-padding))))
+                     (available-backward-lines
+                      (save-excursion
+                        (goto-char tail)
+                        (vertical-motion
+                         (- required-backward-lines) window))))
+                (if (or (= tail (point-min))
+                        (> available-backward-lines
+                           (- required-backward-lines)))
+                    (progn
+                      (set-window-point window point-max)
+                      (set-window-start window (point-min) t))
+                  (goto-char tail)
+                  (recenter (- (1+ effective-padding)))
+                  (set-window-point window point-max)
+                  (set-window-vscroll window 0)))))))
+        (pi-coding-agent--record-following-window-settle window)))))
+
+(defun pi-coding-agent--maybe-settle-current-window ()
+  "Settle the selected following Pi window when its geometry is stale."
+  (let ((window (selected-window)))
+    (when (and (not pi-coding-agent--settling-following-window)
+               (window-live-p window)
+               (eq (window-buffer window) (current-buffer))
+               (eq (frame-visible-p (window-frame window)) t)
+               (pi-coding-agent--window-following-p window)
+               (pi-coding-agent--following-window-settle-stale-p window))
+      (pi-coding-agent--settle-following-window window))))
+
+(defun pi-coding-agent--clear-obsolete-scroll-window-parameters ()
+  "Remove block-reanchor generation parameters from live windows."
+  (dolist (frame (frame-list))
+    (dolist (window (window-list frame 'no-mini))
       (set-window-parameter
-       window 'pi-coding-agent-streaming-scroll-generation generation)
-      (set-window-start
-       window (pi-coding-agent--streaming-scroll-anchor-start window))
-      t)))
+       window 'pi-coding-agent-streaming-scroll-generation nil))))
+
+(pi-coding-agent--clear-obsolete-scroll-window-parameters)
 
 (defmacro pi-coding-agent--with-scroll-preservation (&rest body)
   "Execute BODY preserving scroll for windows not following output.
@@ -2601,11 +2702,10 @@ Windows where user scrolled up stay in place."
      (dolist (pair saved-points)
        (when (window-live-p (car pair))
          (set-window-point (car pair) (cdr pair))))
-     ;; Keep the latest output visible after any one-time reanchor.
+     ;; Keep the latest output at the configured tail boundary.
      (dolist (win following)
        (when (window-live-p win)
-         (pi-coding-agent--maybe-reanchor-streaming-window win)
-         (set-window-point win (point-max))))))
+         (pi-coding-agent--settle-following-window win)))))
 
 (defun pi-coding-agent--append-to-chat (text)
   "Append TEXT to the chat buffer.

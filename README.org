@@ -528,6 +528,10 @@ Here's some common non-default preferences:
 ;; Make the input pane 25% of the Pi window pair; rebalanced on frame resize:
 (setopt pi-coding-agent-input-window-height 0.25)
 
+;; Keep two complete visual lines below the last non-blank output line:
+;; nil or 0 keeps Pi's native tail-following behavior instead.
+(setopt pi-coding-agent-follow-tail-padding-lines 2)
+
 ;; Copy source Markdown from the chat buffer instead of only visible text:
 (setopt pi-coding-agent-copy-raw-markdown t)
 
@@ -569,6 +573,17 @@ Less common tuning knobs:
 ;; `pi-coding-agent-thinking-hidden-preview' is obsolete: collapsed thinking
 ;; always previews its first line, so setting it no longer changes anything.
 #+end_src
+
+Positive =pi-coding-agent-follow-tail-padding-lines= values pin the last
+non-blank content line above a fixed visual breathing room.  Trailing spaces
+and blank lines do not count as content.  Leave it nil or set it to zero for
+the package's natural tail following, including native pixel-precise manual
+scrolling.  Automatic following does not add animation or momentum.
+
+The former =pi-coding-agent-streaming-scroll-context-lines= option is obsolete.
+Streaming no longer reanchors at Thinking or text block boundaries; migrate an
+explicit old setting to =pi-coding-agent-follow-tail-padding-lines= only when
+fixed tail breathing room is desired.
 
 You can also inspect the whole customization group with:
 

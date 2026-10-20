@@ -198,8 +198,6 @@ Nil means use `pi-coding-agent-tool-activity-display'.")
     pi-coding-agent--assistant-wrapper-raw-chunks
     pi-coding-agent--assistant-text-start-marker
     pi-coding-agent--message-start-marker
-    pi-coding-agent--streaming-scroll-generation
-    pi-coding-agent--streaming-scroll-anchor-marker
     pi-coding-agent--tool-args-cache
     pi-coding-agent--transient-tool-pairs
     pi-coding-agent--tool-detail-buffers
@@ -257,7 +255,6 @@ Note: status is set to `streaming' by the event handler."
   (pi-coding-agent--set-aborted nil)  ; Reset abort flag for new turn
   ;; Only show header if not already shown for this prompt.
   (unless pi-coding-agent--assistant-header-shown
-    (pi-coding-agent--begin-streaming-scroll-anchor)
     (pi-coding-agent--insert-turn-heading "Assistant")
     (setq pi-coding-agent--assistant-header-shown t))
   ;; Create markers at current end position
@@ -1949,7 +1946,6 @@ Updates buffer-local state and renders display updates."
           (pi-coding-agent--reset-assistant-markdown-state)
           (setq pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
-            (pi-coding-agent--begin-streaming-scroll-anchor)
             (pi-coding-agent--insert-turn-heading "Assistant")
             (setq pi-coding-agent--assistant-header-shown t))
           (pi-coding-agent--set-message-start-marker (copy-marker (point-max) nil))
@@ -1960,8 +1956,7 @@ Updates buffer-local state and renders display updates."
        (pcase event-type
          ("text_start"
           (pi-coding-agent--finish-assistant-text)
-          (pi-coding-agent--reset-assistant-markdown-state)
-          (pi-coding-agent--begin-streaming-scroll-anchor))
+          (pi-coding-agent--reset-assistant-markdown-state))
          ("text_delta"
           (pi-coding-agent--set-activity-phase "replying")
           (pi-coding-agent--display-message-delta (plist-get msg-event :delta)))
@@ -1973,7 +1968,6 @@ Updates buffer-local state and renders display updates."
           (setq pi-coding-agent--streaming-table-candidate nil))
          ("thinking_start"
           (pi-coding-agent--finish-assistant-text)
-          (pi-coding-agent--begin-streaming-scroll-anchor)
           (pi-coding-agent--display-thinking-start))
          ("thinking_delta"
           (pi-coding-agent--display-thinking-delta (plist-get msg-event :delta)))
@@ -8193,9 +8187,7 @@ nil for positions deleted by the rewrite."
                (point (pi-coding-agent--resolve-window-rewrite-point
                        window-state map-position)))
           (if (plist-get window-state :tail-p)
-              (progn
-                (goto-char point-max)
-                (recenter -1))
+              (pi-coding-agent--settle-following-window win)
             (goto-char point)
             (let* ((body-height (max 1 (window-body-height win)))
                    (saved-start
@@ -8439,8 +8431,8 @@ Note: When called from async callbacks, pass CHAT-BUF explicitly."
             (saved-start (nth 3 state)))
         (when (window-live-p window)
           (if following
-              (set-window-point
-               window (with-current-buffer target-buffer (point-max)))
+              (with-current-buffer target-buffer
+                (pi-coding-agent--settle-following-window window))
             (let ((maximum (with-current-buffer target-buffer (point-max))))
               (set-window-point window (min saved-point maximum))
               (set-window-start window (min saved-start maximum) t))))))))
