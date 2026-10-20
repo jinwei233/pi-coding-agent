@@ -295,5 +295,24 @@
         (goto-char answer)
         (should (looking-at "final answer"))))))
 
+(ert-deftest pi-coding-agent-test-reading-global-window-hook-takes-frame ()
+  (save-window-excursion
+    (let ((first (generate-new-buffer " *pi-reading-first*"))
+          (second (generate-new-buffer " *pi-reading-second*"))
+          (window (selected-window)))
+      (unwind-protect
+          (progn
+            (set-window-buffer window first)
+            (set-window-parameter window 'pi-reading-chat first)
+            (set-window-parameter window 'pi-reading-new t)
+            (pi-coding-agent--reading-window-rebound (selected-frame))
+            (should (window-parameter window 'pi-reading-new))
+            (set-window-buffer window second)
+            (run-hook-with-args 'window-buffer-change-functions (selected-frame))
+            (should-not (window-parameter window 'pi-reading-new))
+            (should-not (window-parameter window 'pi-reading-chat)))
+        (kill-buffer first)
+        (kill-buffer second)))))
+
 (provide 'pi-coding-agent-reading-test)
 ;;; pi-coding-agent-reading-test.el ends here

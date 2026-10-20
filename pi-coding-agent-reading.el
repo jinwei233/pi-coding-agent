@@ -382,11 +382,13 @@
                  (window-parameter window 'pi-reading-new))
             "阅读历史 · 有新输出" "阅读历史")))))
 
-(defun pi-coding-agent--reading-window-rebound (window)
-  "Clear reading state when WINDOW changes its bound chat."
-  (unless (eq (window-buffer window) (window-parameter window 'pi-reading-chat))
-    (dolist (parameter '(pi-reading-chat pi-reading-follow pi-reading-new pi-reading-seen))
-      (set-window-parameter window parameter nil))))
+(defun pi-coding-agent--reading-window-rebound (frame)
+  "Clear reading state for rebound windows on FRAME.
+The global `window-buffer-change-functions' hook receives a frame."
+  (dolist (window (window-list frame 'no-minibuffer))
+    (unless (eq (window-buffer window) (window-parameter window 'pi-reading-chat))
+      (dolist (parameter '(pi-reading-chat pi-reading-follow pi-reading-new pi-reading-seen))
+        (set-window-parameter window parameter nil)))))
 
 (add-hook 'window-buffer-change-functions #'pi-coding-agent--reading-window-rebound)
 
