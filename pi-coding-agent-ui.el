@@ -1384,7 +1384,11 @@ Returns the position of the heading line start, or nil if not found."
     (if pos
         (progn
           (goto-char pos)
-          (when (get-buffer-window) (recenter 0)))
+          (when (get-buffer-window)
+            (recenter 0)
+            (pi-coding-agent--viewport-enter-reading
+             (pi-coding-agent--viewport-window-state (selected-window))
+             t)))
       (message "No more messages"))))
 
 (defun pi-coding-agent-previous-message ()
@@ -1396,7 +1400,11 @@ Returns the position of the heading line start, or nil if not found."
     (if pos
         (progn
           (goto-char pos)
-          (when (get-buffer-window) (recenter 0)))
+          (when (get-buffer-window)
+            (recenter 0)
+            (pi-coding-agent--viewport-enter-reading
+             (pi-coding-agent--viewport-window-state (selected-window))
+             t)))
       (message "No previous message"))))
 
 ;;;; Copy Visible Text
@@ -1623,8 +1631,12 @@ This is a read-only buffer showing the conversation history."
             #'pi-coding-agent--schedule-parser-reconciliation nil t)
   (add-hook 'window-configuration-change-hook
             #'pi-coding-agent--maybe-settle-current-window t t)
+  (add-hook 'post-command-hook
+            #'pi-coding-agent--viewport-post-command t t)
   (add-hook 'window-scroll-functions
             #'pi-coding-agent--parser-window-scrolled nil t)
+  (add-hook 'window-scroll-functions
+            #'pi-coding-agent--viewport-window-scrolled t t)
   (add-hook 'window-size-change-functions
             #'pi-coding-agent--maybe-rebalance-windows)
   (add-hook 'window-size-change-functions
@@ -2456,17 +2468,15 @@ Intended for `window-size-change-functions'."
   "Non-nil while Pi is changing following-window geometry.")
 
 (defun pi-coding-agent--maybe-settle-frame-following-windows (frame)
-  "Settle stale following Pi Output windows on visible FRAME.
+  "Settle stale Pi Output windows on visible FRAME.
 This runs after input-window rebalancing in `window-size-change-functions'."
   (when (and (not pi-coding-agent--settling-following-window)
              (eq (frame-visible-p frame) t))
     (dolist (window (window-list frame 'no-mini))
       (when (window-live-p window)
         (with-current-buffer (window-buffer window)
-          (when (and (derived-mode-p 'pi-coding-agent-chat-mode)
-                     (pi-coding-agent--window-following-p window)
-                     (pi-coding-agent--following-window-settle-stale-p window))
-            (pi-coding-agent--settle-following-window window)))))))
+          (when (derived-mode-p 'pi-coding-agent-chat-mode)
+            (pi-coding-agent--viewport-settle-stale-window window)))))))
 
 (defun pi-coding-agent--windows-by-height (&optional windows)
   "Return live WINDOWS sorted by descending height.
@@ -2584,9 +2594,576 @@ larger window when the selected one cannot be split."
 ;; following before each insert, then restore point for non-following windows
 ;; afterward. Emacs naturally scrolls to keep point visible.
 
+(cl-defstruct (pi-coding-agent--viewport-state
+               (:constructor pi-coding-agent--make-viewport-state))
+  "Authoritative viewport state for one WINDOW displaying one CHAT."
+  window chat mode content-generation seen-generation new-output
+  point-marker start-marker point-row saved-point saved-start
+  dirty-reason replacements
+  settling geometry-signature tail-settle-signature)
+
+(defconst pi-coding-agent--viewport-state-parameter
+  'pi-coding-agent-viewport-state
+  "The sole window parameter used for Pi viewport state.")
+
+(defvar-local pi-coding-agent--viewport-content-generation 0
+  "Latest projected content generation in this chat buffer.")
+
+(defvar pi-coding-agent--viewport-state-registry nil
+  "Viewport states whose marker lifetimes need explicit management.")
+
 (defun pi-coding-agent--window-following-p (window)
   "Return non-nil if WINDOW is following output (point at end of buffer)."
   (>= (window-point window) (1- (point-max))))
+
+(defun pi-coding-agent--viewport-release-marker (marker)
+  "Detach MARKER when it is live."
+  (when (markerp marker)
+    (set-marker marker nil)))
+
+(defun pi-coding-agent--viewport-clear-reading-markers (state)
+  "Detach and clear reading anchors owned by STATE."
+  (pi-coding-agent--viewport-release-marker
+   (pi-coding-agent--viewport-state-point-marker state))
+  (pi-coding-agent--viewport-release-marker
+   (pi-coding-agent--viewport-state-start-marker state))
+  (setf (pi-coding-agent--viewport-state-point-marker state) nil
+        (pi-coding-agent--viewport-state-start-marker state) nil
+        (pi-coding-agent--viewport-state-point-row state) nil
+        (pi-coding-agent--viewport-state-saved-point state) nil
+        (pi-coding-agent--viewport-state-saved-start state) nil
+        (pi-coding-agent--viewport-state-replacements state) nil))
+
+(defun pi-coding-agent--viewport-release-state (state)
+  "Release markers and registry ownership for STATE."
+  (when (pi-coding-agent--viewport-state-p state)
+    (pi-coding-agent--viewport-clear-reading-markers state)
+    (setq pi-coding-agent--viewport-state-registry
+          (delq state pi-coding-agent--viewport-state-registry))))
+
+(defun pi-coding-agent--viewport-capture-reading-position (state)
+  "Capture the logical reading position and screen row into STATE."
+  (let ((window (pi-coding-agent--viewport-state-window state)))
+    (when (and (window-live-p window)
+               (eq (window-buffer window)
+                   (pi-coding-agent--viewport-state-chat state)))
+      (pi-coding-agent--viewport-clear-reading-markers state)
+      (let ((point (window-point window))
+            (start (window-start window)))
+        (setf (pi-coding-agent--viewport-state-point-marker state)
+              (copy-marker point)
+              (pi-coding-agent--viewport-state-start-marker state)
+              (copy-marker start)
+              (pi-coding-agent--viewport-state-saved-point state) point
+              (pi-coding-agent--viewport-state-saved-start state) start
+              (pi-coding-agent--viewport-state-point-row state)
+              (and (pi-coding-agent--viewport-visible-window-p window)
+                   (count-screen-lines start point nil window)))))))
+
+(defun pi-coding-agent--viewport-initialize-state (window)
+  "Create authoritative viewport state for WINDOW in the current chat."
+  (let* ((following (pi-coding-agent--window-following-p window))
+         (state
+          (pi-coding-agent--make-viewport-state
+           :window window
+           :chat (current-buffer)
+           :mode (if following 'following 'reading)
+           :content-generation pi-coding-agent--viewport-content-generation
+           :seen-generation
+           (and following pi-coding-agent--viewport-content-generation)
+           :new-output nil
+           :geometry-signature
+           (pi-coding-agent--viewport-geometry-signature window))))
+    (unless following
+      (pi-coding-agent--viewport-capture-reading-position state))
+    (set-window-parameter window pi-coding-agent--viewport-state-parameter state)
+    (push state pi-coding-agent--viewport-state-registry)
+    state))
+
+(defun pi-coding-agent--viewport-window-state (window &optional no-create)
+  "Return WINDOW's viewport state for the current chat.
+When NO-CREATE is non-nil, return nil instead of initializing missing state."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (let ((state
+           (window-parameter window pi-coding-agent--viewport-state-parameter)))
+      (when (pi-coding-agent--viewport-state-p state)
+        (cond
+         ;; `split-window' copies window parameters.  A copied state remains
+         ;; owned by the original window and must not be released here.
+         ((not (eq (pi-coding-agent--viewport-state-window state) window))
+          (set-window-parameter
+           window pi-coding-agent--viewport-state-parameter nil)
+          (setq state nil))
+         ((not (eq (pi-coding-agent--viewport-state-chat state)
+                   (current-buffer)))
+          (pi-coding-agent--viewport-release-state state)
+          (set-window-parameter
+           window pi-coding-agent--viewport-state-parameter nil)
+          (setq state nil))))
+      (or state
+          (unless no-create
+            (pi-coding-agent--viewport-initialize-state window))))))
+
+(defun pi-coding-agent--viewport-window-state-read-only (window)
+  "Return WINDOW's current-chat viewport state without mutation."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (let ((state
+           (window-parameter window pi-coding-agent--viewport-state-parameter)))
+      (and (pi-coding-agent--viewport-state-p state)
+           (eq (pi-coding-agent--viewport-state-window state) window)
+           (eq (pi-coding-agent--viewport-state-chat state) (current-buffer))
+           state))))
+
+(defun pi-coding-agent-viewport-state (&optional window)
+  "Return a read-only snapshot of Pi viewport state for WINDOW.
+The returned plist is detached from the internal mutable state.  WINDOW
+defaults to the selected window.  Return nil for non-Pi or unbound windows."
+  (let ((window (or window (selected-window))))
+    (when (and (window-live-p window)
+               (buffer-live-p (window-buffer window)))
+      (with-current-buffer (window-buffer window)
+        (when (derived-mode-p 'pi-coding-agent-chat-mode)
+          (when-let* ((state
+                       (pi-coding-agent--viewport-window-state-read-only
+                        window)))
+            (list
+             :chat (pi-coding-agent--viewport-state-chat state)
+             :mode (pi-coding-agent--viewport-state-mode state)
+             :following
+             (eq (pi-coding-agent--viewport-state-mode state) 'following)
+             :content-generation
+             (pi-coding-agent--viewport-state-content-generation state)
+             :seen-generation
+             (pi-coding-agent--viewport-state-seen-generation state)
+             :new-output
+             (pi-coding-agent--viewport-state-new-output state)
+             :point
+             (and (markerp
+                   (pi-coding-agent--viewport-state-point-marker state))
+                  (marker-position
+                   (pi-coding-agent--viewport-state-point-marker state)))
+             :start
+             (and (markerp
+                   (pi-coding-agent--viewport-state-start-marker state))
+                  (marker-position
+                   (pi-coding-agent--viewport-state-start-marker state)))
+             :point-row
+             (pi-coding-agent--viewport-state-point-row state)
+             :dirty-reason
+             (pi-coding-agent--viewport-state-dirty-reason state)
+             :settling
+             (pi-coding-agent--viewport-state-settling state))))))))
+
+(defun pi-coding-agent--viewport-enter-following (state)
+  "Move STATE to following mode and clear its reading anchors."
+  (let ((changed
+         (or (not (eq (pi-coding-agent--viewport-state-mode state)
+                      'following))
+             (pi-coding-agent--viewport-state-new-output state))))
+    (setf (pi-coding-agent--viewport-state-mode state) 'following
+          (pi-coding-agent--viewport-state-seen-generation state)
+          (pi-coding-agent--viewport-state-content-generation state)
+          (pi-coding-agent--viewport-state-new-output state) nil
+          (pi-coding-agent--viewport-state-dirty-reason state) nil)
+    (pi-coding-agent--viewport-clear-reading-markers state)
+    (when changed
+      (force-mode-line-update t))))
+
+(defun pi-coding-agent--viewport-enter-reading (state &optional capture)
+  "Move STATE to reading mode.
+When CAPTURE is non-nil, refresh its logical reading anchors."
+  (let ((changed
+         (not (eq (pi-coding-agent--viewport-state-mode state) 'reading))))
+    (setf (pi-coding-agent--viewport-state-mode state) 'reading)
+    (when (or capture changed
+              (not (markerp
+                    (pi-coding-agent--viewport-state-point-marker state))))
+      (pi-coding-agent--viewport-capture-reading-position state))
+    (when changed
+      (force-mode-line-update t))))
+
+(defun pi-coding-agent--viewport-reconcile-window (window)
+  "Synchronize WINDOW's state with its current point-at-end mode."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer))
+             (not pi-coding-agent--settling-following-window))
+    (when-let* ((state (pi-coding-agent--viewport-window-state window)))
+      (unless (pi-coding-agent--viewport-state-settling state)
+        (if (pi-coding-agent--window-following-p window)
+            (pi-coding-agent--viewport-enter-following state)
+          (pi-coding-agent--viewport-enter-reading state t))))))
+
+(defun pi-coding-agent--viewport-post-command ()
+  "Synchronize the selected Pi viewport after an interactive command."
+  (when (eq (window-buffer (selected-window)) (current-buffer))
+    (pi-coding-agent--viewport-reconcile-window (selected-window))))
+
+(defun pi-coding-agent--viewport-window-scrolled (window _display-start)
+  "Synchronize viewport state after WINDOW scrolls.
+This hook only writes state; it never changes window geometry."
+  (when (and (window-live-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (pi-coding-agent--viewport-reconcile-window window)))
+
+(defun pi-coding-agent--viewport-window-rebound (frame)
+  "Release stale viewport state for windows rebound on FRAME."
+  (dolist (window (window-list frame 'no-minibuffer))
+    (when-let* ((state
+                (window-parameter
+                 window pi-coding-agent--viewport-state-parameter)))
+      (unless (and (pi-coding-agent--viewport-state-p state)
+                   (eq (pi-coding-agent--viewport-state-window state) window)
+                   (eq (window-buffer window)
+                       (pi-coding-agent--viewport-state-chat state)))
+        (when (and (pi-coding-agent--viewport-state-p state)
+                   (eq (pi-coding-agent--viewport-state-window state) window))
+          (pi-coding-agent--viewport-release-state state))
+        (set-window-parameter
+         window pi-coding-agent--viewport-state-parameter nil)))))
+
+(defun pi-coding-agent--viewport-prune-dead-windows (&rest _)
+  "Release registered viewport states whose windows were deleted."
+  (dolist (state (copy-sequence pi-coding-agent--viewport-state-registry))
+    (unless (window-live-p (pi-coding-agent--viewport-state-window state))
+      (pi-coding-agent--viewport-release-state state))))
+
+(defun pi-coding-agent--viewport-window-state-changed (&rest _)
+  "Settle dirty visible Pi windows before their next redisplay."
+  (unless pi-coding-agent--settling-following-window
+    (dolist (frame (frame-list))
+      (when (eq (frame-visible-p frame) t)
+        (pi-coding-agent--maybe-settle-frame-following-windows frame)))))
+
+(defun pi-coding-agent--viewport-reset-states (&optional buffer)
+  "Release viewport states bound to BUFFER, defaulting to the current buffer."
+  (let ((buffer (or buffer (current-buffer))))
+    (dolist (state (copy-sequence pi-coding-agent--viewport-state-registry))
+      (when (eq (pi-coding-agent--viewport-state-chat state) buffer)
+        (let ((window (pi-coding-agent--viewport-state-window state)))
+          (when (window-live-p window)
+            (set-window-parameter
+             window pi-coding-agent--viewport-state-parameter nil)))
+        (pi-coding-agent--viewport-release-state state)))
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq pi-coding-agent--viewport-content-generation 0)))))
+
+(add-hook 'window-buffer-change-functions
+          #'pi-coding-agent--viewport-window-rebound)
+(add-hook 'window-state-change-functions
+          #'pi-coding-agent--viewport-prune-dead-windows)
+(add-hook 'window-state-change-functions
+          #'pi-coding-agent--viewport-window-state-changed)
+
+(defvar-local pi-coding-agent--viewport-transaction-depth 0
+  "Current nested viewport transaction depth.")
+
+(defvar-local pi-coding-agent--viewport-transaction-captures nil
+  "Outermost viewport transaction captures for the current chat.")
+
+(defvar-local pi-coding-agent--viewport-transaction-dirty-windows nil
+  "Windows changed by the current viewport transaction.")
+
+(defvar-local pi-coding-agent--viewport-transaction-replacements nil
+  "Region replacements registered by the current viewport transaction.")
+
+(defvar-local pi-coding-agent--viewport-transaction-capture-count 0
+  "Number of outermost viewport transaction captures.")
+
+(defvar-local pi-coding-agent--viewport-transaction-settle-count 0
+  "Number of outermost viewport transaction settlements.")
+
+(defun pi-coding-agent--viewport-visible-window-p (window)
+  "Return non-nil when WINDOW belongs to a visible frame."
+  (and (window-live-p window)
+       (eq (frame-visible-p (window-frame window)) t)))
+
+(defun pi-coding-agent--viewport-geometry-signature (window)
+  "Return the viewport geometry signature for WINDOW."
+  (list (window-buffer window)
+        (window-body-height window)
+        (window-body-width window)
+        (frame-visible-p (window-frame window))))
+
+(defun pi-coding-agent--viewport-capture-transaction ()
+  "Capture visible windows before the outermost transaction mutates text."
+  (setq pi-coding-agent--viewport-transaction-captures nil
+        pi-coding-agent--viewport-transaction-dirty-windows nil
+        pi-coding-agent--viewport-transaction-replacements nil)
+  (cl-incf pi-coding-agent--viewport-transaction-capture-count)
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (pi-coding-agent--viewport-reconcile-window window)
+    (let ((state (pi-coding-agent--viewport-window-state window)))
+      (if (pi-coding-agent--viewport-visible-window-p window)
+          (progn
+            (setf (pi-coding-agent--viewport-state-geometry-signature state)
+                  (pi-coding-agent--viewport-geometry-signature window))
+            (when (eq (pi-coding-agent--viewport-state-mode state) 'reading)
+              (pi-coding-agent--viewport-capture-reading-position state))
+            (push
+             (list
+              :window window
+              :state state
+              :point (window-point window)
+              :start (window-start window)
+              :row
+              (and (eq (pi-coding-agent--viewport-state-mode state) 'reading)
+                   (pi-coding-agent--viewport-state-point-row state)))
+             pi-coding-agent--viewport-transaction-captures))
+        (setf (pi-coding-agent--viewport-state-dirty-reason state) 'hidden
+              (pi-coding-agent--viewport-state-saved-point state)
+              (window-point window)
+              (pi-coding-agent--viewport-state-saved-start state)
+              (window-start window))))))
+
+(defun pi-coding-agent--viewport-note-mutation (&optional reason)
+  "Mark displayed chat windows dirty for mutation REASON."
+  (dolist (window (get-buffer-window-list (current-buffer) nil t))
+    (let ((state (pi-coding-agent--viewport-window-state window)))
+      (unless (eq (pi-coding-agent--viewport-state-dirty-reason state) 'hidden)
+        (setf (pi-coding-agent--viewport-state-dirty-reason state)
+              (or reason 'content)))
+      (cl-pushnew
+       window pi-coding-agent--viewport-transaction-dirty-windows :test #'eq))))
+
+(defun pi-coding-agent--viewport-register-replacement
+    (start end delta &optional fallback)
+  "Register replacement START END DELTA and optional FALLBACK.
+Coordinates describe the text before the replacement.  FALLBACK is the best
+new position when a saved reading anchor was deleted."
+  (let ((replacement (list start end delta fallback)))
+    (push replacement pi-coding-agent--viewport-transaction-replacements))
+  (pi-coding-agent--viewport-note-mutation 'replacement))
+
+(defun pi-coding-agent--viewport-position-replaced-p (position)
+  "Return non-nil when old POSITION was deleted by this transaction."
+  (seq-some
+   (lambda (replacement)
+     (and (<= (nth 0 replacement) position)
+          (< position (nth 1 replacement))))
+   pi-coding-agent--viewport-transaction-replacements))
+
+(defun pi-coding-agent--viewport-map-replaced-position (position)
+  "Map old POSITION through transaction replacements.
+Return nil when POSITION was deleted and no replacement fallback is available."
+  (let ((delta 0))
+    (catch 'mapped
+      (dolist
+          (replacement
+           (nreverse
+            (copy-sequence
+             pi-coding-agent--viewport-transaction-replacements)))
+        (pcase-let ((`(,start ,end ,change ,fallback) replacement))
+          (cond
+           ((and (<= start position) (< position end))
+            (throw 'mapped
+                   (if fallback
+                       (min (+ fallback delta) (point-max))
+                     (min position (point-max)))))
+           ((>= position end)
+            (setq delta (+ delta change))))))
+      (+ position delta))))
+
+(defun pi-coding-agent--viewport-advance-hidden-state (state)
+  "Advance hidden reading anchors in STATE through this transaction."
+  (when (and pi-coding-agent--viewport-transaction-replacements
+             (eq (pi-coding-agent--viewport-state-mode state) 'reading))
+    (let ((point
+           (pi-coding-agent--viewport-map-replaced-position
+            (or (pi-coding-agent--viewport-state-saved-point state)
+                (point-min))))
+          (start
+           (pi-coding-agent--viewport-map-replaced-position
+            (or (pi-coding-agent--viewport-state-saved-start state)
+                (point-min)))))
+      (setf (pi-coding-agent--viewport-state-saved-point state) point
+            (pi-coding-agent--viewport-state-saved-start state) start
+            ;; Force full start/row restoration when the frame becomes visible.
+            (pi-coding-agent--viewport-state-replacements state)
+            '((0 0 0 nil)))
+      (when (markerp (pi-coding-agent--viewport-state-point-marker state))
+        (set-marker
+         (pi-coding-agent--viewport-state-point-marker state) point))
+      (when (markerp (pi-coding-agent--viewport-state-start-marker state))
+        (set-marker
+         (pi-coding-agent--viewport-state-start-marker state) start)))))
+
+(defun pi-coding-agent--viewport-window-start-fills-p
+    (start point-max body-height window)
+  "Return non-nil when START fills BODY-HEIGHT rows through POINT-MAX in WINDOW."
+  (>= (count-screen-lines start point-max nil window)
+      (1- body-height)))
+
+(defun pi-coding-agent--viewport-clamp-reading-row
+    (saved-row above-lines tail-lines body-height)
+  "Clamp SAVED-ROW using ABOVE-LINES, TAIL-LINES, and BODY-HEIGHT."
+  (let* ((max-row (min (max 0 (1- body-height)) above-lines))
+         (total-lines (+ above-lines tail-lines)))
+    (if (< total-lines body-height)
+        (min saved-row max-row)
+      (let ((min-row (max 0 (- body-height tail-lines))))
+        (max min-row (min saved-row max-row))))))
+
+(defun pi-coding-agent--viewport-restore-reading-window (capture)
+  "Restore the reading window described by transaction CAPTURE."
+  (let* ((window (plist-get capture :window))
+         (state (plist-get capture :state)))
+    (when (and (window-live-p window)
+               (eq (window-buffer window) (current-buffer))
+               (eq (pi-coding-agent--viewport-state-chat state)
+                   (current-buffer)))
+      (let* ((point-marker
+              (pi-coding-agent--viewport-state-point-marker state))
+             (start-marker
+              (pi-coding-agent--viewport-state-start-marker state))
+             (point
+              (or (and (pi-coding-agent--viewport-position-replaced-p
+                        (plist-get capture :point))
+                       (pi-coding-agent--viewport-map-replaced-position
+                        (plist-get capture :point)))
+                  (and (markerp point-marker)
+                       (marker-position point-marker))
+                  (point-min)))
+             (start
+              (or (and (pi-coding-agent--viewport-position-replaced-p
+                        (plist-get capture :start))
+                       (pi-coding-agent--viewport-map-replaced-position
+                        (plist-get capture :start)))
+                  (and (markerp start-marker)
+                       (marker-position start-marker))
+                  point))
+             (maximum (point-max)))
+        (setq point (max (point-min) (min point maximum))
+              start (max (point-min) (min start maximum)))
+        (if (null pi-coding-agent--viewport-transaction-replacements)
+            (set-window-point window point)
+          (with-selected-window window
+            (let ((body-height (max 1 (window-body-height window))))
+              (goto-char point)
+              (if (pi-coding-agent--viewport-window-start-fills-p
+                   start maximum body-height window)
+                  (progn
+                    (set-window-start window start t)
+                    (set-window-point window (max point start)))
+                (let* ((above-lines
+                        (count-screen-lines (point-min) point nil window))
+                       (tail-lines
+                        (max 1
+                             (count-screen-lines point maximum nil window)))
+                       (row
+                        (pi-coding-agent--viewport-clamp-reading-row
+                         (or (plist-get capture :row) 0)
+                         above-lines tail-lines body-height)))
+                  (recenter row))))))
+        (pi-coding-agent--viewport-capture-reading-position state)))))
+
+(defun pi-coding-agent--viewport-settle-stale-window (window)
+  "Synchronously settle dirty or geometrically stale Pi WINDOW."
+  (when (and (pi-coding-agent--viewport-visible-window-p window)
+             (eq (window-buffer window) (current-buffer)))
+    (let* ((state (pi-coding-agent--viewport-window-state window))
+           (geometry (pi-coding-agent--viewport-geometry-signature window))
+           (dirty (pi-coding-agent--viewport-state-dirty-reason state))
+           (geometry-stale
+            (not (equal
+                  geometry
+                  (pi-coding-agent--viewport-state-geometry-signature state)))))
+      (when (and (not (pi-coding-agent--viewport-state-settling state))
+                 (or dirty geometry-stale
+                     (and (eq (pi-coding-agent--viewport-state-mode state)
+                              'following)
+                          (pi-coding-agent--following-window-settle-stale-p
+                           window))))
+        (let ((pi-coding-agent--viewport-transaction-replacements
+               (or (pi-coding-agent--viewport-state-replacements state)
+                   (and geometry-stale '((0 0 0 nil)))))
+              (capture
+               (list
+                :window window
+                :state state
+                :point
+                (or (pi-coding-agent--viewport-state-saved-point state)
+                    (window-point window))
+                :start
+                (or (pi-coding-agent--viewport-state-saved-start state)
+                    (window-start window))
+                :row
+                (pi-coding-agent--viewport-state-point-row state))))
+          (setf (pi-coding-agent--viewport-state-settling state) t)
+          (unwind-protect
+              (if (eq (pi-coding-agent--viewport-state-mode state) 'following)
+                  (pi-coding-agent--settle-following-window window)
+                (pi-coding-agent--viewport-restore-reading-window capture))
+            (setf (pi-coding-agent--viewport-state-settling state) nil
+                  (pi-coding-agent--viewport-state-dirty-reason state) nil
+                  (pi-coding-agent--viewport-state-replacements state) nil
+                  (pi-coding-agent--viewport-state-geometry-signature state)
+                  geometry)))))))
+
+(defun pi-coding-agent--viewport-settle-capture (capture)
+  "Settle one transaction CAPTURE according to its authoritative state."
+  (let* ((window (plist-get capture :window))
+         (state (plist-get capture :state)))
+    (when (and (window-live-p window)
+               (memq window
+                     pi-coding-agent--viewport-transaction-dirty-windows)
+               (eq (window-buffer window) (current-buffer)))
+      (if (not (pi-coding-agent--viewport-visible-window-p window))
+          (setf (pi-coding-agent--viewport-state-dirty-reason state) 'hidden)
+        (setf (pi-coding-agent--viewport-state-settling state) t)
+        (unwind-protect
+            (if (eq (pi-coding-agent--viewport-state-mode state) 'following)
+                (pi-coding-agent--settle-following-window window)
+              (pi-coding-agent--viewport-restore-reading-window capture))
+          (setf (pi-coding-agent--viewport-state-settling state) nil
+                (pi-coding-agent--viewport-state-dirty-reason state) nil
+                (pi-coding-agent--viewport-state-replacements state) nil
+                (pi-coding-agent--viewport-state-geometry-signature state)
+                (pi-coding-agent--viewport-geometry-signature window)))))))
+
+(defun pi-coding-agent--viewport-settle-transaction ()
+  "Settle all dirty windows captured by the outermost transaction."
+  (when pi-coding-agent--viewport-transaction-dirty-windows
+    (cl-incf pi-coding-agent--viewport-transaction-settle-count)
+    (save-selected-window
+      (dolist (capture
+               (nreverse pi-coding-agent--viewport-transaction-captures))
+        (pi-coding-agent--viewport-settle-capture capture)))
+    (dolist (state pi-coding-agent--viewport-state-registry)
+      (when (and (eq (pi-coding-agent--viewport-state-chat state)
+                     (current-buffer))
+                 (eq (pi-coding-agent--viewport-state-dirty-reason state)
+                     'hidden))
+        (pi-coding-agent--viewport-advance-hidden-state state)))))
+
+(defun pi-coding-agent--call-with-viewport-transaction (function)
+  "Call FUNCTION inside a nestable synchronous viewport transaction."
+  (if (> pi-coding-agent--viewport-transaction-depth 0)
+      (unwind-protect
+          (progn
+            (cl-incf pi-coding-agent--viewport-transaction-depth)
+            (funcall function))
+        (cl-decf pi-coding-agent--viewport-transaction-depth))
+    (let ((inhibit-redisplay t))
+      (setq pi-coding-agent--viewport-transaction-depth 1)
+      (unwind-protect
+          (progn
+            (pi-coding-agent--viewport-capture-transaction)
+            (funcall function))
+        (unwind-protect
+            (pi-coding-agent--viewport-settle-transaction)
+          (setq pi-coding-agent--viewport-transaction-depth 0
+                pi-coding-agent--viewport-transaction-captures nil
+                pi-coding-agent--viewport-transaction-dirty-windows nil
+                pi-coding-agent--viewport-transaction-replacements nil))))))
+
+(defmacro pi-coding-agent--with-viewport-transaction (&rest body)
+  "Evaluate BODY in one nestable synchronous viewport transaction."
+  (declare (indent 0) (debug t))
+  `(pi-coding-agent--call-with-viewport-transaction
+    (lambda () ,@body)))
 
 (defvar-local pi-coding-agent--tail-settle-count 0
   "Number of effective tail-settle operations in this chat buffer.")
@@ -2602,15 +3179,19 @@ larger window when the selected one cannot be split."
 
 (defun pi-coding-agent--following-window-settle-stale-p (window)
   "Return non-nil when following WINDOW needs tail geometry settlement."
-  (not (equal
-        (window-parameter window 'pi-coding-agent-tail-settle-signature)
-        (pi-coding-agent--following-window-settle-signature window))))
+  (with-current-buffer (window-buffer window)
+    (let ((state (pi-coding-agent--viewport-window-state window)))
+      (not (equal
+            (pi-coding-agent--viewport-state-tail-settle-signature state)
+            (pi-coding-agent--following-window-settle-signature window))))))
 
 (defun pi-coding-agent--record-following-window-settle (window)
   "Record WINDOW's current settled tail geometry."
-  (set-window-parameter
-   window 'pi-coding-agent-tail-settle-signature
-   (pi-coding-agent--following-window-settle-signature window)))
+  (with-current-buffer (window-buffer window)
+    (setf
+     (pi-coding-agent--viewport-state-tail-settle-signature
+      (pi-coding-agent--viewport-window-state window))
+     (pi-coding-agent--following-window-settle-signature window))))
 
 (defun pi-coding-agent--settle-following-window (window)
   "Settle following WINDOW at its buffer's configured output tail.
@@ -2669,43 +3250,31 @@ measurement until their next visible window notification."
         (pi-coding-agent--record-following-window-settle window)))))
 
 (defun pi-coding-agent--maybe-settle-current-window ()
-  "Settle the selected following Pi window when its geometry is stale."
+  "Settle the selected Pi window when its viewport state is stale."
   (let ((window (selected-window)))
     (when (and (not pi-coding-agent--settling-following-window)
                (window-live-p window)
                (eq (window-buffer window) (current-buffer))
-               (eq (frame-visible-p (window-frame window)) t)
-               (pi-coding-agent--window-following-p window)
-               (pi-coding-agent--following-window-settle-stale-p window))
-      (pi-coding-agent--settle-following-window window))))
+               (eq (frame-visible-p (window-frame window)) t))
+      (pi-coding-agent--viewport-settle-stale-window window))))
 
 (defun pi-coding-agent--clear-obsolete-scroll-window-parameters ()
-  "Remove block-reanchor generation parameters from live windows."
+  "Remove pre-unification viewport parameters from live windows."
   (dolist (frame (frame-list))
     (dolist (window (window-list frame 'no-mini))
       (set-window-parameter
-       window 'pi-coding-agent-streaming-scroll-generation nil))))
+       window 'pi-coding-agent-streaming-scroll-generation nil)
+      (set-window-parameter
+       window 'pi-coding-agent-tail-settle-signature nil))))
 
 (pi-coding-agent--clear-obsolete-scroll-window-parameters)
 
 (defmacro pi-coding-agent--with-scroll-preservation (&rest body)
-  "Execute BODY preserving scroll for windows not following output.
-Windows at buffer end will scroll to show new content.
-Windows where user scrolled up stay in place."
+  "Evaluate BODY in a viewport transaction preserving reading/following windows."
   (declare (indent 0) (debug t))
-  `(let* ((windows (get-buffer-window-list (current-buffer) nil t))
-          (following (cl-remove-if-not #'pi-coding-agent--window-following-p windows))
-          (saved-points (mapcar (lambda (w) (cons w (window-point w)))
-                                (cl-remove-if #'pi-coding-agent--window-following-p windows))))
-     ,@body
-     ;; Restore point for non-following windows
-     (dolist (pair saved-points)
-       (when (window-live-p (car pair))
-         (set-window-point (car pair) (cdr pair))))
-     ;; Keep the latest output at the configured tail boundary.
-     (dolist (win following)
-       (when (window-live-p win)
-         (pi-coding-agent--settle-following-window win)))))
+  `(pi-coding-agent--with-viewport-transaction
+     (pi-coding-agent--viewport-note-mutation 'content)
+     ,@body))
 
 (defun pi-coding-agent--append-to-chat (text)
   "Append TEXT to the chat buffer.

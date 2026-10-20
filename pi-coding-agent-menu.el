@@ -511,6 +511,7 @@ Call this when starting a new session to ensure no stale state persists."
   (pi-coding-agent--invalidate-prompt-start-wait)
   (pi-coding-agent--clear-followup-queue)
   (pi-coding-agent--set-aborted nil)
+  (pi-coding-agent--viewport-reset-states)
   (pi-coding-agent--set-canonical-messages nil)
   (pi-coding-agent--set-message-start-marker nil)
   (pi-coding-agent--set-streaming-marker nil)
@@ -527,13 +528,15 @@ Call this when starting a new session to ensure no stale state persists."
 Used when starting a new session."
   (when-let* ((chat-buf (pi-coding-agent--get-chat-buffer)))
     (with-current-buffer chat-buf
-      (let ((inhibit-read-only t))
-        (pi-coding-agent--clear-render-artifacts)
-        (erase-buffer)
-        (insert (pi-coding-agent--format-startup-header))
-        (insert "\n")
-        (pi-coding-agent--reset-session-state)
-        (goto-char (point-max))))))
+      (pi-coding-agent--with-viewport-transaction
+        (pi-coding-agent--viewport-note-mutation 'session-reset)
+        (let ((inhibit-read-only t))
+          (pi-coding-agent--clear-render-artifacts)
+          (erase-buffer)
+          (insert (pi-coding-agent--format-startup-header))
+          (insert "\n")
+          (goto-char (point-max))))
+      (pi-coding-agent--reset-session-state))))
 
 (defun pi-coding-agent--load-session-history
     (proc callback &optional chat-buf completion-callback)

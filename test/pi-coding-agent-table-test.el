@@ -1418,13 +1418,12 @@ When fringes like `display-line-numbers-mode' consume columns,
    "| # | 机制 | 位置 | follow 谓词 | 设计里提到? |\n"
    "|---|------|------|-------------|-------------|\n"
    "| 1 | window-point-insertion-type + "
-   "--with-scroll-preservation | ui.el:2590 | "
+   "viewport transaction | ui.el | "
    "--window-following-p = point ≥ point-max-1 | ✅ |\n"
-   "| 2 | 块级 reanchor + streaming-scroll-generation window param "
-   "| ui.el:2025-2044, 2568 | 同上 | ✅ |\n"
-   "| 3 | --with-window-rewrite-preservation + "
-   "capture/restore-window-rewrite-states | render.el:1131, 8070-8260 | "
-   "--rewrite-tail-window-p | ❌ |\n")
+   "| 2 | 统一 viewport state + generation "
+   "| ui.el | 同上 | ✅ |\n"
+   "| 3 | replacement mapping + transaction settle "
+   "| ui.el, render.el | state mode = following | ✅ |\n")
   "A five-column comparison table too wide for a grid at narrow widths.")
 
 (ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()

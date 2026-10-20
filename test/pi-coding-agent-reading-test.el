@@ -132,7 +132,41 @@
         (should-not (pi-coding-agent-reading-status tail))
         (should (equal "阅读历史 · 有新输出" (pi-coding-agent-reading-status history)))
         (set-window-point history (point-max))
+        (pi-coding-agent--viewport-window-scrolled
+         history (window-start history))
         (should-not (pi-coding-agent-reading-status history))))))
+
+(ert-deftest pi-coding-agent-test-reading-status-is-read-only ()
+  (save-window-excursion
+    (pi-coding-agent-reading-test--chat
+      (switch-to-buffer (current-buffer))
+      (let ((inhibit-read-only t))
+        (insert (make-string 300 ?x)))
+      (let ((window (selected-window)))
+        (set-window-point window 1)
+        (pi-coding-agent--viewport-reconcile-window window)
+        (pi-coding-agent--reading-content-event)
+        (let ((before (pi-coding-agent-viewport-state window)))
+          (should (equal "阅读历史 · 有新输出"
+                         (pi-coding-agent-reading-status window)))
+          (should (equal before
+                         (pi-coding-agent-viewport-state window))))))))
+
+(ert-deftest pi-coding-agent-test-reading-status-does-not-initialize-state ()
+  (save-window-excursion
+    (pi-coding-agent-reading-test--chat
+      (switch-to-buffer (current-buffer))
+      (let ((window (selected-window)))
+        (set-window-parameter
+         window pi-coding-agent--viewport-state-parameter nil)
+        (should-not
+         (window-parameter
+          window pi-coding-agent--viewport-state-parameter))
+        (should-not (pi-coding-agent-reading-status window))
+        (should-not (pi-coding-agent-viewport-state window))
+        (should-not
+         (window-parameter
+          window pi-coding-agent--viewport-state-parameter))))))
 
 (ert-deftest pi-coding-agent-test-reading-title-skill-line ()
   (should (equal "修复中文标题"
@@ -299,18 +333,44 @@
   (save-window-excursion
     (let ((first (generate-new-buffer " *pi-reading-first*"))
           (second (generate-new-buffer " *pi-reading-second*"))
-          (window (selected-window)))
+          (window (selected-window))
+          state point-marker second-state)
       (unwind-protect
           (progn
             (set-window-buffer window first)
-            (set-window-parameter window 'pi-reading-chat first)
-            (set-window-parameter window 'pi-reading-new t)
-            (pi-coding-agent--reading-window-rebound (selected-frame))
-            (should (window-parameter window 'pi-reading-new))
+            (with-current-buffer first
+              (pi-coding-agent-chat-mode)
+              (setq-local pi-coding-agent--viewport-content-generation 7)
+              (let ((inhibit-read-only t))
+                (insert "history\n"))
+              (set-window-point window (point-min))
+              (setq state (pi-coding-agent--viewport-window-state window))
+              (pi-coding-agent--viewport-enter-reading state t)
+              (setq point-marker
+                    (pi-coding-agent--viewport-state-point-marker state)))
+            (pi-coding-agent--viewport-window-rebound (selected-frame))
+            (should (eq state
+                        (window-parameter
+                         window pi-coding-agent--viewport-state-parameter)))
+            (should (marker-position point-marker))
             (set-window-buffer window second)
             (run-hook-with-args 'window-buffer-change-functions (selected-frame))
-            (should-not (window-parameter window 'pi-reading-new))
-            (should-not (window-parameter window 'pi-reading-chat)))
+            (should-not
+             (window-parameter
+              window pi-coding-agent--viewport-state-parameter))
+            (should-not (marker-position point-marker))
+            (with-current-buffer second
+              (pi-coding-agent-chat-mode)
+              ;; A matching numeric generation cannot preserve the old chat.
+              (setq-local pi-coding-agent--viewport-content-generation 7)
+              (setq second-state
+                    (pi-coding-agent--viewport-window-state window)))
+            (should-not (eq state second-state))
+            (should (eq (pi-coding-agent--viewport-state-chat second-state)
+                        second))
+            (should (= (pi-coding-agent--viewport-state-content-generation
+                        second-state)
+                       7)))
         (kill-buffer first)
         (kill-buffer second)))))
 
@@ -352,10 +412,11 @@
             (should
              (equal (with-current-buffer input (buffer-string))
                     "keep this draft"))
-            (should
-             (window-parameter output-window 'pi-reading-follow))
-            (should-not
-             (window-parameter output-window 'pi-reading-new)))
+            (let ((state
+                   (with-current-buffer chat
+                     (pi-coding-agent-viewport-state output-window))))
+              (should (plist-get state :following))
+              (should-not (plist-get state :new-output))))
         (when (buffer-live-p chat)
           (kill-buffer chat))
         (when (buffer-live-p input)

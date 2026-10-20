@@ -63,6 +63,32 @@
     (should (null pi-coding-agent--message-start-marker))
     (should (null pi-coding-agent--streaming-marker))))
 
+(ert-deftest pi-coding-agent-test-clear-chat-buffer-uses-one-transaction ()
+  "Session reset settles its text replacement before releasing viewport state."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *pi-clear-chat-transaction*"))
+          (window (selected-window)))
+      (unwind-protect
+          (progn
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (insert "existing transcript\n"))
+              (set-window-point window (point-max))
+              (pi-coding-agent--viewport-window-state window)
+              (setq-local
+               pi-coding-agent--viewport-transaction-capture-count 0
+               pi-coding-agent--viewport-transaction-settle-count 0)
+              (pi-coding-agent--clear-chat-buffer)
+              (should (= pi-coding-agent--viewport-transaction-capture-count 1))
+              (should (= pi-coding-agent--viewport-transaction-settle-count 1))
+              (should-not
+               (window-parameter
+                window pi-coding-agent--viewport-state-parameter))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest pi-coding-agent-test-clear-chat-buffer-resets-session-state ()
   "Clearing chat buffer resets all session-specific state."
   (with-temp-buffer

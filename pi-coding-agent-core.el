@@ -38,6 +38,9 @@
 (defvar pi-coding-agent-cross-read-batching-delay 0.016)
 (defvar pi-coding-agent-cross-read-batching-metrics-functions nil)
 
+(declare-function pi-coding-agent--call-with-viewport-transaction
+                  "pi-coding-agent-ui" (function))
+
 ;;;; JSON Parsing
 
 (defun pi-coding-agent--parse-json-line (line)
@@ -542,11 +545,21 @@ RIGHT supplies the latest authoritative message snapshot."
 
 (defun pi-coding-agent--dispatch-process-json (proc json)
   "Dispatch parsed JSON from PROC without dropping later filter records."
-  (condition-case err
-      (pi-coding-agent--dispatch-response proc json)
-    (error
-     (message "pi-coding-agent: error dispatching process response: %s"
-              (error-message-string err)))))
+  (let ((dispatch
+         (lambda ()
+           (condition-case err
+               (pi-coding-agent--dispatch-response proc json)
+             (error
+              (message "pi-coding-agent: error dispatching process response: %s"
+                       (error-message-string err)))))))
+    (if (and (not (equal (plist-get json :type) "response"))
+             (fboundp 'pi-coding-agent--call-with-viewport-transaction)
+             (buffer-live-p
+              (process-get proc 'pi-coding-agent-chat-buffer)))
+        (with-current-buffer
+            (process-get proc 'pi-coding-agent-chat-buffer)
+          (pi-coding-agent--call-with-viewport-transaction dispatch))
+      (funcall dispatch))))
 
 (defun pi-coding-agent--process-chat-buffer (proc)
   "Return PROC's live Pi chat buffer, or nil."

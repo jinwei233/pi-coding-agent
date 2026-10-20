@@ -1593,6 +1593,34 @@ TYPE defaults to text_delta, CONTENT-INDEX to zero and TIMESTAMP to one."
       (when (process-live-p fake-proc) (delete-process fake-proc))
       (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
 
+(ert-deftest pi-coding-agent-test-pending-delta-flush-routes-use-transactions ()
+  "Boundary, deadline, and exit flushes each use one viewport transaction."
+  (let ((events 0)
+        (transactions 0)
+        (chat-buffer (generate-new-buffer " *pi-cross-read-transactions*"))
+        (fake-proc (start-process "cat" nil "cat"))
+        (event '(:type "agent_start")))
+    (unwind-protect
+        (progn
+          (process-put fake-proc 'pi-coding-agent-chat-buffer chat-buffer)
+          (process-put fake-proc 'pi-coding-agent-display-handler
+                       (lambda (_event) (cl-incf events)))
+          (cl-letf (((symbol-function
+                      'pi-coding-agent--call-with-viewport-transaction)
+                     (lambda (function)
+                       (cl-incf transactions)
+                       (funcall function))))
+            (dolist (reason '(boundary deadline process-exit))
+              (process-put fake-proc 'pi-coding-agent-pending-delta event)
+              (process-put fake-proc 'pi-coding-agent-pending-delta-count 1)
+              (should
+               (pi-coding-agent--flush-pending-delta fake-proc reason))))
+          (should (= events 3))
+          (should (= transactions 3)))
+      (pi-coding-agent--cancel-pending-delta fake-proc)
+      (when (process-live-p fake-proc) (delete-process fake-proc))
+      (when (buffer-live-p chat-buffer) (kill-buffer chat-buffer)))))
+
 (ert-deftest pi-coding-agent-test-process-filter-discards-stale-generation ()
   "A delayed delta from an old session generation cannot reach the new one."
   (let ((events nil)

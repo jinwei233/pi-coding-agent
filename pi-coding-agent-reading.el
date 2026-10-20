@@ -24,8 +24,6 @@
 (declare-function pi-coding-agent--activity-record-tools "pi-coding-agent-render" (record))
 (declare-function pi-coding-agent--activity-render-record "pi-coding-agent-render" (record))
 (declare-function pi-coding-agent--activity-toggle-tool-detail "pi-coding-agent-render" (record tool))
-(declare-function pi-coding-agent--capture-window-rewrite-states "pi-coding-agent-render" ())
-(declare-function pi-coding-agent--restore-window-rewrite-states "pi-coding-agent-render" (buffer states &optional adjust))
 
 (defcustom pi-coding-agent-thinking-activity-display 'blocks
   "Display completed thinking as individual `blocks' or turn `grouped'."
@@ -45,7 +43,6 @@
 (defvar-local pi-coding-agent--reading-current nil)
 (defvar-local pi-coding-agent--reading-title nil)
 (defvar-local pi-coding-agent--reading-welcome-hidden nil)
-(defvar-local pi-coding-agent--reading-generation 0)
 (defvar-local pi-coding-agent--reading-chunks nil)
 (defvar-local pi-coding-agent--reading-live-thought nil)
 (defvar pi-coding-agent--reading-history nil)
@@ -154,67 +151,69 @@
         (end (pi-coding-agent--reading-turn-end turn))
         (inhibit-read-only t))
     (when start
-      (let ((saved (pi-coding-agent--capture-window-rewrite-states)))
-        (unwind-protect
-        (save-excursion
-          (goto-char start)
-          (delete-region start end)
-          (let* ((visible (eq (pi-coding-agent--thinking-display-mode) 'visible))
-                 (expanded (or visible (pi-coding-agent--reading-turn-expanded turn)))
-                 (running (eq (pi-coding-agent--reading-turn-state turn) 'running))
-                 (label (if running "working"
-                          (format "%d thoughts"
-                                  (length (pi-coding-agent--reading-turn-thoughts turn)))))
-                 (position (point)))
-            (insert (pi-coding-agent--activity-row-text
-                     (cond (expanded "▾") (running "◌") (t "▸"))
-                     'thinking label) "\n")
-            (make-text-button position (1- (point))
-                              :type 'pi-coding-agent-activity-button
-                              'action #'pi-coding-agent--reading-button
-                              'pi-reading-turn turn 'pi-reading-index nil
-                              'help-echo "TAB/RET/click: toggle thoughts"
-                              'follow-link t)
-            (when expanded
-              (cl-loop for fragment in (pi-coding-agent--reading-turn-thoughts turn)
-                       for index from 0 do
-                       (let ((thought (plist-get fragment :text))
-                             (position (point))
-                             (selected (or visible
-                                           (eql index (pi-coding-agent--reading-turn-selected turn)))))
-                         (insert "  "
-                                 (truncate-string-to-width
-                                  (pi-coding-agent--activity-row-text
-                                   (if selected "▾" "▸") 'thinking
-                                   (plist-get fragment :preview))
-                                  70 nil nil "…") "\n")
-                         (make-text-button position (1- (point))
-                                           :type 'pi-coding-agent-activity-button
-                                           'action #'pi-coding-agent--reading-button
-                                           'pi-reading-turn turn 'pi-reading-index index
-                                           'help-echo "TAB/RET/click: toggle full thought"
-                                           'follow-link t)
-                         (when selected
-                           (insert (pi-coding-agent--thinking-blockquote-text
-                                    (pi-coding-agent--thinking-normalize-text thought)) "\n"))))
-              (when (and (eq turn pi-coding-agent--reading-current)
-                         pi-coding-agent--reading-chunks)
-                (let ((position (point))
-                      (text (apply #'concat (reverse pi-coding-agent--reading-chunks)))
-                      (selected (eq (pi-coding-agent--reading-turn-selected turn) 'live)))
-                  (insert "  " (pi-coding-agent--activity-row-text
-                                (if selected "▾" "◌") 'thinking "working") "\n")
-                  (make-text-button position (1- (point))
-                                    :type 'pi-coding-agent-activity-button
-                                    'action #'pi-coding-agent--reading-button
-                                    'pi-reading-turn turn 'pi-reading-index 'live
-                                    'help-echo "TAB/RET/click: toggle live thought"
-                                    'follow-link t)
-                  (when selected
-                    (insert (pi-coding-agent--thinking-blockquote-text
-                             (pi-coding-agent--thinking-normalize-text text)) "\n"))))))
-          (set-marker end (point)))
-          (pi-coding-agent--restore-window-rewrite-states (current-buffer) saved))))))
+      (let ((old-start (marker-position start))
+            (old-end (marker-position end)))
+        (pi-coding-agent--with-viewport-transaction
+          (save-excursion
+            (goto-char start)
+            (delete-region start end)
+            (let* ((visible (eq (pi-coding-agent--thinking-display-mode) 'visible))
+                   (expanded (or visible (pi-coding-agent--reading-turn-expanded turn)))
+                   (running (eq (pi-coding-agent--reading-turn-state turn) 'running))
+                   (label (if running "working"
+                            (format "%d thoughts"
+                                    (length (pi-coding-agent--reading-turn-thoughts turn)))))
+                   (position (point)))
+              (insert (pi-coding-agent--activity-row-text
+                       (cond (expanded "▾") (running "◌") (t "▸"))
+                       'thinking label) "\n")
+              (make-text-button position (1- (point))
+                                :type 'pi-coding-agent-activity-button
+                                'action #'pi-coding-agent--reading-button
+                                'pi-reading-turn turn 'pi-reading-index nil
+                                'help-echo "TAB/RET/click: toggle thoughts"
+                                'follow-link t)
+              (when expanded
+                (cl-loop for fragment in (pi-coding-agent--reading-turn-thoughts turn)
+                         for index from 0 do
+                         (let ((thought (plist-get fragment :text))
+                               (position (point))
+                               (selected (or visible
+                                             (eql index (pi-coding-agent--reading-turn-selected turn)))))
+                           (insert "  "
+                                   (truncate-string-to-width
+                                    (pi-coding-agent--activity-row-text
+                                     (if selected "▾" "▸") 'thinking
+                                     (plist-get fragment :preview))
+                                    70 nil nil "…") "\n")
+                           (make-text-button position (1- (point))
+                                             :type 'pi-coding-agent-activity-button
+                                             'action #'pi-coding-agent--reading-button
+                                             'pi-reading-turn turn 'pi-reading-index index
+                                             'help-echo "TAB/RET/click: toggle full thought"
+                                             'follow-link t)
+                           (when selected
+                             (insert (pi-coding-agent--thinking-blockquote-text
+                                      (pi-coding-agent--thinking-normalize-text thought)) "\n"))))
+                (when (and (eq turn pi-coding-agent--reading-current)
+                           pi-coding-agent--reading-chunks)
+                  (let ((position (point))
+                        (text (apply #'concat (reverse pi-coding-agent--reading-chunks)))
+                        (selected (eq (pi-coding-agent--reading-turn-selected turn) 'live)))
+                    (insert "  " (pi-coding-agent--activity-row-text
+                                  (if selected "▾" "◌") 'thinking "working") "\n")
+                    (make-text-button position (1- (point))
+                                      :type 'pi-coding-agent-activity-button
+                                      'action #'pi-coding-agent--reading-button
+                                      'pi-reading-turn turn 'pi-reading-index 'live
+                                      'help-echo "TAB/RET/click: toggle live thought"
+                                      'follow-link t)
+                    (when selected
+                      (insert (pi-coding-agent--thinking-blockquote-text
+                               (pi-coding-agent--thinking-normalize-text text)) "\n"))))))
+            (set-marker end (point)))
+          (pi-coding-agent--viewport-register-replacement
+           old-start old-end (- (marker-position end) old-end) old-start))))))
 
 (defun pi-coding-agent--reading-button (button)
   "Toggle the turn or thought identified by BUTTON."
@@ -327,7 +326,9 @@
          (push-mark (point) t)
          (goto-char answer)
          (set-window-start (selected-window) answer)
-         (set-window-parameter (selected-window) 'pi-reading-follow nil)
+         (pi-coding-agent--viewport-enter-reading
+          (pi-coding-agent--viewport-window-state (selected-window))
+          t)
          (message "Pi: %s"
                   (pcase (pi-coding-agent--reading-turn-state turn)
                     ('running "进行中的正文") ('interrupted "回复中断") (_ "答复"))))))))
@@ -347,50 +348,44 @@
    (lambda ()
      (push-mark (point) t)
      (goto-char (point-max))
-     (set-window-parameter (selected-window) 'pi-reading-follow t)
-     (set-window-parameter (selected-window) 'pi-reading-new nil)
+     (let ((state
+            (pi-coding-agent--viewport-window-state (selected-window))))
+       (pi-coding-agent--viewport-enter-following state))
      (pi-coding-agent--settle-following-window (selected-window))
      (force-mode-line-update))))
 
 (defun pi-coding-agent--reading-content-event ()
   "Update visible windows before a real content event is projected."
-  (cl-incf pi-coding-agent--reading-generation)
+  (cl-incf pi-coding-agent--viewport-content-generation)
   (dolist (window (get-buffer-window-list (current-buffer) nil t))
-    (let ((following (>= (window-point window) (1- (point-max)))))
-      (unless (eq (window-parameter window 'pi-reading-chat) (current-buffer))
-        (set-window-parameter window 'pi-reading-chat (current-buffer))
-        (set-window-parameter window 'pi-reading-new nil))
-      (set-window-parameter window 'pi-reading-follow following)
-      (when following
-        (set-window-parameter window 'pi-reading-seen pi-coding-agent--reading-generation))
-      (unless following
-        (unless (window-parameter window 'pi-reading-new)
-          (set-window-parameter window 'pi-reading-new t)
-          (force-mode-line-update))))))
+    (pi-coding-agent--viewport-reconcile-window window)
+    (let* ((state (pi-coding-agent--viewport-window-state window))
+           (following
+            (eq (pi-coding-agent--viewport-state-mode state) 'following))
+           (was-new (pi-coding-agent--viewport-state-new-output state)))
+      (setf (pi-coding-agent--viewport-state-content-generation state)
+            pi-coding-agent--viewport-content-generation)
+      (if following
+          (setf (pi-coding-agent--viewport-state-seen-generation state)
+                pi-coding-agent--viewport-content-generation
+                (pi-coding-agent--viewport-state-new-output state) nil)
+        (setf (pi-coding-agent--viewport-state-new-output state) t))
+      (unless (eq was-new
+                  (pi-coding-agent--viewport-state-new-output state))
+        (force-mode-line-update t)))))
 
 (defun pi-coding-agent-reading-status (&optional window)
-  "Return the static reading hint for WINDOW's mode line."
+  "Return the static reading hint for WINDOW's mode line.
+Formatting is read-only; state transitions happen in command and scroll hooks."
   (let ((window (or window (selected-window))))
     (when (and pi-coding-agent-reading-hints
                (eq (window-buffer window) (current-buffer)))
-      (if (>= (window-point window) (1- (point-max)))
-          (progn
-            (set-window-parameter window 'pi-reading-new nil)
-            (set-window-parameter window 'pi-reading-seen pi-coding-agent--reading-generation)
-            nil)
-        (if (and (eq (window-parameter window 'pi-reading-chat) (current-buffer))
-                 (window-parameter window 'pi-reading-new))
-            "阅读历史 · 有新输出" "阅读历史")))))
-
-(defun pi-coding-agent--reading-window-rebound (frame)
-  "Clear reading state for rebound windows on FRAME.
-The global `window-buffer-change-functions' hook receives a frame."
-  (dolist (window (window-list frame 'no-minibuffer))
-    (unless (eq (window-buffer window) (window-parameter window 'pi-reading-chat))
-      (dolist (parameter '(pi-reading-chat pi-reading-follow pi-reading-new pi-reading-seen))
-        (set-window-parameter window parameter nil)))))
-
-(add-hook 'window-buffer-change-functions #'pi-coding-agent--reading-window-rebound)
+      (when-let* ((state
+                   (pi-coding-agent--viewport-window-state-read-only window)))
+        (unless (eq (pi-coding-agent--viewport-state-mode state) 'following)
+          (if (pi-coding-agent--viewport-state-new-output state)
+              "阅读历史 · 有新输出"
+            "阅读历史"))))))
 
 (defun pi-coding-agent--reading-failed-tool (direction)
   "Visit the next failed tool in DIRECTION without wrapping."
@@ -423,12 +418,15 @@ The global `window-buffer-change-functions' hook receives a frame."
          (let ((record (car target)) (tool (cadr target)))
            (pi-coding-agent--reading-expand-tools record)
            (pi-coding-agent--activity-render-record record)
+           (pi-coding-agent--activity-toggle-tool-detail record tool)
            (goto-char (pi-coding-agent--activity-record-start-marker record))
            (when-let* ((found (text-property-search-forward
                               'pi-coding-agent-activity-tool-call-id
                               (plist-get tool :tool-call-id) t)))
              (goto-char (prop-match-beginning found)))
-           (pi-coding-agent--activity-toggle-tool-detail record tool)))))))
+           (pi-coding-agent--viewport-enter-reading
+            (pi-coding-agent--viewport-window-state (selected-window))
+            t)))))))
 
 (defun pi-coding-agent-next-failed-tool ()
   "Visit the next failed tool and open its existing detail view."

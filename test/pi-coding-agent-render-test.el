@@ -631,6 +631,27 @@ as the top-level structure."
     (pi-coding-agent--display-agent-end)
     (should (string-suffix-p "response\n" (buffer-string)))))
 
+(ert-deftest pi-coding-agent-test-direct-agent-end-uses-one-transaction ()
+  "Direct turn completion joins nested finalizers into one settlement."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *pi-agent-end-transaction*"))
+          (window (selected-window)))
+      (unwind-protect
+          (progn
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (pi-coding-agent--display-agent-start)
+              (pi-coding-agent--display-message-delta "Some response")
+              (setq-local pi-coding-agent--viewport-transaction-capture-count 0
+                          pi-coding-agent--viewport-transaction-settle-count 0)
+              (pi-coding-agent--display-agent-end)
+              (should (= pi-coding-agent--viewport-transaction-capture-count 1))
+              (should (= pi-coding-agent--viewport-transaction-settle-count 1))
+              (should (= pi-coding-agent--viewport-transaction-depth 0))))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
 (ert-deftest pi-coding-agent-test-spacing-blank-line-after-user-header ()
   "User turn keeps its structural heading hidden behind the marker line."
   (with-temp-buffer
@@ -1690,6 +1711,52 @@ agent_end + next section's leading newline must not create triple newlines."
               (should (equal completions '(nil))))))
       (kill-buffer chat))))
 
+(ert-deftest pi-coding-agent-test-failed-stable-history-keeps-viewport-state ()
+  "A staging failure leaves target text and authoritative viewport state alone."
+  (save-window-excursion
+    (let ((messages
+           [(:role "user" :content [(:type "text" :text "First")])])
+          (chat (generate-new-buffer " *pi-failed-stable-history*"))
+          (window (selected-window))
+          queue completions initial-text initial-state)
+      (unwind-protect
+          (progn
+            (set-window-buffer window chat)
+            (with-current-buffer chat
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (dotimes (index 40)
+                  (insert (format "local line %02d\n" index))))
+              (set-window-point window (point-min))
+              (pi-coding-agent--viewport-reconcile-window window)
+              (setq-local pi-coding-agent-history-replay-stable-viewport t)
+              (setq initial-text (buffer-string)
+                    initial-state (pi-coding-agent-viewport-state window))
+              (let ((pi-coding-agent-history-replay-slice-size 1)
+                    (pi-coding-agent-history-replay-slice-seconds 10))
+                (cl-letf (((symbol-function 'run-at-time)
+                           (lambda (_delay _repeat function &rest args)
+                             (let ((scheduled (cons function args)))
+                               (setq queue (append queue (list scheduled)))
+                               scheduled)))
+                          ((symbol-function 'timerp) (lambda (_timer) nil))
+                          ((symbol-function
+                            'pi-coding-agent--display-history-message)
+                           (lambda (&rest _)
+                             (error "expected staging failure"))))
+                  (pi-coding-agent--display-session-history-async
+                   messages chat
+                   (lambda (success) (push success completions)))
+                  (let ((scheduled (pop queue)))
+                    (apply (car scheduled) (cdr scheduled)))))
+              (should (equal completions '(nil)))
+              (should (equal (buffer-string) initial-text))
+              (should (equal (pi-coding-agent-viewport-state window)
+                             initial-state))
+              (should-not pi-coding-agent--history-replay-job)))
+        (when (buffer-live-p chat)
+          (kill-buffer chat))))))
+
 (ert-deftest pi-coding-agent-test-stable-history-transfers-render-state ()
   "Stable replay transfers overlays and marker-backed state to the live chat."
   (let ((chat (generate-new-buffer " *pi-stable-history-target*"))
@@ -1736,6 +1803,57 @@ agent_end + next section's leading newline must not create triple newlines."
       (when (buffer-live-p staging)
         (kill-buffer staging))
       (kill-buffer chat))))
+
+(ert-deftest pi-coding-agent-test-stable-history-restores-reading-window ()
+  "A stable text swap restores a reading window through unified anchors."
+  (save-window-excursion
+    (let ((chat (generate-new-buffer " *pi-stable-reading-target*"))
+          (staging (generate-new-buffer " *pi-stable-reading-staging*"))
+          (window (selected-window))
+          saved-start saved-point completion)
+      (unwind-protect
+          (progn
+            (set-window-buffer window chat)
+            (with-current-buffer chat
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (dotimes (index 120)
+                  (insert (format "old line %03d\n" index))))
+              (save-excursion
+                (goto-char (point-min))
+                (forward-line 45)
+                (setq saved-start (point))
+                (forward-line 5)
+                (setq saved-point (point)))
+              (set-window-start window saved-start)
+              (set-window-point window saved-point)
+              (pi-coding-agent--viewport-reconcile-window window))
+            (with-current-buffer staging
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (dotimes (index 120)
+                  (insert (format "new line %03d\n" index)))))
+            (let ((job
+                   (pi-coding-agent--make-history-replay-job
+                    :buffer staging
+                    :target-buffer chat
+                    :stable-viewport t
+                    :completion
+                    (lambda (success) (setq completion success)))))
+              (with-current-buffer chat
+                (setq pi-coding-agent--history-replay-job job))
+              (pi-coding-agent--finish-history-replay-job job t))
+            (should completion)
+            (should (= (window-start window) saved-start))
+            (should (= (window-point window) saved-point))
+            (with-current-buffer chat
+              (should
+               (eq (plist-get (pi-coding-agent-viewport-state window) :mode)
+                   'reading))))
+        (when (buffer-live-p staging)
+          (kill-buffer staging))
+        (when (buffer-live-p chat)
+          (kill-buffer chat))))))
 
 (ert-deftest pi-coding-agent-test-async-history-replay-cancels-stale-slices ()
   "Cancelling asynchronous history replay prevents later slices from writing."
@@ -2044,6 +2162,65 @@ and DISPLAY controls how completed thinking is rendered."
                    "Need to double-check.\n\nSecond paragraph."))
                  text))
         (should-not (string-match-p "^> Need to double-check\\.$" text))))))
+
+(ert-deftest pi-coding-agent-test-canonical-rerender-restores-two-reading-windows ()
+  "A whole-chat rebuild restores two independent reading viewports."
+  (save-window-excursion
+    (delete-other-windows)
+    (let* ((chat (generate-new-buffer " *pi-two-reading-rerender*"))
+           (messages
+            (vector
+             (list :role "user"
+                   :content
+                   (mapconcat
+                    (lambda (index) (format "history line %03d" index))
+                    (number-sequence 0 99)
+                    "\n"))
+             '(:role "assistant" :content "final answer")))
+           (first (selected-window))
+           second first-start first-point second-start second-point
+           first-state second-state)
+      (unwind-protect
+          (progn
+            (set-window-buffer first chat)
+            (with-current-buffer chat
+              (pi-coding-agent-chat-mode)
+              (pi-coding-agent--display-session-history messages chat))
+            (setq second (split-window-below))
+            (set-window-buffer second chat)
+            (with-current-buffer chat
+              (save-excursion
+                (goto-char (point-min))
+                (forward-line 8)
+                (setq first-start (point))
+                (forward-line 3)
+                (setq first-point (point))
+                (forward-line 28)
+                (setq second-start (point))
+                (forward-line 3)
+                (setq second-point (point)))
+              (set-window-start first first-start)
+              (set-window-point first first-point)
+              (set-window-start second second-start)
+              (set-window-point second second-point)
+              (pi-coding-agent--viewport-reconcile-window first)
+              (pi-coding-agent--viewport-reconcile-window second)
+              (setq first-state
+                    (pi-coding-agent--viewport-window-state first)
+                    second-state
+                    (pi-coding-agent--viewport-window-state second))
+              (pi-coding-agent--rerender-canonical-history)
+              (should (eq first-state
+                          (pi-coding-agent--viewport-window-state first)))
+              (should (eq second-state
+                          (pi-coding-agent--viewport-window-state second)))
+              (should-not (eq first-state second-state))
+              (should (= (window-start first) first-start))
+              (should (= (window-point first) first-point))
+              (should (= (window-start second) second-start))
+              (should (= (window-point second) second-point))))
+        (when (buffer-live-p chat)
+          (kill-buffer chat))))))
 
 (ert-deftest pi-coding-agent-test-thinking-toggle-preserves-window-start-before-block ()
   "Thinking toggles keep a window anchored when it was scrolled before the block."
@@ -2539,25 +2716,56 @@ and DISPLAY controls how completed thinking is rendered."
 
 (ert-deftest pi-coding-agent-test-streaming-scroll-settles-following-window ()
   "A following window uses the shared tail-settle path after insertion."
-  (with-temp-buffer
-    (insert "context\n")
-    (let (settled)
-      (cl-letf (((symbol-function 'get-buffer-window-list)
-                 (lambda (&rest _) '(window)))
-                ((symbol-function 'window-point)
-                 (lambda (_window) (point-max)))
-                ((symbol-function 'window-live-p)
-                 (lambda (_window) t))
-                ((symbol-function 'set-window-point)
-                 (lambda (&rest _)
-                   (ert-fail "Following windows must use tail settle")))
-                ((symbol-function 'pi-coding-agent--settle-following-window)
-                 (lambda (window)
-                   (setq settled window))))
-        (pi-coding-agent--with-scroll-preservation
-          (goto-char (point-max))
-          (insert "reply\n"))
-        (should (eq settled 'window))))))
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *pi-following-transaction*"))
+          (window (selected-window))
+          settled)
+      (unwind-protect
+          (progn
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (let ((inhibit-read-only t))
+                (insert "context\n"))
+              (set-window-point window (point-max))
+              (cl-letf (((symbol-function
+                          'pi-coding-agent--settle-following-window)
+                         (lambda (target)
+                           (setq settled target))))
+                (let ((inhibit-read-only t))
+                  (pi-coding-agent--with-scroll-preservation
+                    (goto-char (point-max))
+                    (insert "reply\n")))))
+            (should (eq settled window)))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest pi-coding-agent-test-event-dispatch-captures-and-settles-once ()
+  "One visible event is one transaction despite nested render preservation."
+  (save-window-excursion
+    (let ((buffer (generate-new-buffer " *pi-dispatch-transaction*"))
+          (process (start-process "pi-dispatch-transaction" nil "cat"))
+          (window (selected-window)))
+      (unwind-protect
+          (progn
+            (set-process-query-on-exit-flag process nil)
+            (set-window-buffer window buffer)
+            (with-current-buffer buffer
+              (pi-coding-agent-chat-mode)
+              (setq-local pi-coding-agent--viewport-transaction-capture-count 0
+                          pi-coding-agent--viewport-transaction-settle-count 0))
+            (process-put process 'pi-coding-agent-chat-buffer buffer)
+            (pi-coding-agent--register-display-handler process)
+            (pi-coding-agent--dispatch-process-json
+             process '(:type "agent_start"))
+            (with-current-buffer buffer
+              (should (= pi-coding-agent--viewport-transaction-capture-count 1))
+              (should (= pi-coding-agent--viewport-transaction-settle-count 1))
+              (should (= pi-coding-agent--viewport-transaction-depth 0))))
+        (when (process-live-p process)
+          (delete-process process))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
 
 (ert-deftest pi-coding-agent-test-tail-padding-default-keeps-natural-following ()
   "Tail padding defaults to nil for standalone chats."
@@ -2578,15 +2786,18 @@ and DISPLAY controls how completed thinking is rendered."
             (pi-coding-agent-chat-mode)
             (let ((inhibit-read-only t))
               (insert "rewritten tail"))
+            (set-window-point window (point-max))
             (cl-letf (((symbol-function
                         'pi-coding-agent--settle-following-window)
                        (lambda (target) (setq settled target))))
-              (pi-coding-agent--restore-window-rewrite-state
-               (list :window window
-                     :point (point-max)
-                     :start (point-min)
-                     :row 0
-                     :tail-p t))))
+              (let ((inhibit-read-only t)
+                    (old-end (point-max)))
+                (pi-coding-agent--with-viewport-transaction
+                  (goto-char (point-min))
+                  (delete-region (point-min) old-end)
+                  (insert "new tail")
+                  (pi-coding-agent--viewport-register-replacement
+                   (point-min) old-end (- (point-max) old-end))))))
           (should (eq settled window)))
       (when (window-live-p window)
         (set-window-buffer window original-buffer))
@@ -2609,27 +2820,13 @@ and DISPLAY controls how completed thinking is rendered."
     (cl-letf (((symbol-function 'window-point) (lambda (_w) 1)))
       (should-not (pi-coding-agent--window-following-p 'mock-window)))))
 
-(ert-deftest pi-coding-agent-test-rewrite-tail-window-p-keeps-lower-tail-view-following ()
-  "A lower-window tail view should stay in tail-following mode after a rewrite."
-  (should (pi-coding-agent--rewrite-tail-window-p 10 99 100 18 30))
-  (should (pi-coding-agent--rewrite-tail-window-p 99 50 100 5 30))
-  (should-not (pi-coding-agent--rewrite-tail-window-p 10 50 100 18 30)))
-
-(ert-deftest pi-coding-agent-test-rewrite-tail-window-p-keeps-mid-buffer-context-when-tall-window-shows-tail ()
-  "A tall window showing the tail should not outrank an in-view mid-buffer point."
-  (should-not (pi-coding-agent--rewrite-tail-window-p 60 199 200 10 36)))
-
-(ert-deftest pi-coding-agent-test-rewrite-tail-window-p-ignores-offscreen-point ()
-  "A stale tail-reaching window end should not make an offscreen point follow."
-  (should-not (pi-coding-agent--rewrite-tail-window-p 60 199 200 14 11)))
-
 (ert-deftest pi-coding-agent-test-clamp-rewrite-point-row-pushes-point-lower-when-tail-shrinks ()
   "Shrinking the tail should move point lower so the rewritten window stays filled."
-  (should (= 12 (pi-coding-agent--clamp-rewrite-point-row 3 40 8 20))))
+  (should (= 12 (pi-coding-agent--viewport-clamp-reading-row 3 40 8 20))))
 
 (ert-deftest pi-coding-agent-test-clamp-rewrite-point-row-falls-back-when-buffer-too-short ()
   "When the whole buffer is shorter than the window, preserve the highest visible row."
-  (should (= 5 (pi-coding-agent--clamp-rewrite-point-row 10 5 8 20))))
+  (should (= 5 (pi-coding-agent--viewport-clamp-reading-row 10 5 8 20))))
 
 ;;; Pandoc Conversion
 

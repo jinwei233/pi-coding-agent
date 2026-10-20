@@ -2934,6 +2934,49 @@ Binds `chat-win' and `input-win' for use in BODY."
     (should
      (pi-coding-agent--following-window-settle-stale-p chat-win))))
 
+(ert-deftest pi-coding-agent-test-tail-signature-lives-in-unified-state ()
+  "Tail settlement does not create a second viewport window parameter."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "tail"))
+    (pi-coding-agent--settle-following-window chat-win)
+    (should
+     (pi-coding-agent--viewport-state-p
+      (window-parameter
+       chat-win pi-coding-agent--viewport-state-parameter)))
+    (should-not
+     (window-parameter chat-win 'pi-coding-agent-tail-settle-signature))
+    (should-not
+     (window-parameter
+      chat-win 'pi-coding-agent-streaming-scroll-generation))))
+
+(ert-deftest pi-coding-agent-test-hidden-reading-transaction-skips-line-measurement ()
+  "A hidden reading window is marked dirty without visual-line work."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (set-window-point chat-win (point-min))
+    (pi-coding-agent--viewport-reconcile-window chat-win)
+    (cl-letf (((symbol-function 'frame-visible-p) (lambda (_frame) nil))
+              ((symbol-function 'count-screen-lines)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden transactions must not measure visual lines")))
+              ((symbol-function 'vertical-motion)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden transactions must not measure visual lines")))
+              ((symbol-function 'recenter)
+               (lambda (&rest _args)
+                 (ert-fail "Hidden transactions must not recenter"))))
+      (let ((inhibit-read-only t))
+        (pi-coding-agent--with-scroll-preservation
+          (goto-char (point-max))
+          (insert "new output\n"))))
+    (should
+     (eq (pi-coding-agent--viewport-state-dirty-reason
+          (pi-coding-agent--viewport-window-state chat-win))
+         'hidden))))
+
 (ert-deftest pi-coding-agent-test-tail-settle-signature-ignores-manual-scroll ()
   "Content and manual scroll changes do not request resize settlement."
   (pi-coding-agent-test-with-split-layout
@@ -2956,6 +2999,241 @@ Binds `chat-win' and `input-win' for use in BODY."
           (pi-coding-agent--settling-following-window t))
       (pi-coding-agent--settle-following-window chat-win)
       (should (= pi-coding-agent--tail-settle-count before)))))
+
+(ert-deftest pi-coding-agent-test-viewport-transaction-nests-once ()
+  "Nested viewport transactions capture and settle only at depth zero."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "context\n"))
+    (set-window-point chat-win (point-max))
+    (setq-local pi-coding-agent--viewport-transaction-capture-count 0
+                pi-coding-agent--viewport-transaction-settle-count 0)
+    (let ((inhibit-read-only t))
+      (pi-coding-agent--with-viewport-transaction
+        (pi-coding-agent--viewport-note-mutation 'outer)
+        (pi-coding-agent--with-viewport-transaction
+          (pi-coding-agent--viewport-note-mutation 'inner)
+          (goto-char (point-max))
+          (insert "reply\n"))))
+    (should (= pi-coding-agent--viewport-transaction-capture-count 1))
+    (should (= pi-coding-agent--viewport-transaction-settle-count 1))
+    (should (= pi-coding-agent--viewport-transaction-depth 0))
+    (should-not pi-coding-agent--viewport-transaction-captures)
+    (should-not pi-coding-agent--viewport-transaction-dirty-windows)
+    (should-not pi-coding-agent--viewport-transaction-replacements)))
+
+(ert-deftest pi-coding-agent-test-viewport-replacement-restores-deleted-anchors ()
+  "Deleted reading point and start use the registered replacement fallback."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 80)
+        (insert (format "line %02d\n" index))))
+    (let (start end)
+      (save-excursion
+        (goto-char (point-min))
+        (forward-line 10)
+        (setq start (point))
+        (forward-line 10)
+        (setq end (point)))
+      (set-window-start chat-win start)
+      (set-window-point chat-win (+ start 10))
+      (pi-coding-agent--viewport-reconcile-window chat-win)
+      (let ((old-size (- end start))
+            (inhibit-read-only t))
+        (pi-coding-agent--with-viewport-transaction
+          (delete-region start end)
+          (goto-char start)
+          (insert "replacement\n")
+          (pi-coding-agent--viewport-register-replacement
+           start end (- (length "replacement\n") old-size) start)))
+      (should (= (window-point chat-win) start))
+      (should (= (window-start chat-win) start))
+      (let ((state (pi-coding-agent--viewport-window-state chat-win)))
+        (should (= (marker-position
+                    (pi-coding-agent--viewport-state-point-marker state))
+                   start))
+        (should (= (marker-position
+                    (pi-coding-agent--viewport-state-start-marker state))
+                   start))))))
+
+(ert-deftest pi-coding-agent-test-viewport-maps-later-replacement-fallback ()
+  "A later replacement fallback includes deltas from earlier regions."
+  (with-temp-buffer
+    (insert (make-string 100 ?x))
+    (let ((pi-coding-agent--viewport-transaction-replacements
+           '((30 40 -5 30)
+             (10 20 5 10))))
+      (should (= (pi-coding-agent--viewport-map-replaced-position 35) 35))
+      (should (= (pi-coding-agent--viewport-map-replaced-position 50) 50)))))
+
+(ert-deftest pi-coding-agent-test-hidden-reading-anchors-advance-per-transaction ()
+  "Hidden anchors are advanced per text version, not by deferred raw mappings."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 80)
+        (insert (format "line %02d\n" index))))
+    (let ((chat-buffer (current-buffer))
+          visible reading-start reading-point
+          first-start first-end second-start second-end)
+      (save-excursion
+        (goto-char (point-min))
+        (forward-line 25)
+        (setq reading-start (point))
+        (forward-line 5)
+        (setq reading-point (point))
+        (goto-char (point-min))
+        (forward-line 5)
+        (setq first-start (point))
+        (forward-line 5)
+        (setq first-end (point)))
+      (set-window-start chat-win reading-start)
+      (set-window-point chat-win reading-point)
+      (pi-coding-agent--viewport-reconcile-window chat-win)
+      (select-window input-win)
+      (with-current-buffer chat-buffer
+        (cl-letf (((symbol-function 'frame-visible-p)
+                   (lambda (_frame) (and visible t))))
+          (let ((inhibit-read-only t)
+                (old-size (- first-end first-start)))
+            (pi-coding-agent--with-viewport-transaction
+              (delete-region first-start first-end)
+              (goto-char first-start)
+              (insert (make-string 80 ?a))
+              (pi-coding-agent--viewport-register-replacement
+               first-start first-end (- 80 old-size) first-start)))
+          (let* ((state (pi-coding-agent--viewport-window-state chat-win))
+                 (point (pi-coding-agent--viewport-state-saved-point state)))
+            (setq second-start (- point 2)
+                  second-end (+ point 2)))
+          (let ((inhibit-read-only t))
+            (pi-coding-agent--with-viewport-transaction
+              (delete-region second-start second-end)
+              (goto-char second-start)
+              (insert "x")
+              (pi-coding-agent--viewport-register-replacement
+               second-start second-end -3 second-start)))
+          (let ((state (pi-coding-agent--viewport-window-state chat-win)))
+            (should (= (pi-coding-agent--viewport-state-saved-point state)
+                       second-start))
+            (should (= (marker-position
+                        (pi-coding-agent--viewport-state-point-marker state))
+                       second-start)))
+          (setq visible t)
+          (pi-coding-agent--viewport-settle-stale-window chat-win)))
+      (should (= (window-point chat-win) second-start)))))
+
+(ert-deftest pi-coding-agent-test-viewport-transaction-cleans-nonlocal-exits ()
+  "Errors, quits, and throws cannot leak viewport transaction state."
+  (pi-coding-agent-test-with-split-layout
+    (dolist (kind '(error quit throw))
+      (pcase kind
+        ('error
+         (should-error
+          (pi-coding-agent--with-viewport-transaction
+            (pi-coding-agent--viewport-note-mutation kind)
+            (error "expected"))))
+        ('quit
+         (should
+          (condition-case nil
+              (progn
+                (pi-coding-agent--with-viewport-transaction
+                  (pi-coding-agent--viewport-note-mutation kind)
+                  (signal 'quit nil))
+                nil)
+            (quit t))))
+        ('throw
+         (should
+          (eq 'escaped
+              (catch 'viewport-test
+                (pi-coding-agent--with-viewport-transaction
+                  (pi-coding-agent--viewport-note-mutation kind)
+                  (throw 'viewport-test 'escaped)))))))
+      (should (= pi-coding-agent--viewport-transaction-depth 0))
+      (should-not pi-coding-agent--viewport-transaction-captures)
+      (should-not pi-coding-agent--viewport-transaction-dirty-windows)
+      (should-not pi-coding-agent--viewport-transaction-replacements)
+      (should-not inhibit-redisplay))))
+
+(ert-deftest pi-coding-agent-test-viewport-state-self-heals-at-tail ()
+  "Command and scroll hooks synchronize reading/following without mode-line writes."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (set-window-point chat-win (point-min))
+    (pi-coding-agent--viewport-window-scrolled
+     chat-win (window-start chat-win))
+    (should
+     (eq (plist-get (pi-coding-agent-viewport-state chat-win) :mode)
+         'reading))
+    (set-window-point chat-win (point-max))
+    (pi-coding-agent--viewport-post-command)
+    (should
+     (plist-get (pi-coding-agent-viewport-state chat-win) :following))))
+
+(ert-deftest pi-coding-agent-test-viewport-internal-settle-does-not-change-mode ()
+  "Internal settlement geometry is not interpreted as user navigation."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (insert "history\n"))
+    (set-window-point chat-win (point-min))
+    (let ((state (pi-coding-agent--viewport-window-state chat-win)))
+      (pi-coding-agent--viewport-enter-reading state t)
+      (set-window-point chat-win (point-max))
+      (setf (pi-coding-agent--viewport-state-settling state) t)
+      (pi-coding-agent--viewport-reconcile-window chat-win)
+      (should (eq (pi-coding-agent--viewport-state-mode state) 'reading))
+      (setf (pi-coding-agent--viewport-state-settling state) nil)
+      (pi-coding-agent--viewport-reconcile-window chat-win)
+      (should (eq (pi-coding-agent--viewport-state-mode state) 'following)))))
+
+(ert-deftest pi-coding-agent-test-viewport-prunes-deleted-window-markers ()
+  "Deleting a window releases its registered reading anchors."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (let* ((original-state
+            (pi-coding-agent--viewport-window-state chat-win))
+           (extra-window (split-window chat-win nil 'right))
+           state point-marker)
+      (set-window-buffer extra-window (current-buffer))
+      (set-window-point extra-window (point-min))
+      (pi-coding-agent--viewport-reconcile-window extra-window)
+      (setq state (pi-coding-agent--viewport-window-state extra-window)
+            point-marker
+            (pi-coding-agent--viewport-state-point-marker state))
+      (should-not (eq state original-state))
+      (should
+       (eq original-state
+           (window-parameter
+            chat-win pi-coding-agent--viewport-state-parameter)))
+      (should (marker-position point-marker))
+      (delete-window extra-window)
+      (pi-coding-agent--viewport-prune-dead-windows)
+      (should-not (marker-position point-marker))
+      (should-not (memq state pi-coding-agent--viewport-state-registry)))))
+
+(ert-deftest pi-coding-agent-test-viewport-window-notifications-settle-once ()
+  "Visibility and selection notifications converge after one effective settle."
+  (pi-coding-agent-test-with-split-layout
+    (let ((inhibit-read-only t))
+      (dotimes (index 40)
+        (insert (format "line %d\n" index))))
+    (set-window-point chat-win (point-max))
+    (pi-coding-agent--settle-following-window chat-win)
+    (let* ((state (pi-coding-agent--viewport-window-state chat-win))
+           (before pi-coding-agent--tail-settle-count))
+      (setf (pi-coding-agent--viewport-state-dirty-reason state) 'content)
+      (pi-coding-agent--viewport-window-state-changed)
+      (should (= pi-coding-agent--tail-settle-count (1+ before)))
+      (save-selected-window
+        (select-window input-win)
+        (pi-coding-agent--viewport-window-state-changed)
+        (select-window chat-win)
+        (pi-coding-agent--viewport-window-state-changed))
+      (should (= pi-coding-agent--tail-settle-count (1+ before)))
+      (should-not (pi-coding-agent--viewport-state-dirty-reason state)))))
 
 (provide 'pi-coding-agent-ui-test)
 ;;; pi-coding-agent-ui-test.el ends here
