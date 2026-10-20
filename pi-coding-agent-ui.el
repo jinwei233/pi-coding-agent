@@ -3262,10 +3262,14 @@ measurement until their next visible window notification."
   "Remove pre-unification viewport parameters from live windows."
   (dolist (frame (frame-list))
     (dolist (window (window-list frame 'no-mini))
-      (set-window-parameter
-       window 'pi-coding-agent-streaming-scroll-generation nil)
-      (set-window-parameter
-       window 'pi-coding-agent-tail-settle-signature nil))))
+      (dolist (parameter
+               '(pi-coding-agent-streaming-scroll-generation
+                 pi-coding-agent-tail-settle-signature
+                 pi-reading-chat
+                 pi-reading-follow
+                 pi-reading-new
+                 pi-reading-seen))
+        (set-window-parameter window parameter nil)))))
 
 (pi-coding-agent--clear-obsolete-scroll-window-parameters)
 

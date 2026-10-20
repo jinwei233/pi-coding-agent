@@ -2950,6 +2950,27 @@ Binds `chat-win' and `input-win' for use in BODY."
      (window-parameter
       chat-win 'pi-coding-agent-streaming-scroll-generation))))
 
+(ert-deftest pi-coding-agent-test-obsolete-viewport-parameters-cleared-on-load ()
+  "Pre-unification parameters are cleared without removing unified state."
+  (pi-coding-agent-test-with-split-layout
+    (let ((state (pi-coding-agent--viewport-window-state chat-win))
+          (parameters
+           '(pi-coding-agent-streaming-scroll-generation
+             pi-coding-agent-tail-settle-signature
+             pi-reading-chat
+             pi-reading-follow
+             pi-reading-new
+             pi-reading-seen)))
+      (dolist (parameter parameters)
+        (set-window-parameter chat-win parameter t))
+      (pi-coding-agent--clear-obsolete-scroll-window-parameters)
+      (dolist (parameter parameters)
+        (should-not (window-parameter chat-win parameter)))
+      (should
+       (eq state
+           (window-parameter
+            chat-win pi-coding-agent--viewport-state-parameter))))))
+
 (ert-deftest pi-coding-agent-test-hidden-reading-transaction-skips-line-measurement ()
   "A hidden reading window is marked dirty without visual-line work."
   (pi-coding-agent-test-with-split-layout
