@@ -679,11 +679,13 @@ Return nil when CONTENT-WIDTH cannot hold all atomic minima and grid borders."
 (defun pi-coding-agent--stacked-table-groups
     (headers rows width num-cols _minima)
   "Return narrow responsive display groups, or nil when unsafe.
-This layout is limited to two through four columns.  Each raw data row becomes
-a framed row title plus labeled field lines, preserving the raw-line mapping."
+This layout needs at least two columns.  Each raw data row becomes a framed
+row title plus labeled field lines, preserving the raw-line mapping.  The body
+is column-agnostic, so wide comparison tables that cannot fit a grid still
+stack instead of falling through to raw pipes."
   (let ((inner-width (- width 4)))
     (when (and pi-coding-agent-prettify-tables
-               (<= 2 num-cols 4)
+               (>= num-cols 2)
                (>= inner-width 16))
       (let* ((padded-headers
               (append headers

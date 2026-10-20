@@ -1413,6 +1413,20 @@ When fringes like `display-line-numbers-mode' consume columns,
    "| TCE_PSM | fe.vconsole.universal_server_i18n | 同左 |\n")
   "A narrow environment table containing an overlong URL token.")
 
+(defconst pi-coding-agent-test--wide-five-column-table
+  (concat
+   "| # | 机制 | 位置 | follow 谓词 | 设计里提到? |\n"
+   "|---|------|------|-------------|-------------|\n"
+   "| 1 | window-point-insertion-type + "
+   "--with-scroll-preservation | ui.el:2590 | "
+   "--window-following-p = point ≥ point-max-1 | ✅ |\n"
+   "| 2 | 块级 reanchor + streaming-scroll-generation window param "
+   "| ui.el:2025-2044, 2568 | 同上 | ✅ |\n"
+   "| 3 | --with-window-rewrite-preservation + "
+   "capture/restore-window-rewrite-states | render.el:1131, 8070-8260 | "
+   "--rewrite-tail-window-p | ❌ |\n")
+  "A five-column comparison table too wide for a grid at narrow widths.")
+
 (ert-deftest pi-coding-agent-test-table-normalizes-only-verified-bare-emoji ()
   "Only the explicit same-base allowlist receives one VS16."
   (dolist (base '(#x1f6e0 #x2699 #x26a0))
@@ -1600,21 +1614,66 @@ When fringes like `display-line-numbers-mode' consume columns,
         (= (markdown-table-wrap-visible-width line) 55))
       display-lines))))
 
+(ert-deftest pi-coding-agent-test-table-stacks-wide-five-column-table ()
+  "A five-column table too wide for a grid stacks instead of staying raw."
+  (let* ((raw-lines
+          (split-string
+           (string-trim-right
+            pi-coding-agent-test--wide-five-column-table)
+           "\n"))
+         (projection
+          (pi-coding-agent--table-display-projection raw-lines 62))
+         (display-lines
+          (and projection
+               (apply #'append (plist-get projection :groups))))
+         (text (and display-lines
+                    (mapconcat #'identity display-lines "\n"))))
+    (should projection)
+    (should (eq (plist-get projection :layout) 'stacked))
+    (should (= (length (plist-get projection :groups))
+               (length raw-lines)))
+    (dolist (token '("follow 谓词:" "设计里提到?:" "window-point-insertion-type"))
+      (should (string-search token text)))
+    (should
+     (cl-every
+      (lambda (line)
+        (= (markdown-table-wrap-visible-width line) 62))
+      display-lines))))
+
 (ert-deftest pi-coding-agent-test-table-min-content-falls-back-when-too-narrow ()
-  "Dense tables stay raw instead of force-breaking atomic tokens."
+  "Dense tables stack without force-breaking tokens, or stay raw when too narrow."
   (let ((raw-lines
          (split-string
           (string-trim-right pi-coding-agent-test--dense-technical-table)
           "\n")))
+    ;; Below the stacked inner-width floor there is no safe layout: the
+    ;; table must stay raw rather than force-break an atomic token.
     (should-not
-     (pi-coding-agent--table-display-projection raw-lines 48)))
+     (pi-coding-agent--table-display-projection raw-lines 18))
+    ;; Given room to stack, a dense many-column table renders as a stacked
+    ;; layout with every atomic technical token preserved whole.
+    (let* ((projection
+            (pi-coding-agent--table-display-projection raw-lines 48))
+           (display-lines
+            (and projection
+                 (apply #'append (plist-get projection :groups))))
+           (text (and display-lines
+                      (mapconcat #'identity display-lines "\n"))))
+      (should (eq (plist-get projection :layout) 'stacked))
+      (should (string-search "ArialUnicodeMS.ttf" text))
+      (should (string-search "U+270F+FE0F" text))
+      (should
+       (cl-every
+        (lambda (line)
+          (<= (markdown-table-wrap-visible-width line) 48))
+        display-lines))))
   (with-temp-buffer
     (pi-coding-agent-chat-mode)
     (let ((inhibit-read-only t))
       (insert pi-coding-agent-test--dense-technical-table))
     (font-lock-ensure)
     (pi-coding-agent--decorate-tables-in-region
-     (point-min) (point-max) 48)
+     (point-min) (point-max) 18)
     (should-not (pi-coding-agent-test--display-overlays))
     (should (string-search "char-width" (buffer-string)))
     (should-not (string-search "char-w\n" (buffer-string)))))
