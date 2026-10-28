@@ -873,11 +873,19 @@ COMMAND is passed as `$0' and `$@' to preserve the original argv exactly."
                          pi-coding-agent--remote-ready-marker)))
           command))
 
+(defun pi-coding-agent--local-settings-file ()
+  "Return the local Pi settings file resolved from the launch environment."
+  (expand-file-name
+   "settings.json"
+   (expand-file-name (or (getenv "PI_CODING_AGENT_DIR") "~/.pi/agent"))))
+
 (defun pi-coding-agent--start-process (directory)
   "Start pi RPC process in DIRECTORY.
 Returns the process object."
   (let* ((default-directory directory)
          (remote-start-p (pi-coding-agent--remote-prefix directory))
+         (settings-file (unless remote-start-p
+                          (pi-coding-agent--local-settings-file)))
          (command (pi-coding-agent--pi-command))
          (process-command (if remote-start-p
                               (pi-coding-agent--remote-start-command command)
@@ -896,6 +904,8 @@ Returns the process object."
           (when (and remote-start-p
                      (not (process-get proc 'pi-coding-agent-ready)))
             (process-put proc 'pi-coding-agent-awaiting-ready-marker t))
+          (process-put proc 'pi-coding-agent-settings-persistence
+                       (or settings-file 'unsupported))
           (process-put proc 'pi-coding-agent-stderr-buf stderr-buf)
           (when-let* ((stderr-proc (get-buffer-process stderr-buf)))
             (set-process-query-on-exit-flag stderr-proc nil))

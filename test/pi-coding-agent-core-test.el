@@ -1161,12 +1161,85 @@ and starting in DIRECTORY or `/tmp/'."
                                            default-directory)))
                        dummy-proc)))
             (ignore-errors (pi-coding-agent--start-process (or directory "/tmp/"))))
+          (setq captured
+                (plist-put captured :captured-settings-persistence
+                           (process-get dummy-proc
+                                        'pi-coding-agent-settings-persistence)))
           captured)
       (when-let* ((stderr-buf (plist-get captured :stderr)))
         (when (buffer-live-p stderr-buf)
           (kill-buffer stderr-buf)))
       (when (process-live-p dummy-proc)
         (delete-process dummy-proc)))))
+
+(ert-deftest pi-coding-agent-test-start-process-captures-agent-directory-override ()
+  "Local start snapshots PI_CODING_AGENT_DIR as its settings target."
+  (let* ((agent-dir (make-temp-file "pi-agent-dir-" t))
+         (process-environment (copy-sequence process-environment))
+         (pi-coding-agent-executable '("sh" "-c" "sleep 5"))
+         (pi-coding-agent-extra-args nil)
+         (proc nil))
+    (setenv "PI_CODING_AGENT_DIR" agent-dir)
+    (unwind-protect
+        (progn
+          (setq proc (pi-coding-agent--start-process "/tmp/"))
+          (should (equal (process-get proc 'pi-coding-agent-settings-persistence)
+                         (expand-file-name "settings.json" agent-dir)))
+          (setenv "PI_CODING_AGENT_DIR" "/tmp/changed-after-launch")
+          (should (equal (process-get proc 'pi-coding-agent-settings-persistence)
+                         (expand-file-name "settings.json" agent-dir))))
+      (when (processp proc)
+        (pi-coding-agent--cleanup-process-stderr-buffer proc)
+        (when (process-live-p proc) (delete-process proc)))
+      (delete-directory agent-dir t))))
+
+(ert-deftest pi-coding-agent-test-start-process-captures-default-agent-directory ()
+  "Local start snapshots ~/.pi/agent when the override is unset."
+  (let ((process-environment (copy-sequence process-environment))
+        (pi-coding-agent-executable '("sh" "-c" "sleep 5"))
+        (pi-coding-agent-extra-args nil)
+        (proc nil))
+    (setenv "PI_CODING_AGENT_DIR" nil)
+    (unwind-protect
+        (progn
+          (setq proc (pi-coding-agent--start-process "/tmp/"))
+          (should (equal (process-get proc 'pi-coding-agent-settings-persistence)
+                         (expand-file-name "~/.pi/agent/settings.json"))))
+      (when (processp proc)
+        (pi-coding-agent--cleanup-process-stderr-buffer proc)
+        (when (process-live-p proc) (delete-process proc))))))
+
+(ert-deftest pi-coding-agent-test-start-process-recomputes-settings-snapshot ()
+  "Each new process, including reload replacements, gets a fresh snapshot."
+  (let* ((first-dir (make-temp-file "pi-first-agent-dir-" t))
+         (second-dir (make-temp-file "pi-second-agent-dir-" t))
+         (process-environment (copy-sequence process-environment))
+         (pi-coding-agent-executable '("sh" "-c" "sleep 5"))
+         (pi-coding-agent-extra-args nil)
+         first second)
+    (unwind-protect
+        (progn
+          (setenv "PI_CODING_AGENT_DIR" first-dir)
+          (setq first (pi-coding-agent--start-process "/tmp/"))
+          (setenv "PI_CODING_AGENT_DIR" second-dir)
+          (setq second (pi-coding-agent--start-process "/tmp/"))
+          (should (equal (process-get first 'pi-coding-agent-settings-persistence)
+                         (expand-file-name "settings.json" first-dir)))
+          (should (equal (process-get second 'pi-coding-agent-settings-persistence)
+                         (expand-file-name "settings.json" second-dir))))
+      (dolist (proc (list first second))
+        (when (processp proc)
+          (pi-coding-agent--cleanup-process-stderr-buffer proc)
+          (when (process-live-p proc) (delete-process proc))))
+      (delete-directory first-dir t)
+      (delete-directory second-dir t))))
+
+(ert-deftest pi-coding-agent-test-start-process-remote-disables-settings-persistence ()
+  "Remote starts never fall back to a local settings target."
+  (let ((launch (pi-coding-agent-test--capture-process-launch
+                 '("pi") nil 'approve "/ssh:test:/home/me/proj/")))
+    (should (eq (plist-get launch :captured-settings-persistence)
+                'unsupported))))
 
 (ert-deftest pi-coding-agent-test-start-process-uses-custom-executable ()
   "start-process builds command from `pi-coding-agent-executable'."

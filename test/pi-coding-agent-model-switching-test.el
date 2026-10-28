@@ -25,10 +25,195 @@
         '(("deepseek" . "deepseek-v4-flash")
           ("deepseek" . "deepseek-v4-pro")))))))
 
-(ert-deftest pi-coding-agent-test-model-switching-sends-explicit-scope ()
-  "Model switching sends explicit current-only and sticky scope values."
+(defun pi-coding-agent-test--parse-settings (path)
+  "Parse settings PATH with stable JSON sentinels and string top-level keys."
+  (mapcar
+   (lambda (entry)
+     (cons (if (symbolp (car entry))
+               (symbol-name (car entry))
+             (car entry))
+           (cdr entry)))
+   (json-parse-string
+    (with-temp-buffer
+      (insert-file-contents path)
+      (buffer-string))
+    :object-type 'alist :array-type 'array
+    :null-object :null :false-object :false)))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-creates-missing-directory ()
+  "Persistence creates a missing agent directory and settings file."
+  (let* ((root (make-temp-file "pi-settings-create-" t))
+         (path (expand-file-name "missing/agent/settings.json" root)))
+    (unwind-protect
+        (progn
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "deepseek" "pro")
+                       :status)
+                      'written))
+          (should
+           (equal (pi-coding-agent-test--parse-settings path)
+                  '(("defaultProvider" . "deepseek")
+                    ("defaultModel" . "pro")))))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-preserves-unrelated-values ()
+  "Persistence keeps unrelated keys and JSON value types intact."
+  (let* ((root (make-temp-file "pi-settings-values-" t))
+         (path (expand-file-name "settings.json" root))
+         (original
+          '(("packages" . ["one"])
+            ("nothing" . :null)
+            ("disabled" . :false)
+            ("count" . 42)
+            ("label" . "中文"))))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert (pi-coding-agent--encode-settings-json original)))
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "deepseek" "pro")
+                       :status)
+                      'written))
+          (let ((written (pi-coding-agent-test--parse-settings path)))
+            (dolist (entry original)
+              (should (equal (assoc (car entry) written) entry)))))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-complete-state-is-byte-noop ()
+  "Complete defaults and exact scope do not rewrite the file."
+  (let* ((root (make-temp-file "pi-settings-noop-" t))
+         (path (expand-file-name "settings.json" root))
+         (contents
+          "{\n  \"defaultProvider\": \"DeepSeek\",\n  \"defaultModel\": \"Pro\",\n  \"enabledModels\": [\"DEEPSEEK/PRO\"]\n}\n"))
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert contents))
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "DeepSeek" "Pro")
+                       :status)
+                      'noop))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents-literally path)
+                           (buffer-string))
+                         contents)))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-repairs-incomplete-scope ()
+  "Matching defaults still append a missing exact enabledModels entry."
+  (let* ((root (make-temp-file "pi-settings-scope-" t))
+         (path (expand-file-name "settings.json" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file path
+            (insert "{\"defaultProvider\":\"deepseek\",\"defaultModel\":\"pro\",\"enabledModels\":[\"deepseek/*\"]}"))
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "deepseek" "pro")
+                       :status)
+                      'written))
+          (should (equal (cdr (assoc "enabledModels"
+                                     (pi-coding-agent-test--parse-settings path)))
+                         ["deepseek/*" "deepseek/pro"]))
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "deepseek" "pro")
+                       :status)
+                      'noop)))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-rejects-unsafe-json ()
+  "Malformed, non-object, and invalid enabledModels settings stay unchanged."
+  (dolist (contents '("{broken" "[]" "null"
+                      "{\"enabledModels\":\"deepseek/*\"}"))
+    (let* ((root (make-temp-file "pi-settings-invalid-" t))
+           (path (expand-file-name "settings.json" root)))
+      (unwind-protect
+          (progn
+            (with-temp-file path (insert contents))
+            (should (eq (plist-get
+                         (pi-coding-agent--update-default-model-settings
+                          path "deepseek" "pro")
+                         :status)
+                        'failed))
+            (should (equal (with-temp-buffer
+                             (insert-file-contents-literally path)
+                             (buffer-string))
+                           contents)))
+        (delete-directory root t)))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-accepts-bom ()
+  "A UTF-8 BOM is ignored while parsing existing settings."
+  (let* ((root (make-temp-file "pi-settings-bom-" t))
+         (path (expand-file-name "settings.json" root)))
+    (unwind-protect
+        (progn
+          (let ((coding-system-for-write 'utf-8-with-signature))
+            (write-region "{\"other\":true}" nil path nil 'silent))
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        path "deepseek" "pro")
+                       :status)
+                      'written))
+          (should (eq (cdr (assoc "other"
+                                  (pi-coding-agent-test--parse-settings path)))
+                      t)))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-preserves-mode-and-symlink ()
+  "Atomic replacement keeps target mode and does not replace a symlink."
+  (let* ((root (make-temp-file "pi-settings-link-" t))
+         (target (expand-file-name "managed-settings.json" root))
+         (link (expand-file-name "settings.json" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file target (insert "{\"other\":1}"))
+          (set-file-modes target #o644)
+          (make-symbolic-link target link)
+          (should (eq (plist-get
+                       (pi-coding-agent--update-default-model-settings
+                        link "deepseek" "pro")
+                       :status)
+                      'written))
+          (should (file-symlink-p link))
+          (should (= (file-modes target) #o644))
+          (should (equal (cdr (assoc "defaultModel"
+                                     (pi-coding-agent-test--parse-settings target)))
+                         "pro")))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-settings-persistence-cleans-temp-after-rename-failure ()
+  "A failed rename reports failure and removes its temporary file."
+  (let* ((root (make-temp-file "pi-settings-rename-" t))
+         (path (expand-file-name "settings.json" root))
+         temporary)
+    (unwind-protect
+        (progn
+          (with-temp-file path (insert "{}"))
+          (cl-letf (((symbol-function 'rename-file)
+                     (lambda (source &rest _)
+                       (setq temporary source)
+                       (error "simulated rename failure"))))
+            (should (eq (plist-get
+                         (pi-coding-agent--update-default-model-settings
+                          path "deepseek" "pro")
+                         :status)
+                        'failed)))
+          (should temporary)
+          (should-not (file-exists-p temporary))
+          (should (equal (with-temp-buffer
+                           (insert-file-contents path)
+                           (buffer-string))
+                         "{}")))
+      (delete-directory root t))))
+
+(ert-deftest pi-coding-agent-test-model-switching-sends-documented-rpc-only ()
+  "Both actions send only documented set_model fields over RPC."
   (let ((chat-buf (generate-new-buffer "*pi-model-scope-test*"))
-        commands)
+        commands
+        persisted)
     (unwind-protect
         (progn
           (with-current-buffer chat-buf
@@ -46,7 +231,11 @@
                                   :command "set_model"
                                   :data (:provider "deepseek"
                                          :id "deepseek-v4-pro"
-                                         :name "DeepSeek V4 Pro"))))))
+                                         :name "DeepSeek V4 Pro")))))
+                    ((symbol-function 'pi-coding-agent--persist-default-model)
+                     (lambda (&rest args)
+                       (setq persisted args)
+                       '(:status noop :path "/tmp/settings.json"))))
             (pi-coding-agent--switch-model
              :proc chat-buf
              '(:provider "deepseek" :id "deepseek-v4-pro"
@@ -58,9 +247,13 @@
                :name "DeepSeek V4 Pro")
              t))
           (setq commands (nreverse commands))
-          (should (eq (plist-get (car commands) :persistDefault)
-                      :json-false))
-          (should (eq (plist-get (cadr commands) :persistDefault) t)))
+          (dolist (command commands)
+            (should (equal command
+                           '(:type "set_model"
+                             :provider "deepseek"
+                             :modelId "deepseek-v4-pro"))))
+          (should (equal persisted
+                         '(:proc "deepseek" "deepseek-v4-pro"))))
       (kill-buffer chat-buf))))
 
 (ert-deftest pi-coding-agent-test-model-switching-rejects-busy-dispatch ()
@@ -85,9 +278,10 @@
       (kill-buffer chat-buf))))
 
 (ert-deftest pi-coding-agent-test-model-switching-failure-preserves-model ()
-  "A failed model RPC leaves the current buffer model unchanged."
+  "A failed model RPC leaves the model unchanged and never persists."
   (let ((chat-buf (generate-new-buffer "*pi-model-failure-test*"))
-        last-message)
+        last-message
+        persisted)
     (unwind-protect
         (progn
           (with-current-buffer chat-buf
@@ -101,6 +295,9 @@
                      (lambda (_proc _command callback)
                        (funcall callback
                                 '(:success :false :error "quota exceeded"))))
+                    ((symbol-function 'pi-coding-agent--persist-default-model)
+                     (lambda (&rest _)
+                       (setq persisted t)))
                     ((symbol-function 'message)
                      (lambda (format-string &rest args)
                        (setq last-message
@@ -109,17 +306,18 @@
              :proc chat-buf
              '(:provider "deepseek" :id "deepseek-v4-pro"
                :name "DeepSeek V4 Pro")
-             nil))
+             t))
           (should
            (equal
             (with-current-buffer chat-buf
               (plist-get (plist-get pi-coding-agent--state :model) :id))
             "deepseek-v4-flash"))
-          (should (string-match-p "quota exceeded" last-message)))
+          (should (string-match-p "quota exceeded" last-message))
+          (should-not persisted))
       (kill-buffer chat-buf))))
 
 (ert-deftest pi-coding-agent-test-model-switching-helm-has-scope-actions ()
-  "The Helm source exposes current-only and sticky actions in that order."
+  "The Helm source exposes sticky and current-only actions in that order."
   (let (captured-actions dispatched)
     (cl-letf (((symbol-function 'helm-make-source)
                (lambda (_name _class &rest args)
@@ -137,16 +335,64 @@
        nil)
       (should
        (equal (mapcar #'car captured-actions)
-              '("Switch current Session"
-                "Switch Session and set new-session default")))
+              '("Switch and remember as default"
+                "Just this session")))
       (funcall (cdar captured-actions)
                '(:provider "deepseek" :id "deepseek-v4-pro"))
       (funcall (cdadr captured-actions)
                '(:provider "deepseek" :id "deepseek-v4-pro"))
       (should
        (equal (nreverse dispatched)
-              '(("deepseek-v4-pro" nil)
-                ("deepseek-v4-pro" t)))))))
+              '(("deepseek-v4-pro" t)
+                ("deepseek-v4-pro" nil)))))))
+
+(ert-deftest pi-coding-agent-test-model-switching-completion-is-sticky ()
+  "The non-Helm completion fallback uses switch-and-remember semantics."
+  (let (persist-default)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _) "Pro"))
+              ((symbol-function 'pi-coding-agent--switch-model)
+               (lambda (_proc _chat _model persist)
+                 (setq persist-default persist))))
+      (pi-coding-agent--show-model-completion
+       :proc :chat
+       '(("Pro" . (:provider "deepseek" :id "pro")))
+       '(:name "Flash") nil)
+      (should persist-default))))
+
+(ert-deftest pi-coding-agent-test-model-switching-persistence-failure-warns-after-switch ()
+  "Persistence failure warns without undoing a successful Session switch."
+  (let ((chat-buf (generate-new-buffer "*pi-model-persist-failure-test*"))
+        warning)
+    (unwind-protect
+        (progn
+          (with-current-buffer chat-buf
+            (pi-coding-agent-chat-mode)
+            (setq pi-coding-agent--status 'idle
+                  pi-coding-agent--state
+                  '(:model (:provider "deepseek" :id "flash"))))
+          (cl-letf (((symbol-function 'pi-coding-agent--rpc-async)
+                     (lambda (_proc _command callback)
+                       (funcall callback
+                                '(:success t :command "set_model"
+                                  :data (:provider "deepseek" :id "pro")))))
+                    ((symbol-function 'pi-coding-agent--persist-default-model)
+                     (lambda (&rest _)
+                       '(:status failed :path "/tmp/settings.json"
+                         :reason "invalid JSON")))
+                    ((symbol-function 'display-warning)
+                     (lambda (_type text &rest _)
+                       (setq warning text)))
+                    ((symbol-function 'message) #'ignore))
+            (pi-coding-agent--switch-model
+             :proc chat-buf '(:provider "deepseek" :id "pro") t))
+          (should (equal
+                   (with-current-buffer chat-buf
+                     (plist-get (plist-get pi-coding-agent--state :model) :id))
+                   "pro"))
+          (should (string-match-p "/tmp/settings.json" warning))
+          (should (string-match-p "invalid JSON" warning)))
+      (kill-buffer chat-buf))))
 
 (ert-deftest pi-coding-agent-test-model-switching-shows-price-without-tier-label ()
   "Candidates and Header avoid redundant tier labels."

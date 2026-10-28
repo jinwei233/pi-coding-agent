@@ -127,6 +127,15 @@ activity phase, cost and context usage, session name, and extension
 status when available.  The model and thinking fields can be clicked
 to change their values.
 
+The model selector's primary action switches the current Session and remembers
+that model as the default for future local Sessions using the same Pi agent
+directory.  Its secondary =Just this session= action does not change settings.
+Pi's normal project settings and explicit launch arguments still override this
+global default.  Remote TRAMP Sessions switch only the current Session and warn
+instead of guessing a remote settings path.  The settings update preserves
+unrelated keys and uses atomic replacement, but concurrent writers are handled
+on a best-effort, last-writer-wins basis rather than with a transactional merge.
+
 Type in the input buffer and press =C-c C-c= to send.  If Pi is
 already working, =C-c C-c= queues the text as a follow-up and sends it
 when the current turn finishes.  Press =C-c C-s= while Pi is busy to

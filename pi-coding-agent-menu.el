@@ -42,6 +42,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'pi-coding-agent-render)
 (require 'transient)
 
@@ -1025,10 +1026,138 @@ When WIDTHS is non-nil, align each field to the corresponding display width."
         model))
      models rows)))
 
+(defun pi-coding-agent--encode-settings-json (settings)
+  "Encode SETTINGS as pretty JSON while preserving JSON scalar types."
+  (let ((json-null :null)
+        (json-false :false)
+        (json-encoding-pretty-print t)
+        (json-encoding-default-indentation "  "))
+    (concat (json-encode settings) "\n")))
+
+(defun pi-coding-agent--settings-put (settings key value)
+  "Return SETTINGS with string KEY set to VALUE."
+  (if-let* ((entry (assoc key settings)))
+      (progn
+        (setcdr entry value)
+        settings)
+    (append settings (list (cons key value)))))
+
+(defun pi-coding-agent--read-settings-json (path)
+  "Read PATH as a JSON object alist, or signal an error."
+  (if (not (file-exists-p path))
+      nil
+    (let ((text
+           (with-temp-buffer
+             (let ((coding-system-for-read 'utf-8))
+               (insert-file-contents path))
+             (buffer-string))))
+      (when (string-prefix-p "\ufeff" text)
+        (setq text (substring text 1)))
+      (let ((settings
+             (json-parse-string text
+                                :object-type 'alist
+                                :array-type 'array
+                                :null-object :null
+                                :false-object :false)))
+        (unless (listp settings)
+          (error "Settings root is not a JSON object"))
+        ;; Emacs 29-31 may intern alist object keys despite `object-type'.
+        ;; Normalize only the top-level keys that this updater addresses.
+        (mapcar (lambda (entry)
+                  (cons (if (symbolp (car entry))
+                            (symbol-name (car entry))
+                          (car entry))
+                        (cdr entry)))
+                settings)))))
+
+(defun pi-coding-agent--enabled-model-exact-p (enabled reference)
+  "Return non-nil when ENABLED contains exact REFERENCE ignoring case."
+  (let ((folded-reference (downcase reference)))
+    (seq-some (lambda (entry)
+                (and (stringp entry)
+                     (string= (downcase entry) folded-reference)))
+              enabled)))
+
+(defun pi-coding-agent--replace-settings-file (path contents)
+  "Atomically replace the resolved target of PATH with CONTENTS."
+  (make-directory (file-name-directory path) t)
+  (let* ((real-path (file-truename path))
+         (directory (file-name-directory real-path))
+         (existing-mode (and (file-exists-p real-path)
+                             (file-modes real-path)))
+         (temporary nil))
+    (make-directory directory t)
+    (unwind-protect
+        (progn
+          (setq temporary
+                (make-temp-file
+                 (expand-file-name ".pi-settings-" directory)))
+          (let ((coding-system-for-write 'utf-8-unix))
+            (write-region contents nil temporary nil 'silent))
+          (when existing-mode
+            (set-file-modes temporary existing-mode))
+          (rename-file temporary real-path t)
+          (setq temporary nil))
+      (when (and temporary (file-exists-p temporary))
+        (delete-file temporary)))))
+
+(defun pi-coding-agent--update-default-model-settings (path provider model-id)
+  "Persist PROVIDER and MODEL-ID in settings PATH.
+Return a plist whose `:status' is `written', `noop', or `failed'."
+  (condition-case err
+      (let* ((settings (pi-coding-agent--read-settings-json path))
+             (provider-entry (assoc "defaultProvider" settings))
+             (model-entry (assoc "defaultModel" settings))
+             (enabled-entry (assoc "enabledModels" settings))
+             (enabled (and enabled-entry (cdr enabled-entry)))
+             (reference (concat provider "/" model-id)))
+        (when (and enabled-entry
+                   (not (or (vectorp enabled)
+                            (eq enabled :null))))
+          (error "EnabledModels is neither an array nor null: %S" enabled))
+        (let* ((nonempty-enabled (and (vectorp enabled)
+                                      (> (length enabled) 0)))
+               (scope-complete (or (not nonempty-enabled)
+                                   (pi-coding-agent--enabled-model-exact-p
+                                    enabled reference))))
+          (if (and provider-entry
+                   (equal (cdr provider-entry) provider)
+                   model-entry
+                   (equal (cdr model-entry) model-id)
+                   scope-complete)
+              (list :status 'noop :path path)
+            (setq settings
+                  (pi-coding-agent--settings-put
+                   settings "defaultProvider" provider))
+            (setq settings
+                  (pi-coding-agent--settings-put
+                   settings "defaultModel" model-id))
+            (when (and nonempty-enabled (not scope-complete))
+              (setq settings
+                    (pi-coding-agent--settings-put
+                     settings "enabledModels"
+                     (vconcat enabled (vector reference)))))
+            (pi-coding-agent--replace-settings-file
+             path (pi-coding-agent--encode-settings-json settings))
+            (list :status 'written :path path))))
+    (error
+     (list :status 'failed :path path :reason (error-message-string err)))))
+
+(defun pi-coding-agent--persist-default-model (proc provider model-id)
+  "Persist PROVIDER and MODEL-ID using PROC's launch-time settings target."
+  (let ((target (and (processp proc)
+                     (process-get proc 'pi-coding-agent-settings-persistence))))
+    (if (stringp target)
+        (pi-coding-agent--update-default-model-settings
+         target provider model-id)
+      (list :status 'unsupported
+            :reason "default persistence is unsupported for this remote Session"))))
+
 (defun pi-coding-agent--switch-model
     (proc chat-buf model persist-default)
   "Switch CHAT-BUF through PROC to MODEL.
-When PERSIST-DEFAULT is non-nil, also set MODEL as Pi's new-session default."
+When PERSIST-DEFAULT is non-nil, remember MODEL in the local Pi settings
+captured when PROC started.  The RPC request itself remains session-only."
   (pi-coding-agent--ensure-model-switch-idle chat-buf)
   (let ((provider (plist-get model :provider))
         (model-id (plist-get model :id))
@@ -1038,20 +1167,33 @@ When PERSIST-DEFAULT is non-nil, also set MODEL as Pi's new-session default."
      proc
      (list :type "set_model"
            :provider provider
-           :modelId model-id
-           :persistDefault (if persist-default t :json-false))
+           :modelId model-id)
      (lambda (response)
-       (if (and (eq (plist-get response :success) t)
-                (buffer-live-p chat-buf))
+       (if (eq (plist-get response :success) t)
            (progn
-             (with-current-buffer chat-buf
-               (pi-coding-agent--update-state-from-response response)
-               (pi-coding-agent--notify-input-state-change)
-               (force-mode-line-update t))
-             (message (if persist-default
-                          "Pi: Switched to %s and set it as the new-session default"
-                        "Pi: Switched current session to %s")
-                      model-name))
+             (when (buffer-live-p chat-buf)
+               (with-current-buffer chat-buf
+                 (pi-coding-agent--update-state-from-response response)
+                 (pi-coding-agent--notify-input-state-change)
+                 (force-mode-line-update t)))
+             (if (not persist-default)
+                 (message "Pi: Switched current Session to %s" model-name)
+               (let* ((result (pi-coding-agent--persist-default-model
+                               proc provider model-id))
+                      (status (plist-get result :status)))
+                 (if (memq status '(written noop))
+                     (message "Pi: Switched to %s and remembered it as the default"
+                              model-name)
+                   (message "Pi: Switched current Session to %s" model-name)
+                   (display-warning
+                    'pi-coding-agent
+                    (format "Pi switched the current Session, but did not persist the default%s: %s"
+                            (if-let* ((path (plist-get result :path)))
+                                (format " in %s" path)
+                              "")
+                            (or (plist-get result :reason)
+                                "unknown persistence failure"))
+                    :warning)))))
          (message "Pi: Failed to switch model: %s"
                   (or (plist-get response :error) "unknown error")))))))
 
@@ -1079,7 +1221,7 @@ PROC, CHAT-BUF, CURRENT-MODEL, and INITIAL-INPUT describe the active selector."
                  (t (completing-read prompt labels nil t initial-input))))
             (completing-read prompt labels nil t))))
     (when-let* ((model (cdr (assoc choice candidates))))
-      (pi-coding-agent--switch-model proc chat-buf model nil))))
+      (pi-coding-agent--switch-model proc chat-buf model t))))
 
 (defun pi-coding-agent--show-model-helm
     (proc chat-buf candidates initial-input)
@@ -1091,14 +1233,14 @@ PROC and CHAT-BUF identify the session.  INITIAL-INPUT seeds Helm filtering."
           :candidates candidates
           :action
           (list
-           (cons "Switch current Session"
+           (cons "Switch and remember as default"
                  (lambda (model)
                    (pi-coding-agent--switch-model
-                    proc chat-buf model nil)))
-           (cons "Switch Session and set new-session default"
+                    proc chat-buf model t)))
+           (cons "Just this session"
                  (lambda (model)
                    (pi-coding-agent--switch-model
-                    proc chat-buf model t))))
+                    proc chat-buf model nil))))
           :must-match t)))
     (helm :sources source
           :buffer "*helm Pi models*"
@@ -1108,9 +1250,10 @@ PROC and CHAT-BUF identify the session.  INITIAL-INPUT seeds Helm filtering."
 ;;;###autoload
 (defun pi-coding-agent-select-model (&optional initial-input)
   "Select an allowlisted runtime model.
-Helm's default action switches only the current Session; its secondary action
-also updates Pi's default for new Sessions.  Optional INITIAL-INPUT pre-fills
-the selector."
+Helm's default action switches the current Session and remembers the model for
+future local Sessions using the same Pi agent directory.  Its secondary action
+switches only the current Session.  The `completing-read' fallback also uses the
+sticky default action.  Optional INITIAL-INPUT pre-fills the selector."
   (interactive)
   (let ((proc (pi-coding-agent--get-process))
         (chat-buf (pi-coding-agent--get-chat-buffer)))
