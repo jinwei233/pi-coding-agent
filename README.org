@@ -203,8 +203,9 @@ as =search-forward=, =occur= or =replace-string= work on buffer text and can
 still match the hidden structure, which is a known limit of the quiet
 presentation.
 
-Completed tool calls use one folded activity row per user turn when
-=pi-coding-agent-tool-activity-display= is =grouped=:
+By default, completed tool calls use one folded activity row per user turn when
+=pi-coding-agent-tool-activity-display= is =grouped= and
+=pi-coding-agent-output-progress-display= is =legacy=:
 =▸ Tools · 1 file · +4 -1 · tests passed · 7 calls=.  Results outrank call
 counts when the window is narrow.  =TAB= or =RET= on the row reveals one
 muted row per tool without link underlines; =TAB= on a tool row toggles its
@@ -230,14 +231,43 @@ option back to =text= restores the previous text shape.  Type labels and
 expanded tool names use a neutral shadow face in all three styles; this face
 adjustment is independent of the marker choice.
 
-During a live agent turn, the folded row stays at =◌ Tools · working= across
+In =legacy= mode, the live folded row stays at =◌ Tools · working= across
 consecutive tool start, update, and end events.  It changes to the final
 result-first summary once at agent end.  Expanding the row intentionally keeps
 the per-tool list live.
 
-Grouped history is rendered directly from lightweight per-turn records.  It
-does not materialize hidden tool headers, outputs, or overlays, and live
-updates rewrite only the current turn's activity region.
+Set =pi-coding-agent-output-progress-display= to =segmented= for tool groups
+separated by the assistant's actual nonblank explanations.  Canonical tool
+calls establish their segment before execution starts; delayed results update
+the original segment.  =TAB=, =RET=, and clicks on a segment affect only that
+segment.  The existing per-tool detail and file actions remain unchanged.
+The package default stays =legacy=; explicit =summary= tools or =visible=
+thinking keep their original presentation.
+
+Segment rows show event-based counts instead of =working=: successful reads
+and edits deduplicate authoritative file paths within the segment; command
+counts count bash calls, and MCP counts require explicit type metadata.
+Unknown tools count as other calls.  Structured test and operation-line evidence
+is used without inferring conclusions from command output.  Whole-turn file
+counts deduplicate paths across segments, and retries do not erase earlier
+call failures.
+
+In =segmented= mode, current phase, active tool or parallel count, completion
+counts, failures, and request elapsed time appear in the existing Input header.
+If Input is not visible in the same frame, Output's existing mode line shows
+the same cached progress.  No extra window or transcript status row is added.
+Elapsed time includes waiting and automatic retries, samples only on semantic
+events, and freezes on completion, abort, or error.  There is no stopwatch
+timer; history reload/resume restores counts without reconstructing old elapsed
+time.  Folded live thinking uses a stable thought-record entry, retaining the
+existing expansion actions.
+
+Grouped history is rendered directly from lightweight per-turn and segment
+records.  It does not materialize hidden tool headers, outputs, or overlays,
+and live updates rewrite only the affected activity region.  Changing progress
+mode takes effect in new chats or an explicit transcript rebuild; it does not
+rewrite canonical messages or session files.  Set the mode back to =legacy=
+and rebuild to restore the previous presentation.
 
 Markdown pipe tables get a display-only treatment: wide tables are
 wrapped and drawn to neatly fit window width, with cleaner separators,

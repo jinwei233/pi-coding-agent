@@ -2752,7 +2752,8 @@ and DISPLAY controls how completed thinking is rendered."
             (set-window-buffer window buffer)
             (with-current-buffer buffer
               (pi-coding-agent-chat-mode)
-              (setq-local pi-coding-agent--viewport-transaction-capture-count 0
+              (setq-local pi-coding-agent--process process
+                          pi-coding-agent--viewport-transaction-capture-count 0
                           pi-coding-agent--viewport-transaction-settle-count 0))
             (process-put process 'pi-coding-agent-chat-buffer buffer)
             (pi-coding-agent--register-display-handler process)
@@ -11188,6 +11189,7 @@ Edit diffs include unchanged context rows with a leading space marker."
            (proc (start-process "pi-coding-agent-render-test-cat" nil "cat"))
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
+      (setq-local pi-coding-agent--process proc)
       (unwind-protect
           (progn
             (process-put proc 'pi-coding-agent-chat-buffer (current-buffer))
@@ -11245,6 +11247,7 @@ Edit diffs include unchanged context rows with a leading space marker."
     (let* ((proc (start-process "pi-coding-agent-render-test-text-cat" nil "cat"))
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
+      (setq-local pi-coding-agent--process proc)
       (unwind-protect
           (progn
             (process-put proc 'pi-coding-agent-chat-buffer (current-buffer))
@@ -11274,6 +11277,7 @@ Edit diffs include unchanged context rows with a leading space marker."
     (let* ((proc (start-process "pi-coding-agent-render-test-thinking-cat" nil "cat"))
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
+      (setq-local pi-coding-agent--process proc)
       (unwind-protect
           (progn
             (process-put proc 'pi-coding-agent-chat-buffer (current-buffer))
@@ -11312,6 +11316,7 @@ Edit diffs include unchanged context rows with a leading space marker."
                     :toolName "bash"
                     :args (:command 42)))
            caught)
+      (setq-local pi-coding-agent--process proc)
       (unwind-protect
           (progn
             (process-put proc 'pi-coding-agent-chat-buffer (current-buffer))
@@ -11338,6 +11343,7 @@ Edit diffs include unchanged context rows with a leading space marker."
     (let* ((proc (start-process "pi-coding-agent-render-test-cat" nil "cat"))
            (encode (lambda (event) (concat (json-encode event) "\n")))
            caught)
+      (setq-local pi-coding-agent--process proc)
       (unwind-protect
           (progn
             (process-put proc 'pi-coding-agent-chat-buffer (current-buffer))

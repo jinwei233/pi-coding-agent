@@ -383,6 +383,17 @@ inside that suffix; older history stays frozen until explicitly rebuilt."
   :type 'natnum
   :group 'pi-coding-agent)
 
+(defcustom pi-coding-agent-output-progress-display 'legacy
+  "How execution progress is presented in new chat buffers.
+`legacy' preserves the existing transcript and phase display.  `segmented'
+uses tool segments and cached progress in the Input header, or the Output
+mode line when its linked Input is not visible in the same frame.
+This option does not override tool or completed-thinking display preferences.
+Existing sessions keep their buffer-local value through resets and rebuilds."
+  :type '(choice (const :tag "Legacy" legacy)
+                 (const :tag "Segmented" segmented))
+  :group 'pi-coding-agent)
+
 (defcustom pi-coding-agent-thinking-display 'visible
   "Default display mode for completed assistant thinking in new chat buffers.
 New chat buffers copy this user preference into a buffer-local session value.
@@ -1577,6 +1588,14 @@ This is a read-only buffer showing the conversation history."
   (setq-local filter-buffer-substring-function
               #'pi-coding-agent--filter-buffer-substring)
   (setq-local pi-coding-agent--thinking-display pi-coding-agent-thinking-display)
+  (setq-local pi-coding-agent--output-progress-display
+              pi-coding-agent-output-progress-display)
+  ;; Reuse the existing mode line; never add an Output header or window.
+  (setq-local mode-line-format
+              (append (if (listp mode-line-format)
+                          mode-line-format
+                        (list mode-line-format))
+                      '((:eval (pi-coding-agent--output-progress-mode-line-string)))))
   (setq-local pi-coding-agent--tool-activity-display
               pi-coding-agent-tool-activity-display)
   (setq-local pi-coding-agent--activity-table (make-hash-table :test 'equal))
@@ -1816,6 +1835,8 @@ of the current session in the selected frame."
   "Set the pi RPC subprocess PROCESS for this session.
 Resets cached process version and starts a delayed version probe for
 new live processes in interactive sessions."
+  (when (and pi-coding-agent--process (null process))
+    (pi-coding-agent--progress-finish "error"))
   (setq pi-coding-agent--process process
         pi-coding-agent--process-version nil)
   (when (and (processp process)
@@ -1859,6 +1880,19 @@ so built-in other-window scrolling commands target the linked chat."
       (setq pi-coding-agent--input-buffer buffer)
       (when (and buffer (buffer-live-p buffer))
         (pi-coding-agent--set-activity-phase phase 'input-link t)))))
+
+(defvar-local pi-coding-agent--output-progress-display 'legacy
+  "Effective progress presentation for this session.
+Copied from `pi-coding-agent-output-progress-display' when the chat is created.")
+
+(defun pi-coding-agent--segmented-progress-p ()
+  "Return non-nil when this buffer uses segmented progress."
+  (eq pi-coding-agent--output-progress-display 'segmented))
+
+(defun pi-coding-agent--set-output-progress-display (display)
+  "Set effective progress DISPLAY for the current chat buffer."
+  (setq pi-coding-agent--output-progress-display display)
+  (pi-coding-agent--redraw-progress))
 
 (defvar-local pi-coding-agent--thinking-display nil
   "Completed-thinking display mode for this chat buffer.
@@ -2026,6 +2060,9 @@ transitions."
                 fn (error-message-string err))
         :error)))))
 
+(defvar pi-coding-agent--progress-aggregate)
+(defvar pi-coding-agent--progress-running-label)
+
 (defun pi-coding-agent--set-activity-phase (phase &optional reason force)
   "Set activity PHASE for header-line display in current chat buffer.
 PHASE should be one of \"thinking\", \"replying\",
@@ -2044,11 +2081,287 @@ Returns non-nil when the phase changed."
              (changed (not (equal old-phase phase))))
         (when (or changed force)
           (setq pi-coding-agent--activity-phase phase)
-          (when changed
-            (force-mode-line-update t))
+          (cond
+           ((memq reason '(reset teardown))
+            (pi-coding-agent--progress-reset))
+           (changed
+            (if (equal phase "idle")
+                (pi-coding-agent--progress-finish)
+              (pi-coding-agent--update-progress
+               pi-coding-agent--progress-aggregate
+               pi-coding-agent--progress-running-label))))
           (pi-coding-agent--run-activity-phase-functions
            (current-buffer) pi-coding-agent--input-buffer old-phase phase reason))
         changed))))
+
+;;;; Cached Execution Progress
+
+(defvar-local pi-coding-agent--progress-aggregate nil
+  "Lightweight whole-turn aggregate supplied by the activity renderer.")
+(defvar-local pi-coding-agent--progress-running-label nil
+  "Bounded name of the single running tool, or nil.")
+(defvar-local pi-coding-agent--progress-origin nil
+  "Live request start time, retained across automatic retries.")
+(defvar-local pi-coding-agent--progress-active nil
+  "Non-nil while elapsed time may be sampled at semantic events.")
+(defvar-local pi-coding-agent--progress-pending-prompt nil
+  "Submitted prompt origin awaiting its live canonical user echo.")
+(defvar-local pi-coding-agent--progress-pending-steers nil
+  "FIFO of steering submission entries, each (ORIGIN . TEXT).
+Entries carry only submitted text, not attachments or tool payloads.")
+(defvar-local pi-coding-agent--progress-elapsed-cache nil
+  "Elapsed seconds sampled at the most recent semantic progress event.")
+(defvar-local pi-coding-agent--progress-outcome nil
+  "Terminal outcome: \"done\", \"aborted\", \"error\", or nil.")
+(defvar-local pi-coding-agent--progress-cache nil
+  "Semantic progress snapshot; equal updates do not sample or redraw.")
+(defvar-local pi-coding-agent--progress-parts nil
+  "Cached progress strings, ordered phase/error, label, counts, elapsed.")
+(defvar-local pi-coding-agent--progress-help nil
+  "Full cached progress description, including counts and elapsed time.")
+
+(defvar mode-line-window)
+
+(defun pi-coding-agent--progress-display-window ()
+  "Return the window whose status line is being evaluated."
+  (if (and (boundp 'mode-line-window) (window-live-p mode-line-window))
+      mode-line-window
+    (selected-window)))
+
+(defun pi-coding-agent--progress-chat-buffer ()
+  "Return the authoritative chat buffer, requiring reciprocal Input linkage."
+  (cond
+   ((derived-mode-p 'pi-coding-agent-chat-mode) (current-buffer))
+   ((and (derived-mode-p 'pi-coding-agent-input-mode)
+         (buffer-live-p pi-coding-agent--chat-buffer)
+         (eq (buffer-local-value 'pi-coding-agent--input-buffer
+                                 pi-coding-agent--chat-buffer)
+             (current-buffer)))
+    pi-coding-agent--chat-buffer)))
+
+(defun pi-coding-agent--redraw-progress ()
+  "Request redisplay only in this chat and its reciprocally linked Input.
+Does not select windows, fetch stats, or perform display-position calculations."
+  (force-mode-line-update)
+  (when (and (buffer-live-p pi-coding-agent--input-buffer)
+             (eq (buffer-local-value 'pi-coding-agent--chat-buffer
+                                     pi-coding-agent--input-buffer)
+                 (current-buffer)))
+    (with-current-buffer pi-coding-agent--input-buffer
+      (force-mode-line-update))))
+
+(defun pi-coding-agent--progress-running-count (aggregate)
+  "Return running tool count in AGGREGATE.
+Accept both the existing running-name list and numeric aggregate counts."
+  (let ((running (plist-get aggregate :running)))
+    (if (numberp running) running (length running))))
+
+(defun pi-coding-agent--progress-elapsed ()
+  "Return cached elapsed seconds, without sampling the clock."
+  pi-coding-agent--progress-elapsed-cache)
+
+(defun pi-coding-agent--progress-phase ()
+  "Return the effective cached phase for this request."
+  (or pi-coding-agent--progress-outcome
+      (when (and pi-coding-agent--progress-active
+                 (not (equal pi-coding-agent--activity-phase "compact"))
+                 (> (pi-coding-agent--progress-running-count
+                     pi-coding-agent--progress-aggregate) 0))
+        "running")
+      pi-coding-agent--activity-phase))
+
+(defun pi-coding-agent--cache-progress-parts ()
+  "Build bounded display parts from the current semantic progress snapshot."
+  (let* ((aggregate pi-coding-agent--progress-aggregate)
+         (phase (pi-coding-agent--progress-phase))
+         (running (pi-coding-agent--progress-running-count aggregate))
+         (failed (or (plist-get aggregate :failed) 0))
+         (calls (or (plist-get aggregate :calls) 0))
+         (completed (or (plist-get aggregate :completed)
+                        (max 0 (- calls running))))
+         (phase-face (if (member phase '("error" "aborted"))
+                         'error 'pi-coding-agent-activity-phase)))
+    (setq pi-coding-agent--progress-parts
+          (delq nil
+                (list
+                 (concat
+                  (cond
+                   ((> failed 0)
+                    (propertize (format "!%d " failed) 'face 'error))
+                   ((equal phase "error") (propertize "! " 'face 'error)))
+                  (propertize phase 'face phase-face))
+                 (when (and (not pi-coding-agent--progress-outcome)
+                            (not (equal phase "compact")) (> running 0))
+                   (if (= running 1)
+                       (or pi-coding-agent--progress-running-label "1 running")
+                     (format "%d running" running)))
+                 (when (> calls 0) (format "%d/%d calls" completed calls))
+                 (when pi-coding-agent--progress-elapsed-cache
+                   (format "%.1fs" pi-coding-agent--progress-elapsed-cache)))))
+    (setq pi-coding-agent--progress-help
+          (concat (string-join pi-coding-agent--progress-parts " · ")
+                  (when (> failed 0)
+                    (format " · %d call%s failed" failed
+                            (if (= failed 1) "" "s")))))))
+
+(defun pi-coding-agent--update-progress (aggregate &optional running-label)
+  "Cache whole-turn AGGREGATE and bounded RUNNING-LABEL at a semantic event.
+Only a changed phase, outcome, aggregate, or label samples elapsed time and
+requests redisplay.  Display evaluation never calls this function.  The
+renderer supplies lightweight authoritative counts, never tool payloads."
+  (when-let* ((chat (pi-coding-agent--progress-chat-buffer)))
+    (with-current-buffer chat
+      (let* ((aggregate (copy-tree aggregate))
+             (label (when (and (stringp running-label)
+                               (= 1 (pi-coding-agent--progress-running-count
+                                     aggregate)))
+                      (truncate-string-to-width
+                       (replace-regexp-in-string
+                        "[\n\r\t]+" " " (substring running-label 0
+                                                    (min 160 (length running-label))))
+                       40 nil nil "…"))))
+        ;; Terminal and compaction states must not retain an active tool label
+        ;; or running count, including late tool results after termination.
+        (when (or pi-coding-agent--progress-outcome
+                  (member pi-coding-agent--activity-phase '("compact" "idle")))
+          (setq label nil)
+          (when aggregate (setq aggregate (plist-put aggregate :running 0))))
+        (let ((snapshot
+               (list (let ((pi-coding-agent--progress-aggregate aggregate))
+                       (pi-coding-agent--progress-phase))
+                     aggregate label pi-coding-agent--progress-origin)))
+          (unless (equal snapshot pi-coding-agent--progress-cache)
+            (setq pi-coding-agent--progress-cache snapshot
+                  pi-coding-agent--progress-aggregate aggregate
+                  pi-coding-agent--progress-running-label label)
+            (when (and pi-coding-agent--progress-active
+                       pi-coding-agent--progress-origin)
+              (setq pi-coding-agent--progress-elapsed-cache
+                    (max 0.0 (- (float-time) pi-coding-agent--progress-origin))))
+            (pi-coding-agent--cache-progress-parts)
+            (pi-coding-agent--redraw-progress)
+            t))))))
+
+(defun pi-coding-agent--progress-start (&optional origin)
+  "Start a new request from submitted ORIGIN, or the current time.
+ORIGIN is elapsed-clock seconds, not a historical session timestamp."
+  (setq pi-coding-agent--progress-origin (or origin (float-time))
+        pi-coding-agent--progress-active t
+        pi-coding-agent--progress-elapsed-cache 0.0
+        pi-coding-agent--progress-outcome nil
+        pi-coding-agent--progress-cache nil
+        pi-coding-agent--progress-aggregate nil
+        pi-coding-agent--progress-running-label nil)
+  (pi-coding-agent--update-progress nil))
+
+(defun pi-coding-agent--progress-submit-steer (text)
+  "Record TEXT and its submission time without changing the active turn.
+Return an entry token used to remove a rejected steering submission."
+  (when-let* ((chat (pi-coding-agent--progress-chat-buffer)))
+    (with-current-buffer chat
+      (let ((entry (cons (float-time) text)))
+        (setq pi-coding-agent--progress-pending-steers
+              (nconc pi-coding-agent--progress-pending-steers (list entry)))
+        entry))))
+
+(defun pi-coding-agent--progress-reject-steer (entry)
+  "Remove rejected steering ENTRY without altering the active turn."
+  (setq pi-coding-agent--progress-pending-steers
+        (delq entry pi-coding-agent--progress-pending-steers)))
+
+(defun pi-coding-agent--progress-accept-user (&optional canonical-text local-echo)
+  "Accept a live canonical user boundary for CANONICAL-TEXT and LOCAL-ECHO.
+A pending prompt echo retains its preflight origin, including expanded slash
+prompts without LOCAL-ECHO.  Otherwise a queued steering echo starts a fresh
+turn at its submitted origin.  LOCAL-ECHO without a pending submission does
+not restart timing.  Unsubmitted external messages start at receipt.
+CANONICAL-TEXT is the canonical plain text; expanded echoes consume pending
+submissions in authoritative FIFO order rather than requiring text equality.
+Never call this helper from history replay."
+  (ignore canonical-text)
+  (when-let* ((chat (pi-coding-agent--progress-chat-buffer)))
+    (with-current-buffer chat
+      (cond
+       (pi-coding-agent--progress-pending-prompt
+        (setq pi-coding-agent--progress-pending-prompt nil))
+       (local-echo nil)
+       (pi-coding-agent--progress-pending-steers
+        (let ((entry (pop pi-coding-agent--progress-pending-steers)))
+          (pi-coding-agent--progress-start (car entry))))
+       (t (pi-coding-agent--progress-start))))))
+
+(defun pi-coding-agent--progress-resume ()
+  "Resume a same-request automatic retry, retaining its original start time."
+  (when pi-coding-agent--progress-origin
+    (setq pi-coding-agent--progress-active t
+          pi-coding-agent--progress-outcome nil)
+    (pi-coding-agent--update-progress pi-coding-agent--progress-aggregate)))
+
+(defun pi-coding-agent--progress-finish (&optional outcome)
+  "Freeze timing and clear running tools with terminal OUTCOME.
+OUTCOME defaults to \"done\".  Completion cannot overwrite a previously
+recorded abort or error.  A request without a live origin has no elapsed time."
+  (when (or pi-coding-agent--progress-origin
+            (member outcome '("aborted" "error")))
+    (let ((outcome (or outcome "done")))
+      (unless (and (equal outcome "done")
+                   (member pi-coding-agent--progress-outcome '("aborted" "error")))
+        (setq pi-coding-agent--progress-outcome outcome)))
+    (when pi-coding-agent--progress-active
+      (setq pi-coding-agent--progress-elapsed-cache
+            (max 0.0 (- (float-time) pi-coding-agent--progress-origin)))))
+  ;; A prompt that completed without a user echo must not claim the next
+  ;; steering echo.  Steering survives ordinary completion until accepted.
+  (setq pi-coding-agent--progress-pending-prompt nil)
+  (when (member pi-coding-agent--progress-outcome '("error" "aborted"))
+    (setq pi-coding-agent--progress-pending-steers nil))
+  (setq pi-coding-agent--progress-active nil)
+  (let ((aggregate (copy-tree pi-coding-agent--progress-aggregate)))
+    (when aggregate (setq aggregate (plist-put aggregate :running 0)))
+    (pi-coding-agent--update-progress aggregate)))
+
+(defun pi-coding-agent--progress-reset ()
+  "Clear live timing and counts for history, reload, reset, or teardown.
+Preserves the session's effective display preference."
+  (setq pi-coding-agent--progress-origin nil
+        pi-coding-agent--progress-pending-prompt nil
+        pi-coding-agent--progress-pending-steers nil
+        pi-coding-agent--progress-active nil
+        pi-coding-agent--progress-elapsed-cache nil
+        pi-coding-agent--progress-outcome nil
+        pi-coding-agent--progress-aggregate nil
+        pi-coding-agent--progress-running-label nil)
+  (pi-coding-agent--update-progress nil))
+
+(defun pi-coding-agent--progress-string (&optional width)
+  "Format cached progress, fitting WIDTH columns by dropping low priority parts.
+The full cached state remains in help-echo even in a narrow window."
+  (let* ((parts (or pi-coding-agent--progress-parts
+                    (list pi-coding-agent--activity-phase)))
+         (full (or pi-coding-agent--progress-help (string-join parts " · ")))
+         (shown parts))
+    (when width
+      (while (and (cdr shown)
+                  (> (string-width (string-join shown " · ")) width))
+        (setq shown (butlast shown))))
+    (propertize
+     (if width
+         (truncate-string-to-width (string-join shown " · ")
+                                   (max 0 width) nil nil "…")
+       (string-join parts " · "))
+     'help-echo full)))
+
+(defun pi-coding-agent--output-progress-mode-line-string ()
+  "Show cached status in Output only when linked Input is absent in this frame."
+  (when (and (pi-coding-agent--segmented-progress-p)
+             (not (and (buffer-live-p pi-coding-agent--input-buffer)
+                       (eq (buffer-local-value 'pi-coding-agent--chat-buffer
+                                               pi-coding-agent--input-buffer)
+                           (current-buffer))
+                       (get-buffer-window pi-coding-agent--input-buffer
+                                          (window-frame
+                                           (pi-coding-agent--progress-display-window))))))
+    (concat " │ " (pi-coding-agent--header-line-string))))
 
 (defvar-local pi-coding-agent--cached-stats nil
   "Cached session statistics for header-line display.
@@ -2059,7 +2372,9 @@ Updated after each agent turn completes.")
 
 (defun pi-coding-agent--set-aborted (value)
   "Set the aborted flag to VALUE."
-  (setq pi-coding-agent--aborted value))
+  (setq pi-coding-agent--aborted value)
+  (when value
+    (pi-coding-agent--progress-finish "aborted")))
 
 (defvar-local pi-coding-agent--message-start-marker nil
   "Marker for start of current message content.
@@ -3978,15 +4293,16 @@ when no extension info exists."
 (defun pi-coding-agent--header-line-string ()
   "Return formatted header-line string for input buffer.
 Accesses state from the linked chat buffer."
-  (let* ((chat-buf (cond
-                    ;; In input buffer with valid link to chat
-                    ((and pi-coding-agent--chat-buffer (buffer-live-p pi-coding-agent--chat-buffer))
-                     pi-coding-agent--chat-buffer)
-                    ;; In chat buffer itself
-                    ((derived-mode-p 'pi-coding-agent-chat-mode)
-                     (current-buffer))
-                    ;; No valid chat buffer yet
-                    (t nil)))
+  (let* ((chat-buf
+          (or (pi-coding-agent--progress-chat-buffer)
+              ;; Preserve legacy headers for callers with a one-way link.
+              ;; Segmented status requires reciprocal session ownership.
+              (when (and (buffer-live-p pi-coding-agent--chat-buffer)
+                         (not (eq (buffer-local-value
+                                   'pi-coding-agent--output-progress-display
+                                   pi-coding-agent--chat-buffer)
+                                  'segmented)))
+                pi-coding-agent--chat-buffer)))
          (state (and chat-buf (buffer-local-value 'pi-coding-agent--state chat-buf)))
          (stats (and chat-buf (buffer-local-value 'pi-coding-agent--cached-stats chat-buf)))
          (ext-status (and chat-buf (buffer-local-value 'pi-coding-agent--extension-status chat-buf)))
@@ -4003,15 +4319,45 @@ Accesses state from the linked chat buffer."
          (activity-phase (or (and chat-buf
                                   (buffer-local-value 'pi-coding-agent--activity-phase chat-buf))
                              "idle"))
+         (segmented (and chat-buf
+                         (buffer-local-value
+                          'pi-coding-agent--output-progress-display chat-buf)))
+         (segmented (eq segmented 'segmented))
          (activity-phase-str
-          (propertize (format "%-8s" activity-phase)
-                      'face 'pi-coding-agent-activity-phase)))
-    (concat
-     (pi-coding-agent--header-format-identity
-      model-short thinking activity-phase-str)
-     (pi-coding-agent--header-format-stats stats)
-     (pi-coding-agent--header-format-context-group session-name)
-     (pi-coding-agent--header-format-extension-group ext-status working-message))))
+          (if segmented
+              (with-current-buffer chat-buf
+                (pi-coding-agent--progress-string))
+            (propertize (format "%-8s" activity-phase)
+                        'face 'pi-coding-agent-activity-phase)))
+         (identity (pi-coding-agent--header-format-identity
+                    model-short thinking activity-phase-str))
+         (metadata (concat
+                    (pi-coding-agent--header-format-stats stats)
+                    (pi-coding-agent--header-format-context-group session-name)
+                    (pi-coding-agent--header-format-extension-group
+                     ext-status working-message)))
+         (full (concat identity metadata))
+         (width (window-body-width (pi-coding-agent--progress-display-window))))
+    (if (or (not segmented) (<= (string-width full) width))
+        full
+      ;; On narrow displays preserve phase/error first.  Optional progress
+      ;; parts degrade in priority order, then identity/context/session use
+      ;; the remaining budget.  No window geometry or display positions change.
+      (let* ((progress (with-current-buffer chat-buf
+                         (pi-coding-agent--progress-string (max 1 (- width 9)))))
+             (remaining (max 0 (- width (string-width progress) 1)))
+             (details (concat
+                       (pi-coding-agent--header-format-identity
+                        model-short thinking "") metadata)))
+        (propertize
+         (concat progress
+                 (when (> remaining 0)
+                   (concat " " (truncate-string-to-width
+                                details remaining nil nil "…"))))
+         'help-echo (concat
+                     (substring-no-properties full) " · "
+                     (with-current-buffer chat-buf
+                       (or pi-coding-agent--progress-help ""))))))))
 
 ;;; State Management
 
@@ -4148,6 +4494,11 @@ ON-NO-AGENT-START is called if success is not followed by agent_start."
          (proc (pi-coding-agent--get-process))
         (chat-buf (pi-coding-agent--get-chat-buffer))
         (prompt-generation nil))
+    (when (buffer-live-p chat-buf)
+      (with-current-buffer chat-buf
+        (pi-coding-agent--progress-start)
+        (setq pi-coding-agent--progress-pending-prompt
+              pi-coding-agent--progress-origin)))
     (cond
      ((null proc)
       (when (and on-failure (buffer-live-p chat-buf))
@@ -4166,7 +4517,8 @@ ON-NO-AGENT-START is called if success is not followed by agent_start."
         (with-current-buffer chat-buf
           (setq prompt-generation (pi-coding-agent--begin-prompt-start-wait))
           (setq pi-coding-agent--status 'sending)
-          (pi-coding-agent--set-activity-phase "thinking")))
+          (pi-coding-agent--set-activity-phase
+           (if (pi-coding-agent--segmented-progress-p) "waiting" "thinking"))))
       (pi-coding-agent--rpc-async
        proc
        (append (list :type "prompt" :message message)
@@ -4205,6 +4557,7 @@ Resets activity phase and status to idle."
       (setq pi-coding-agent--local-user-message nil)
       (setq pi-coding-agent--pre-compaction-status nil)
       (setq pi-coding-agent--status 'idle)
+      (pi-coding-agent--progress-finish "error")
       (pi-coding-agent--set-activity-phase "idle"))))
 
 

@@ -9,6 +9,8 @@
 (require 'ert)
 (require 'cl-lib)
 (require 'pi-coding-agent)
+(require 'pi-coding-agent-test-common)
+(require 'pi-coding-agent-progress-fixture)
 
 (defmacro pi-coding-agent-tool-activity-test--with-chat (&rest body)
   "Run BODY in a fresh grouped-activity chat buffer."
@@ -714,6 +716,459 @@ Each turn is a list of tool specs (NAME ARGS CONTENT DETAILS ERROR)."
                   (get-text-property 0 'font-lock-face failure-row)))
       (should (eq 'pi-coding-agent-activity-failed
                   (get-text-property 2 'font-lock-face tool-row))))))
+
+(defun pi-coding-agent-tool-activity-test--thought-snapshot ()
+  "Return the current turn's ordered lightweight thought previews."
+  (mapcar (lambda (thought) (plist-get thought :preview))
+          (pi-coding-agent--reading-turn-thoughts (pi-coding-agent--reading-current))))
+
+(defun pi-coding-agent-tool-activity-test--segment-snapshot ()
+  "Return canonical identity and counts for the current turn and segments."
+  (let ((turn (pi-coding-agent--activity-record-for-turn
+               pi-coding-agent--current-activity-turn)))
+    (list (pi-coding-agent--activity-aggregates turn)
+          (mapcar
+           (lambda (segment)
+             (list (pi-coding-agent--activity-record-turn-id segment)
+                   (pi-coding-agent--activity-record-segment-ordinal segment)
+                   (mapcar (lambda (tool) (plist-get tool :tool-call-id))
+                           (pi-coding-agent--activity-record-tools segment))
+                   (pi-coding-agent--activity-aggregates segment)))
+           (pi-coding-agent--activity-record-segments turn)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-shared-live-history ()
+  "Canonical segment ownership survives delayed starts and late duplicates."
+  (let ((fixture (pi-coding-agent-progress-fixture))
+        (pi-coding-agent-thinking-activity-display 'grouped)
+        (pi-coding-agent-thinking-display 'hidden)
+        live-snapshot live-text live-thoughts)
+    (pi-coding-agent-tool-activity-test--with-chat
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (dolist (event (plist-get fixture :events))
+        (pi-coding-agent--handle-display-event event))
+      (setq live-snapshot (pi-coding-agent-tool-activity-test--segment-snapshot)
+            live-text (pi-coding-agent-tool-activity-test--visible)
+            live-thoughts (pi-coding-agent-tool-activity-test--thought-snapshot))
+      (let* ((turn (pi-coding-agent--activity-record-for-turn 0))
+             (segments (pi-coding-agent--activity-record-segments turn)))
+        (should (= 1 (hash-table-count pi-coding-agent--activity-table)))
+        (should (= 2 (length segments)))
+        (should (eq (car segments) (pi-coding-agent--activity-record-for-tool "segment-1")))
+        (should (eq (car segments) (pi-coding-agent--activity-record-for-tool "segment-2")))
+        (should (eq (cadr segments) (pi-coding-agent--activity-record-for-tool "segment-3")))
+        (should (eq (pi-coding-agent--activity-tool turn "segment-1")
+                    (pi-coding-agent--activity-tool (car segments) "segment-1")))
+        (should (= 1 (plist-get (car live-snapshot) :files)))
+        (should (= 3 (plist-get (car live-snapshot) :started)))
+        (should (= 3 (plist-get (car live-snapshot) :completed)))
+        (should (= 1 (plist-get (car live-snapshot) :mcp)))
+        (dolist (segment segments)
+          (should (= 1 (plist-get (pi-coding-agent--activity-aggregates segment) :files))))
+        (should-not (string-match-p "working\\|PRIVATE PAYLOAD" live-text))
+        (should (= 2 (pi-coding-agent-tool-activity-test--count "Tools")))
+        (should (string-match-p "Body A[[:ascii:][:nonascii:]]*Tools[[:ascii:][:nonascii:]]*Body B[[:ascii:][:nonascii:]]*Tools[[:ascii:][:nonascii:]]*Body C" live-text))))
+    (pi-coding-agent-tool-activity-test--with-chat
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (let ((publications 0))
+        (cl-letf (((symbol-function 'pi-coding-agent--tool-detail-text)
+                   (lambda (&rest _) (ert-fail "History materialized payload")))
+                  ((symbol-function 'pi-coding-agent--update-progress)
+                   (lambda (aggregate &rest _)
+                     (when aggregate (cl-incf publications)))))
+          (pi-coding-agent--display-session-history
+           (plist-get fixture :messages) (current-buffer)))
+        (should (= 1 publications))
+        (should-not pi-coding-agent--progress-origin))
+      (should (equal live-snapshot (pi-coding-agent-tool-activity-test--segment-snapshot)))
+      (should (equal live-thoughts (pi-coding-agent-tool-activity-test--thought-snapshot)))
+      (should (= 3 (length live-thoughts)))
+      (should (= 2 (pi-coding-agent-tool-activity-test--count "Tools")))
+      (should-not (string-match-p "PRIVATE PAYLOAD" (pi-coding-agent-tool-activity-test--visible)))
+      (let ((positions (mapcar (lambda (text)
+                                (pi-coding-agent-tool-activity-test--goto text) (point))
+                              '("Body A" "Body B" "Body C"))))
+        (should (apply #'< positions))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-legacy-rebuild-roundtrip ()
+  "Mode rebuild changes projection only and preserves canonical message data."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (let* ((messages (plist-get (pi-coding-agent-progress-fixture) :messages))
+           (original (copy-tree messages t)))
+      (setq-local pi-coding-agent--output-progress-display 'legacy)
+      (pi-coding-agent--display-session-history messages (current-buffer))
+      (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (pi-coding-agent--rerender-canonical-history)
+      (should (= 2 (pi-coding-agent-tool-activity-test--count "Tools")))
+      (should (eq messages pi-coding-agent--canonical-messages))
+      (should (equal original messages))
+      (setq-local pi-coding-agent--output-progress-display 'legacy)
+      (pi-coding-agent--rerender-canonical-history)
+      (should (= 1 (pi-coding-agent-tool-activity-test--count "Tools")))
+      (should (eq messages pi-coding-agent--canonical-messages))
+      (should (equal original messages))
+      (should (= 1 (hash-table-count pi-coding-agent--activity-table)))
+      (should-not (pi-coding-agent--activity-record-segments
+                   (pi-coding-agent--activity-record-for-turn 0))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-steering-progress-new-turn ()
+  "Canonical steering resets progress; a local echo preserves request timing."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (let ((clock 100.0))
+      (cl-letf (((symbol-function 'float-time) (lambda (&rest _) clock)))
+        (pi-coding-agent--progress-start)
+        (pi-coding-agent--display-user-message "first request")
+        (pi-coding-agent--set-activity-phase "running")
+        (pi-coding-agent--activity-finish-tool "failed" "bash" nil [] nil t t)
+        (should (= 1 (plist-get pi-coding-agent--progress-aggregate :failed)))
+        (setq clock 105.0)
+        (pi-coding-agent--handle-display-event
+         '(:type "message_start" :message (:role "user" :content [(:type "text" :text "steering request")])))
+        (pi-coding-agent--handle-display-event
+         '(:type "message_update" :assistantMessageEvent (:type "text_delta" :delta "text only")))
+        (should (= 105.0 pi-coding-agent--progress-origin))
+        (should-not pi-coding-agent--progress-aggregate)
+        (should-not (string-match-p "failed\\|calls\\|!1" (pi-coding-agent--progress-string)))
+        ;; A submitted local message has already started its clock and turn.
+        (setq clock 110.0)
+        (pi-coding-agent--progress-start)
+        (setq pi-coding-agent--local-user-message "local request")
+        (pi-coding-agent--display-user-message "local request")
+        (setq clock 115.0)
+        (pi-coding-agent--handle-display-event
+         '(:type "message_start" :message (:role "user" :content [(:type "text" :text "local request")])))
+        (should (= 110.0 pi-coding-agent--progress-origin))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-pending-and-semantic-refresh ()
+  "Pending calls are not started; duplicate and payload events do not rewrite."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "pending")
+    (pi-coding-agent--activity-start-tool "p" "bash" '(:command "one; two") t t)
+    (let* ((record (pi-coding-agent--activity-record-for-tool "p"))
+           (aggregate (pi-coding-agent--activity-aggregates record)))
+      (should (= 1 (plist-get aggregate :calls)))
+      (should (= 0 (plist-get aggregate :started)))
+      (should-not (plist-get aggregate :running))
+      (should (= 1 (plist-get aggregate :bash)))
+      (pi-coding-agent--activity-start-tool "p" "bash" '(:command "one; two") t)
+      (should (= 1 (plist-get (pi-coding-agent--activity-aggregates record) :started)))
+      (let ((writes 0))
+        (cl-letf (((symbol-function 'pi-coding-agent--activity-render-record)
+                   (lambda (&rest _) (cl-incf writes)))
+                  ((symbol-function 'pi-coding-agent--refresh-header)
+                   (lambda (&rest _) (ert-fail "Progress requested stats RPC"))))
+          (dotimes (_ 20)
+            (pi-coding-agent--activity-start-tool "p" "bash" '(:command "one; two") t)
+            (pi-coding-agent--handle-display-event
+             '(:type "tool_execution_update" :toolCallId "p" :partialResult (:text "more"))))
+          (should (= 0 writes))))
+      (pi-coding-agent--activity-finish-tool "p" "bash" '(:command "one; two") [] nil t t)
+      (pi-coding-agent--activity-start-tool "retry" "bash" '(:command "one; two") t)
+      (pi-coding-agent--activity-finish-tool "retry" "bash" nil [] nil nil t)
+      (let ((turn (pi-coding-agent--activity-record-for-turn 0)))
+        (should (= 1 (plist-get (pi-coding-agent--activity-aggregates turn) :failed)))
+        (should (= 2 (plist-get (pi-coding-agent--activity-aggregates turn) :completed)))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-classification-explicit-only ()
+  "Only direct registered MCP metadata classifies an MCP call."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "metadata")
+    (cl-loop for metadata in '(nil (:isMcp :false) (:toolType "mcp")
+                              (:tool-type mcp) (:isMcp t)
+                              (:registration (:toolType "mcp"))
+                              (:tool (:tool-type mcp))
+                              (:metadata (:nested (:toolType "mcp"))))
+             for id from 0 do
+             (pi-coding-agent--activity-start-tool (number-to-string id) "mcp__looks_like_mcp"
+                                                  nil t nil metadata))
+    (let ((aggregate (pi-coding-agent--activity-aggregates
+                      (pi-coding-agent--activity-record-for-turn 0))))
+      (should (= 5 (plist-get aggregate :mcp)))
+      (should (= 3 (plist-get aggregate :other))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-group-interaction-local ()
+  "Segment metadata scopes TAB, RET and click without altering turn identity."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (dolist (event (plist-get (pi-coding-agent-progress-fixture) :events))
+      (pi-coding-agent--handle-display-event event))
+    (let* ((first (pi-coding-agent--activity-record-for-tool "segment-1"))
+           (second (pi-coding-agent--activity-record-for-tool "segment-3")))
+      (goto-char (pi-coding-agent--activity-record-start-marker first))
+      (should (= 0 (get-text-property (point) 'pi-coding-agent-activity-turn)))
+      (should (= 1 (get-text-property (point) 'pi-coding-agent-activity-segment)))
+      (should (eq (key-binding (kbd "TAB")) #'pi-coding-agent-toggle-tool-section))
+      (should (eq (key-binding (kbd "<tab>")) #'pi-coding-agent-toggle-tool-section))
+      ;; Resolve the real button keymap, then dispatch in this temp buffer.
+      ;; Keyboard macros themselves operate the batch selected window instead.
+      (call-interactively (key-binding (kbd "TAB")))
+      (should (pi-coding-agent--activity-record-expanded first))
+      (should-not (pi-coding-agent--activity-record-expanded second))
+      (goto-char (pi-coding-agent--activity-record-start-marker second))
+      (pi-coding-agent--activity-toggle-group-button (button-at (point)))
+      (should (pi-coding-agent--activity-record-expanded second))
+      (pi-coding-agent--activity-finish-tool "segment-1" "edit"
+                                          '(:path "/tmp/pi-tool-activity/shared.el")
+                                          [] '(:diff "+ 1 changed") nil t)
+      (should (pi-coding-agent--activity-record-expanded first))
+      (should (pi-coding-agent--activity-record-expanded second)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-whitespace-agent-boundary ()
+  "Thinking, whitespace and agent boundaries do not manufacture segments."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "boundaries")
+    (pi-coding-agent--activity-start-tool "one" "bash" nil t t)
+    (pi-coding-agent--activity-text-boundary " \n\t" t)
+    (pi-coding-agent--activity-finalize-live-turn)
+    (pi-coding-agent--activity-start-tool "two" "bash" nil t t)
+    (let ((turn (pi-coding-agent--activity-record-for-turn 0)))
+      (should (= 1 (length (pi-coding-agent--activity-record-segments turn))))
+      (should (eq (pi-coding-agent--activity-record-for-tool "one")
+                  (pi-coding-agent--activity-record-for-tool "two"))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-read-edit-dedup ()
+  "Successful path sets are independent and operations accumulate per call."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "paths")
+    (cl-loop for id in '("read-one" "read-two" "read-failed") do
+             (pi-coding-agent--activity-finish-tool
+              id "read" '(:path "/tmp/pi-tool-activity/shared.el") [] nil
+              (equal id "read-failed") t))
+    (cl-loop for id in '("edit-one" "edit-two") do
+             (pi-coding-agent--activity-finish-tool
+              id "edit" '(:path "/tmp/pi-tool-activity/shared.el") []
+              '(:diff "+ 1 new\n- 1 old") nil t))
+    (pi-coding-agent--activity-finish-tool
+     "unknown-path" "read" nil [] nil nil t)
+    (let ((aggregate (pi-coding-agent--activity-aggregates
+                      (pi-coding-agent--activity-record-for-turn 0))))
+      (should (= 1 (plist-get aggregate :read)))
+      (should (= 1 (plist-get aggregate :files)))
+      (should (= 1 (plist-get aggregate :failed)))
+      (should (= 2 (plist-get aggregate :added)))
+      (should (= 2 (plist-get aggregate :removed))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-clear-releases-segments ()
+  "Cleanup releases segment markers and the existing session indexes."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "cleanup")
+    (pi-coding-agent--activity-start-tool "one" "bash" nil t)
+    (let ((marker (pi-coding-agent--activity-record-start-marker
+                   (pi-coding-agent--activity-record-for-tool "one"))))
+      (pi-coding-agent--activity-clear-state)
+      (should-not (marker-position marker))
+      (should (= 0 (hash-table-count pi-coding-agent--activity-table)))
+      (should (= 0 (hash-table-count pi-coding-agent--tool-activity-index))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-tiny-failure-budget ()
+  "Tiny segmented rows preserve failure and complete help text."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "narrow")
+    (pi-coding-agent--activity-finish-tool "bad" "bash" nil [] nil t t)
+    (let ((record (pi-coding-agent--activity-record-for-tool "bad")))
+      (dolist (width '(1 5 12 72))
+        (cl-letf (((symbol-function 'pi-coding-agent--activity-line-budget) (lambda () width)))
+          (let ((text (pi-coding-agent--activity-group-text record)))
+            (should (<= (string-width text) width))
+            (should (string-match-p "failed\\|!" text))
+            (should (string-match-p "1 call failed" (get-text-property 0 'help-echo text)))))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-summary-keeps-per-tool-ui ()
+  "Explicit summary display remains per-tool while fixed counts are recorded."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented
+                pi-coding-agent--tool-activity-display 'summary)
+    (pi-coding-agent--display-user-message "summary")
+    (pi-coding-agent-tool-activity-test--render-tool "summary" "bash" '(:command "echo ok") "ok")
+    (should-not (text-property-any (point-min) (point-max) 'pi-coding-agent-activity-group t))
+    (should (string-match-p "\\$ echo ok" (pi-coding-agent-tool-activity-test--visible)))
+    (let ((turn (pi-coding-agent--activity-record-for-turn 0)))
+      (should-not (pi-coding-agent--activity-record-segments turn))
+      (should (= 1 (plist-get (pi-coding-agent--activity-aggregates turn) :completed))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-summary-interrupt ()
+  "Summary interruption settles running calls without inserting groups."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented
+                pi-coding-agent--tool-activity-display 'summary)
+    (pi-coding-agent--display-user-message "exit")
+    (pi-coding-agent--activity-start-tool "pending" "bash" nil t t)
+    (pi-coding-agent--activity-start-tool "running" "bash" nil t)
+    (let ((turn (pi-coding-agent--activity-record-for-turn 0)))
+      (pi-coding-agent--activity-interrupt-live-turn)
+      (should-not (pi-coding-agent--activity-record-live turn))
+      (should (eq 'pending (plist-get (pi-coding-agent--activity-tool turn "pending") :status)))
+      (should (eq 'failed (plist-get (pi-coding-agent--activity-tool turn "running") :status)))
+      (should (= 1 (plist-get (pi-coding-agent--activity-aggregates turn) :started)))
+      (should (= 1 (plist-get (pi-coding-agent--activity-aggregates turn) :completed)))
+      (should-not (plist-get (pi-coding-agent--activity-aggregates turn) :running))
+      (should-not (text-property-any (point-min) (point-max) 'pi-coding-agent-activity-group t)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-blocks-thinking-stub ()
+  "Blocks Thinking uses a stable record entry, preserving legacy fallback."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (let ((pi-coding-agent-activity-icon-style 'text))
+      (should (equal (substring-no-properties (pi-coding-agent--thinking-live-stub))
+                     "▸ Think · 思考记录")))
+    (let ((pi-coding-agent-activity-icon-style 'none))
+      (should (equal (substring-no-properties (pi-coding-agent--thinking-live-stub))
+                     "▸ 思考记录")))
+    (setq-local pi-coding-agent--output-progress-display 'legacy)
+    (should (string-match-p "working" (pi-coding-agent--thinking-live-stub)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-late-old-text-index ()
+  "Late deltas in an earlier canonical text block cannot split later tools."
+  (let* ((blocks [(:type "text" :text "A later")
+                  (:type "toolCall" :id "a" :name "bash" :arguments (:command "a"))
+                  (:type "toolCall" :id "b" :name "bash" :arguments (:command "b"))])
+         (message (list :role "assistant" :content blocks)) live)
+    (pi-coding-agent-tool-activity-test--with-chat
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (pi-coding-agent--display-user-message "old text")
+      (pi-coding-agent--handle-display-event '(:type "agent_start"))
+      (pi-coding-agent--handle-display-event
+       '(:type "message_start" :message (:role "assistant" :content [])))
+      (dolist (entry '(("text_delta" 0 "A") ("toolcall_start" 1)
+                       ("text_delta" 0 " later") ("toolcall_start" 2)))
+        (pi-coding-agent--handle-display-event
+         (list :type "message_update" :message message
+               :assistantMessageEvent
+               (list :type (car entry) :contentIndex (cadr entry) :delta (nth 2 entry)))))
+      (setq live (pi-coding-agent-tool-activity-test--segment-snapshot))
+      (should (= 1 (length (cadr live))))
+      (should (= 0 (plist-get (car live) :started)))
+      (should (eq (pi-coding-agent--activity-record-for-tool "a")
+                  (pi-coding-agent--activity-record-for-tool "b"))))
+    (pi-coding-agent-tool-activity-test--with-chat
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (pi-coding-agent--display-session-history
+       (vector '(:role "user" :content "old text") message) (current-buffer))
+      (should (equal live (pi-coding-agent-tool-activity-test--segment-snapshot))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-segmented-newest-text-first-nonblank ()
+  "Whitespace becoming nonblank closes once; raw fallback still closes tools."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "whitespace")
+    (pi-coding-agent--handle-display-event '(:type "agent_start"))
+    (pi-coding-agent--activity-reconcile-canonical
+     '(:role "assistant" :content [(:type "toolCall" :id "one" :name "bash")]) 0)
+    (dolist (text '(" " " explanation" " explanation more"))
+      (pi-coding-agent--handle-display-event
+       (list :type "message_update"
+             :message (list :role "assistant" :content
+                            (vector '(:type "toolCall" :id "one" :name "bash")
+                                    (list :type "text" :text text)))
+             :assistantMessageEvent (list :type "text_delta" :contentIndex 1 :delta text))))
+    (pi-coding-agent--activity-start-tool "two" "bash" nil t t)
+    (should-not (eq (pi-coding-agent--activity-record-for-tool "one")
+                    (pi-coding-agent--activity-record-for-tool "two")))
+    ;; The direct renderer has no canonical message/index evidence.
+    (pi-coding-agent--display-message-delta "raw boundary")
+    (pi-coding-agent--activity-start-tool "three" "bash" nil t t)
+    (should-not (eq (pi-coding-agent--activity-record-for-tool "two")
+                    (pi-coding-agent--activity-record-for-tool "three")))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-display-handler-process-ownership ()
+  "Stale and transition processes cannot mutate the current chat projection."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (let ((old (make-pipe-process :name "pi-progress-stale" :noquery t))
+          (current (make-pipe-process :name "pi-progress-current" :noquery t)))
+      (unwind-protect
+          (progn
+            (setq-local pi-coding-agent--process current)
+            (pi-coding-agent--display-user-message "ownership")
+            (dolist (process (list old current))
+              (process-put process 'pi-coding-agent-chat-buffer (current-buffer))
+              (pi-coding-agent--register-display-handler process))
+            (let ((before (buffer-string))
+                  (state (copy-tree pi-coding-agent--state))
+                  (cache (copy-tree pi-coding-agent--progress-cache)))
+              (dolist (transition '(nil t))
+                (setq-local pi-coding-agent--session-transition-active transition
+                            pi-coding-agent--session-transition-process (and transition old))
+                (pi-coding-agent--handle-event
+                 old '(:type "tool_execution_start" :toolCallId "stale" :toolName "bash")))
+              (should (equal before (buffer-string)))
+              (should (equal state pi-coding-agent--state))
+              (should (equal cache pi-coding-agent--progress-cache))
+              (should-not (pi-coding-agent--activity-record-for-tool "stale")))
+            (pi-coding-agent--handle-event
+             current '(:type "tool_execution_start" :toolCallId "current" :toolName "bash"))
+            (should (= 1 (plist-get (pi-coding-agent--activity-aggregates
+                                    (pi-coding-agent--activity-record-for-turn 0)) :started)))
+            (should (equal "running" pi-coding-agent--activity-phase)))
+        (setq-local pi-coding-agent--process nil
+                    pi-coding-agent--session-transition-process nil)
+        (delete-process old)
+        (delete-process current)))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-duplicate-events-preserve-reply-phase ()
+  "Duplicate completed starts and ends preserve reply phase and cached state."
+  (dolist (mode '(legacy segmented))
+    (pi-coding-agent-tool-activity-test--with-chat
+      (setq-local pi-coding-agent--output-progress-display mode)
+      (pi-coding-agent--display-user-message "duplicates")
+      (pi-coding-agent-tool-activity-test--render-tool "done" "bash" '(:command "true") "ok")
+      (pi-coding-agent--set-activity-phase "replying")
+      (let ((cache (copy-tree pi-coding-agent--progress-cache))
+            (state (copy-tree pi-coding-agent--state)))
+        (pi-coding-agent--handle-display-event
+         '(:type "tool_execution_end" :toolCallId "done" :toolName "bash"
+           :result (:content [(:type "text" :text "ok")])))
+        (pi-coding-agent--handle-display-event
+         '(:type "tool_execution_start" :toolCallId "done" :toolName "bash" :args (:command "true")))
+        (should (equal "replying" pi-coding-agent--activity-phase))
+        (should (equal cache pi-coding-agent--progress-cache))
+        (should (equal state pi-coding-agent--state))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-old-turn-result-preserves-current-phase ()
+  "Late old-turn results update their segment but never new-turn phase/cache."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "old")
+    (pi-coding-agent--handle-display-event
+     '(:type "tool_execution_start" :toolCallId "old" :toolName "bash"))
+    (let ((owner (pi-coding-agent--activity-record-for-tool "old")))
+      (pi-coding-agent--display-user-message "new")
+      (pi-coding-agent-tool-activity-test--render-tool "new" "bash" nil "new")
+      (pi-coding-agent--set-activity-phase "replying")
+      (let ((cache (copy-tree pi-coding-agent--progress-cache))
+            (state (copy-tree pi-coding-agent--state)))
+        (pi-coding-agent--handle-display-event
+         '(:type "tool_execution_end" :toolCallId "old" :toolName "bash"
+           :result (:content [(:type "text" :text "late")]) :isError t))
+        (pi-coding-agent--handle-display-event
+         '(:type "tool_execution_start" :toolCallId "old" :toolName "bash"))
+        (should (equal "replying" pi-coding-agent--activity-phase))
+        (should (equal cache pi-coding-agent--progress-cache))
+        (should (equal state pi-coding-agent--state))
+        (should (eq owner (pi-coding-agent--activity-record-for-tool "old")))
+        (should (= 1 (plist-get (pi-coding-agent--activity-aggregates owner) :failed)))))))
+
+(ert-deftest pi-coding-agent-test-tool-activity-genuine-end-keeps-parallel-running ()
+  "Genuine execution end retains legacy phase and parallel progress override."
+  (pi-coding-agent-tool-activity-test--with-chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--progress-start)
+    (pi-coding-agent--display-user-message "parallel")
+    (dolist (id '("one" "two"))
+      (pi-coding-agent--handle-display-event
+       (list :type "tool_execution_start" :toolCallId id :toolName "bash")))
+    (pi-coding-agent--handle-display-event
+     '(:type "tool_execution_end" :toolCallId "one" :toolName "bash" :result (:content [])))
+    (should (equal "thinking" pi-coding-agent--activity-phase))
+    (should (equal "running" (pi-coding-agent--progress-phase)))
+    (should (= 1 (length (plist-get pi-coding-agent--progress-aggregate :running))))))
 
 (provide 'pi-coding-agent-tool-activity-test)
 ;;; pi-coding-agent-tool-activity-test.el ends here

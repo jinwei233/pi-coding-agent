@@ -71,6 +71,49 @@
       (should-not (pi-coding-agent--reading-turn-answer turn))
       (should (string-match-p "working" (buffer-string))))))
 
+(ert-deftest pi-coding-agent-test-reading-segmented-live-stable-retry ()
+  (pi-coding-agent-reading-test--chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "request")
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (pi-coding-agent--display-thinking-delta "one")
+    (let ((entry (buffer-string)))
+      (should (string-match-p "▸ Think · 思考记录" entry))
+      (should-not (string-match-p "working" entry))
+      (pi-coding-agent--display-thinking-delta " two")
+      (pi-coding-agent--display-thinking-end "")
+      (pi-coding-agent--display-thinking-start)
+      (pi-coding-agent--display-thinking-end "three")
+      (should (equal entry (buffer-string))))
+    (pi-coding-agent--display-agent-end)
+    (should (string-match-p "2 thoughts" (buffer-string)))
+    (let ((turn pi-coding-agent--reading-current))
+      (pi-coding-agent--reading-run-start)
+      (should (eq turn pi-coding-agent--reading-current))
+      (should (string-match-p "思考记录" (buffer-string)))
+      (should-not (string-match-p "working" (buffer-string))))))
+
+(ert-deftest pi-coding-agent-test-reading-segmented-live-expansion ()
+  (pi-coding-agent-reading-test--chat
+    (setq-local pi-coding-agent--output-progress-display 'segmented)
+    (pi-coding-agent--display-user-message "request")
+    (pi-coding-agent--display-agent-start)
+    (pi-coding-agent--display-thinking-start)
+    (pi-coding-agent--display-thinking-delta "first\nhidden")
+    (goto-char (pi-coding-agent--reading-turn-start pi-coding-agent--reading-current))
+    (pi-coding-agent-toggle-tool-section)
+    (forward-line 1)
+    (should (looking-at "  ▸ Think · 思考记录"))
+    (pi-coding-agent-toggle-tool-section)
+    (pi-coding-agent--display-thinking-delta " continuation")
+    (should (string-match-p "hidden continuation" (buffer-string)))
+    (pi-coding-agent--display-thinking-end nil)
+    (pi-coding-agent--display-agent-end)
+    (should (pi-coding-agent--reading-turn-expanded pi-coding-agent--reading-current))
+    (should (string-match-p "hidden continuation" (buffer-string)))
+    (should-not (string-match-p "working" (buffer-string)))))
+
 (ert-deftest pi-coding-agent-test-reading-empty-and-visible ()
   (pi-coding-agent-reading-test--chat
     (pi-coding-agent--display-session-history
@@ -228,6 +271,41 @@
         (pi-coding-agent-previous-failed-tool)
         (should (equal "call-1"
                        (get-text-property (point) 'pi-coding-agent-activity-tool-call-id)))))))
+
+(ert-deftest pi-coding-agent-test-reading-segmented-failure-navigation ()
+  (save-window-excursion
+    (pi-coding-agent-reading-test--chat
+      (setq-local pi-coding-agent--output-progress-display 'segmented)
+      (switch-to-buffer (current-buffer))
+      (pi-coding-agent--display-session-history
+       [(:role "user" :content "request")
+        (:role "assistant" :content
+               [(:type "toolCall" :id "bad-one" :name "bash" :arguments (:command "false"))
+                (:type "text" :text "middle explanation")
+                (:type "toolCall" :id "bad-two" :name "bash" :arguments (:command "false"))
+                (:type "text" :text "final explanation")])
+        (:role "toolResult" :toolCallId "bad-one" :toolName "bash" :isError t
+               :content [(:type "text" :text "error one")])
+        (:role "toolResult" :toolCallId "bad-two" :toolName "bash" :isError t
+               :content [(:type "text" :text "error two")])]
+       (current-buffer))
+      (let ((first (pi-coding-agent--activity-record-for-tool "bad-one"))
+            (second (pi-coding-agent--activity-record-for-tool "bad-two")))
+        (should-not (eq first second))
+        (goto-char (point-min))
+        (cl-letf (((symbol-function 'message) #'ignore))
+          (pi-coding-agent-next-failed-tool)
+          (should (equal "bad-one"
+                         (get-text-property (point) 'pi-coding-agent-activity-tool-call-id)))
+          (should (pi-coding-agent--activity-record-expanded first))
+          (should-not (pi-coding-agent--activity-record-expanded second))
+          (pi-coding-agent-next-failed-tool)
+          (should (equal "bad-two"
+                         (get-text-property (point) 'pi-coding-agent-activity-tool-call-id)))
+          (should (pi-coding-agent--activity-record-expanded second))
+          (pi-coding-agent-previous-failed-tool)
+          (should (equal "bad-one"
+                         (get-text-property (point) 'pi-coding-agent-activity-tool-call-id))))))))
 
 (ert-deftest pi-coding-agent-test-reading-500-turns-bounded-projection ()
   (pi-coding-agent-reading-test--chat

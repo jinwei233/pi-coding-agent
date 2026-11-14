@@ -34,8 +34,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Auto-detect headless if no display available
-if [ "$HEADLESS" != "1" ] && [ -z "$DISPLAY" ]; then
+# Native macOS Emacs uses NS without DISPLAY; only X11 needs auto-Xvfb.
+if [ "$HEADLESS" != "1" ] && [ -z "$DISPLAY" ] && [ "$(uname -s)" != "Darwin" ]; then
     HEADLESS=1
 fi
 

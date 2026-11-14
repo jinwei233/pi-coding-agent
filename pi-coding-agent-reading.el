@@ -20,6 +20,7 @@
 (declare-function pi-coding-agent--thinking-normalize-text "pi-coding-agent-render" (text))
 (declare-function pi-coding-agent--ensure-blank-line-before-block "pi-coding-agent-render" ())
 (declare-function pi-coding-agent--activity-record-for-turn "pi-coding-agent-render" (turn-id &optional create))
+(declare-function pi-coding-agent--activity-record-for-tool "pi-coding-agent-render" (tool-call-id))
 (declare-function pi-coding-agent--activity-record-start-marker "pi-coding-agent-render" (record))
 (declare-function pi-coding-agent--activity-record-tools "pi-coding-agent-render" (record))
 (declare-function pi-coding-agent--activity-render-record "pi-coding-agent-render" (record))
@@ -160,12 +161,13 @@
             (let* ((visible (eq (pi-coding-agent--thinking-display-mode) 'visible))
                    (expanded (or visible (pi-coding-agent--reading-turn-expanded turn)))
                    (running (eq (pi-coding-agent--reading-turn-state turn) 'running))
-                   (label (if running "working"
+                   (segmented (pi-coding-agent--segmented-progress-p))
+                   (label (if running (if segmented "思考记录" "working")
                             (format "%d thoughts"
                                     (length (pi-coding-agent--reading-turn-thoughts turn)))))
                    (position (point)))
               (insert (pi-coding-agent--activity-row-text
-                       (cond (expanded "▾") (running "◌") (t "▸"))
+                       (cond (expanded "▾") ((and running (not segmented)) "◌") (t "▸"))
                        'thinking label) "\n")
               (make-text-button position (1- (point))
                                 :type 'pi-coding-agent-activity-button
@@ -201,7 +203,8 @@
                         (text (apply #'concat (reverse pi-coding-agent--reading-chunks)))
                         (selected (eq (pi-coding-agent--reading-turn-selected turn) 'live)))
                     (insert "  " (pi-coding-agent--activity-row-text
-                                  (if selected "▾" "◌") 'thinking "working") "\n")
+                                  (cond (selected "▾") (segmented "▸") (t "◌"))
+                                  'thinking (if segmented "思考记录" "working")) "\n")
                     (make-text-button position (1- (point))
                                       :type 'pi-coding-agent-activity-button
                                       'action #'pi-coding-agent--reading-button
@@ -246,7 +249,7 @@
         (pi-coding-agent--reading-render turn)))))
 
 (defun pi-coding-agent--reading-thought-delta (delta)
-  "Collect DELTA without rewriting the stable collapsed working row."
+  "Collect DELTA without rewriting the stable collapsed thinking row."
   (push delta pi-coding-agent--reading-chunks)
   (when (string-match-p "[^ \t\r\n]" delta)
     (pi-coding-agent--reading-thought-anchor))
@@ -394,11 +397,14 @@ Formatting is read-only; state transitions happen in command and scroll hooks."
      (let ((position (point)) candidates target)
        (dolist (turn (reverse pi-coding-agent--reading-turns))
          (when-let* ((record (pi-coding-agent--activity-record-for-turn
-                             (pi-coding-agent--reading-turn-id turn)))
-                     (start (pi-coding-agent--activity-record-start-marker record)))
+                             (pi-coding-agent--reading-turn-id turn))))
            (dolist (tool (pi-coding-agent--activity-record-tools record))
              (when (eq (plist-get tool :status) 'failed)
-               (push (list record tool start) candidates)))))
+               (let* ((owner (or (pi-coding-agent--activity-record-for-tool
+                                  (plist-get tool :tool-call-id)) record))
+                      (start (pi-coding-agent--activity-record-start-marker owner)))
+                 (when start
+                   (push (list owner tool start) candidates)))))))
        (setq candidates (nreverse candidates))
        (let* ((current-id (get-text-property position 'pi-coding-agent-activity-tool-call-id))
               (current (seq-position candidates current-id

@@ -1814,5 +1814,18 @@ must decide whether this is a no-op."
     (should (equal (plist-get result :before-treesit-markdown-remap)
                    (plist-get result :after-treesit-markdown-remap)))))
 
+(ert-deftest pi-coding-agent-test-progress-session-setup-retains-effective-preference ()
+  "Session setup copies progress defaults once and preserves an existing choice."
+  (let ((pi-coding-agent-output-progress-display 'segmented)
+        (dir "/tmp/pi-progress-setup/"))
+    (pi-coding-agent-test-with-mock-session dir
+      (let ((chat (get-buffer (pi-coding-agent--buffer-name :chat dir))))
+        (with-current-buffer chat
+          (should (pi-coding-agent--segmented-progress-p))
+          (pi-coding-agent--set-output-progress-display 'legacy))
+        (should (eq (pi-coding-agent--setup-session dir) chat))
+        (with-current-buffer chat
+          (should-not (pi-coding-agent--segmented-progress-p)))))))
+
 (provide 'pi-coding-agent-test)
 ;;; pi-coding-agent-test.el ends here

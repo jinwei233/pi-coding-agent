@@ -21,6 +21,7 @@
 (require 'ert)
 (require 'pi-coding-agent-gui-test-utils)
 (require 'pi-coding-agent-test-common)
+(require 'pi-coding-agent-progress-gui-test)
 (load (expand-file-name
        "fixtures/viewport-baseline.el"
        (file-name-directory (or load-file-name buffer-file-name)))

@@ -3256,5 +3256,232 @@ Binds `chat-win' and `input-win' for use in BODY."
       (should (= pi-coding-agent--tail-settle-count (1+ before)))
       (should-not (pi-coding-agent--viewport-state-dirty-reason state)))))
 
+;;; Cached Fixed Progress
+
+(ert-deftest pi-coding-agent-test-progress-default-and-effective-preferences ()
+  "Progress defaults to legacy, independently of tool and thinking preferences."
+  (should (eq (eval (car (get 'pi-coding-agent-output-progress-display
+                            'standard-value)) t) 'legacy))
+  (let ((pi-coding-agent-output-progress-display 'segmented)
+        (pi-coding-agent-tool-activity-display 'summary)
+        (pi-coding-agent-thinking-display 'visible))
+    (with-temp-buffer
+      (pi-coding-agent-chat-mode)
+      (should (pi-coding-agent--segmented-progress-p))
+      (should (eq pi-coding-agent--tool-activity-display 'summary))
+      (should (eq (pi-coding-agent--thinking-display-mode) 'visible))
+      (let ((pi-coding-agent-output-progress-display 'legacy))
+        (pi-coding-agent--reset-session-state)
+        (should (pi-coding-agent--segmented-progress-p))
+        (pi-coding-agent--set-output-progress-display 'legacy)
+        (should-not (pi-coding-agent--segmented-progress-p))))))
+
+(ert-deftest pi-coding-agent-test-progress-semantic-cache-no-io ()
+  "Equal deltas neither resample the clock nor redraw, and display has no IO."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--set-output-progress-display 'segmented)
+    (let ((clock 10.0) (samples 0) (redraws 0))
+      (cl-letf (((symbol-function 'float-time)
+                 (lambda (&rest _) (cl-incf samples) clock))
+                ((symbol-function 'force-mode-line-update)
+                 (lambda (&rest _) (cl-incf redraws)))
+                ((symbol-function 'pi-coding-agent--refresh-header)
+                 (lambda (&rest _) (ert-fail "stats refresh")))
+                ((symbol-function 'pi-coding-agent--rpc-async)
+                 (lambda (&rest _) (ert-fail "RPC")))
+                ((symbol-function 'run-at-time)
+                 (lambda (&rest _) (ert-fail "timer")))
+                ((symbol-function 'run-with-timer)
+                 (lambda (&rest _) (ert-fail "timer"))))
+        (pi-coding-agent--progress-start)
+        (setq clock 12.0)
+        (pi-coding-agent--set-activity-phase "replying")
+        (should (= (pi-coding-agent--progress-elapsed) 2.0))
+        (let ((before-samples samples) (before-redraws redraws))
+          (dotimes (_ 100)
+            (pi-coding-agent--set-activity-phase "replying")
+            (pi-coding-agent--update-progress nil))
+          (should (= before-samples samples))
+          (cl-letf (((symbol-function 'insert-file-contents)
+                     (lambda (&rest _) (ert-fail "file IO")))
+                    ((symbol-function 'call-process)
+                     (lambda (&rest _) (ert-fail "process IO")))
+                    ((symbol-function 'window-start)
+                     (lambda (&rest _) (ert-fail "display position"))))
+            ;; Installing primitive mocks can itself consult the clock on
+            ;; native-comp builds.  Snapshot after installation, not before.
+            (let ((display-samples samples))
+              (pi-coding-agent--header-line-string)
+              (pi-coding-agent--output-progress-mode-line-string)
+              (pi-coding-agent--progress-string 20)
+              (pi-coding-agent--progress-elapsed)
+              (should (= display-samples samples))))
+          (should (= before-redraws redraws)))))))
+
+(ert-deftest pi-coding-agent-test-progress-running-priority-and-bounded-label ()
+  "Parallel running counts beat text phase; terminal and compact clear running."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--progress-start)
+    (pi-coding-agent--set-activity-phase "thinking")
+    (pi-coding-agent--update-progress
+     '(:calls 3 :started 2 :completed 0 :running 2 :failed 1))
+    (should (equal (pi-coding-agent--progress-phase) "running"))
+    (should (string-match-p "2 running" (pi-coding-agent--progress-string)))
+    (pi-coding-agent--set-activity-phase "replying")
+    (should (equal (pi-coding-agent--progress-phase) "running"))
+    (pi-coding-agent--update-progress
+     '(:calls 3 :started 2 :completed 1 :running 1 :failed 1)
+     (make-string 1000 ?x))
+    (should (<= (string-width pi-coding-agent--progress-running-label) 40))
+    (pi-coding-agent--set-activity-phase "compact")
+    (should (equal (pi-coding-agent--progress-phase) "compact"))
+    (should-not pi-coding-agent--progress-running-label)
+    (should (= (plist-get pi-coding-agent--progress-aggregate :running) 0))
+    (pi-coding-agent--progress-finish)
+    (should (equal (pi-coding-agent--progress-phase) "done"))
+    (should-not (string-match-p "running" (pi-coding-agent--progress-string)))))
+
+(ert-deftest pi-coding-agent-test-progress-elapsed-retry-terminal-and-reset ()
+  "Elapsed includes waiting/retry, freezes on abort/error, and resets for history."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (let ((clock 100.0))
+      (cl-letf (((symbol-function 'float-time) (lambda (&rest _) clock)))
+        (pi-coding-agent--progress-start)
+        (setq clock 103.0)
+        (pi-coding-agent--set-activity-phase "thinking")
+        (should (= (pi-coding-agent--progress-elapsed) 3.0))
+        (pi-coding-agent--progress-finish "error")
+        (setq clock 105.0)
+        (pi-coding-agent--progress-resume)
+        (should (= pi-coding-agent--progress-origin 100.0))
+        (should (= (pi-coding-agent--progress-elapsed) 5.0))
+        (pi-coding-agent--update-progress
+         '(:calls 2 :completed 0 :running 2 :failed 1))
+        (setq clock 108.0)
+        (pi-coding-agent--set-aborted t)
+        (should (= (pi-coding-agent--progress-elapsed) 8.0))
+        (should (= (plist-get pi-coding-agent--progress-aggregate :running) 0))
+        (setq clock 110.0)
+        (pi-coding-agent--progress-finish "done")
+        (pi-coding-agent--set-activity-phase "idle")
+        (should (equal pi-coding-agent--progress-outcome "aborted"))
+        (should (= (pi-coding-agent--progress-elapsed) 8.0))
+        (pi-coding-agent--progress-reset)
+        (should-not (pi-coding-agent--progress-elapsed))
+        (should-not pi-coding-agent--progress-origin)
+        (should-not pi-coding-agent--progress-aggregate)
+        (pi-coding-agent--progress-start)
+        (should (= pi-coding-agent--progress-origin 110.0))
+        (setq clock 111.0)
+        (pi-coding-agent--progress-finish "error")
+        (pi-coding-agent--progress-finish "done")
+        (should (equal pi-coding-agent--progress-outcome "error"))
+        (should (= (pi-coding-agent--progress-elapsed) 1.0))))))
+
+(ert-deftest pi-coding-agent-test-progress-pending-submission-cleanup ()
+  "Pending steering survives done, but reset, abort, and errors clear it."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (dolist (outcome '("aborted" "error"))
+      (pi-coding-agent--progress-start)
+      (setq pi-coding-agent--progress-pending-prompt
+            pi-coding-agent--progress-origin)
+      (pi-coding-agent--progress-submit-steer "next")
+      (pi-coding-agent--progress-finish outcome)
+      (should-not pi-coding-agent--progress-pending-prompt)
+      (should-not pi-coding-agent--progress-pending-steers))
+    (pi-coding-agent--progress-start)
+    (pi-coding-agent--progress-submit-steer "next")
+    (pi-coding-agent--progress-reset)
+    (should-not pi-coding-agent--progress-pending-steers)))
+
+(ert-deftest pi-coding-agent-test-progress-process-detach-and-kill-cleanup ()
+  "Process detach freezes error; buffer teardown clears only its own progress."
+  (pi-coding-agent-test-with-mock-session "/tmp/pi-progress-cleanup/"
+    (let ((chat (get-buffer (pi-coding-agent--buffer-name
+                             :chat "/tmp/pi-progress-cleanup/")))
+          (other (generate-new-buffer " *pi-progress-other*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer other
+              (pi-coding-agent-chat-mode)
+              (pi-coding-agent--progress-start))
+            (with-current-buffer chat
+              (pi-coding-agent--progress-start)
+              (setq pi-coding-agent--process 'mock-proc)
+              (pi-coding-agent--set-process nil)
+              (should (equal pi-coding-agent--progress-outcome "error"))
+              (should-not pi-coding-agent--progress-active)
+              (pi-coding-agent--set-activity-phase "idle" 'teardown t)
+              (should-not pi-coding-agent--progress-origin)
+              (should-not pi-coding-agent--progress-elapsed-cache)
+              (should-not pi-coding-agent--progress-outcome))
+            (kill-buffer chat)
+            (with-current-buffer other
+              (should pi-coding-agent--progress-active)
+              (should pi-coding-agent--progress-origin)))
+        (when (buffer-live-p other) (kill-buffer other))))))
+
+(ert-deftest pi-coding-agent-test-progress-narrow-failure-help-and-identity ()
+  "Narrow progress preserves failure and full help; wide headers retain identity."
+  (with-temp-buffer
+    (pi-coding-agent-chat-mode)
+    (pi-coding-agent--set-output-progress-display 'segmented)
+    (setq pi-coding-agent--state '(:model (:name "claude-sonnet")
+                                  :thinking-level "high")
+          pi-coding-agent--cached-stats '(:cost 1.0)
+          pi-coding-agent--session-name "my-session")
+    (pi-coding-agent--progress-start)
+    (pi-coding-agent--set-activity-phase "running")
+    (pi-coding-agent--update-progress
+     '(:calls 4 :completed 2 :running 2 :failed 1))
+    (let ((tiny (pi-coding-agent--progress-string 2)))
+      (should (<= (string-width tiny) 2))
+      (should (string-prefix-p "!" tiny))
+      (should (string-match-p "1 call failed" (get-text-property 0 'help-echo tiny)))
+      (should (string-match-p "2/4 calls" (get-text-property 0 'help-echo tiny))))
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 180)))
+      (let ((header (pi-coding-agent--header-line-string)))
+        (should (string-match-p "sonnet" header))
+        (should (string-match-p "session.*my-session" header))
+        (should (string-match-p "running" header))))
+    (cl-letf (((symbol-function 'window-body-width) (lambda (&rest _) 15)))
+      (let ((header (pi-coding-agent--header-line-string)))
+        (should (<= (string-width header) 15))
+        (should (string-prefix-p "!1" header))
+        (should (string-match-p "my-session" (get-text-property 0 'help-echo header)))))))
+
+(ert-deftest pi-coding-agent-test-progress-frame-placement-and-association-guards ()
+  "Placement uses the evaluated frame and never follows a stale Input link."
+  (pi-coding-agent-test-with-mock-session "/tmp/pi-progress-placement/"
+    (let* ((chat (get-buffer (pi-coding-agent--buffer-name
+                             :chat "/tmp/pi-progress-placement/")))
+           (input (buffer-local-value 'pi-coding-agent--input-buffer chat))
+           (mode-line-window (selected-window))
+           (expected-frame (window-frame mode-line-window))
+           (visible t) (redrawn nil))
+      (with-current-buffer chat
+        (pi-coding-agent--set-output-progress-display 'segmented)
+        (pi-coding-agent--progress-start)
+        (cl-letf (((symbol-function 'get-buffer-window)
+                   (lambda (buffer frame)
+                     (should (eq buffer input))
+                     (should (eq frame expected-frame))
+                     (and visible mode-line-window))))
+          (should-not (pi-coding-agent--output-progress-mode-line-string))
+          (setq visible nil)
+          (should (stringp (pi-coding-agent--output-progress-mode-line-string))))
+        (with-current-buffer input (pi-coding-agent--set-chat-buffer nil))
+        (cl-letf (((symbol-function 'force-mode-line-update)
+                   (lambda (&rest _) (push (current-buffer) redrawn))))
+          (pi-coding-agent--set-activity-phase "thinking"))
+        (should (equal redrawn (list chat))))
+      (with-current-buffer input
+        (should-not (pi-coding-agent--progress-chat-buffer))
+        (should-not (pi-coding-agent--update-progress '(:calls 99)))))))
+
 (provide 'pi-coding-agent-ui-test)
 ;;; pi-coding-agent-ui-test.el ends here

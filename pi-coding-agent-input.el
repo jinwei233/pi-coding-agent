@@ -1047,6 +1047,7 @@ Works while sending, streaming, or compacting."
           (with-current-buffer chat-buf
             (pi-coding-agent--set-aborted t)))
         (with-current-buffer chat-buf
+          (pi-coding-agent--progress-finish "aborted")
           (unless (pi-coding-agent--restore-followup-queue-to-input)
             (message "Pi: Follow-up recovery is pending because the input buffer is unavailable")))
         (when-let* ((proc (pi-coding-agent--get-process)))
@@ -1307,15 +1308,19 @@ Shows error message if RPC fails."
          (message (plist-get envelope :text))
          (images (plist-get envelope :images))
          (rpc-images (plist-get envelope :rpc-images))
-         (proc (pi-coding-agent--get-process)))
+         (proc (pi-coding-agent--get-process))
+         (chat (pi-coding-agent--progress-chat-buffer)))
     (if (and proc (process-live-p proc))
-        (progn
+        (let ((entry (pi-coding-agent--progress-submit-steer message)))
           (pi-coding-agent--rpc-async proc
                                       (append (list :type "steer" :message message)
                                               (when images
                                                 (list :images (vconcat rpc-images))))
                                       (lambda (response)
                                         (unless (eq (plist-get response :success) t)
+                                          (when (buffer-live-p chat)
+                                            (with-current-buffer chat
+                                              (pi-coding-agent--progress-reject-steer entry)))
                                           (message "Pi: Steering failed: %s"
                                                    (or (plist-get response :error) "unknown error")))))
           t)

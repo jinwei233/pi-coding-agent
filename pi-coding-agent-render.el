@@ -210,6 +210,18 @@ Nil means use `pi-coding-agent-tool-activity-display'.")
     pi-coding-agent--last-table-display-width
     pi-coding-agent--table-decoration-pending
     pi-coding-agent--tool-activity-display
+    pi-coding-agent--output-progress-display
+    pi-coding-agent--progress-aggregate
+    pi-coding-agent--progress-running-label
+    pi-coding-agent--progress-origin
+    pi-coding-agent--progress-active
+    pi-coding-agent--progress-elapsed-cache
+    pi-coding-agent--progress-outcome
+    pi-coding-agent--progress-cache
+    pi-coding-agent--progress-parts
+    pi-coding-agent--progress-help
+    pi-coding-agent--progress-pending-prompt
+    pi-coding-agent--progress-pending-steers
     pi-coding-agent--activity-table
     pi-coding-agent--tool-activity-index
     pi-coding-agent--activity-turn-counter
@@ -664,13 +676,16 @@ Return `(RESULT . CLOSED)' while preserving whitespace outside that line."
           pi-coding-agent--in-code-block nil
           pi-coding-agent--line-parse-state 'line-start)))
 
-(defun pi-coding-agent--display-message-delta (delta)
+(defun pi-coding-agent--display-message-delta (delta &optional canonical-p)
   "Display streaming message DELTA at the streaming marker.
+CANONICAL-P means source-order boundary handling already used message evidence.
 Transforms ATX headings (outside code blocks) by adding one # level
 to keep our setext H1 separators as the top-level document structure.
 Modification hooks fire normally so jit-lock marks inserted text for
 fontification; tree-sitter re-parses at the C level on each insert."
   (when (and delta pi-coding-agent--streaming-marker)
+    (unless canonical-p
+      (pi-coding-agent--activity-text-boundary delta t))
     (pi-coding-agent--reading-text delta)
     (let* ((delta (pi-coding-agent--render-safe-string delta))
            ;; Wrapper probing owns blank margins; plain output keeps trimming.
@@ -764,15 +779,28 @@ CUE-FACE defaults to `pi-coding-agent-activity-label'."
             content)
          (concat " " content))))))
 
+(declare-function pi-coding-agent--segmented-progress-p "pi-coding-agent-ui")
+(declare-function pi-coding-agent--progress-accept-user "pi-coding-agent-ui"
+                  (&optional canonical-text local-echo))
+(declare-function pi-coding-agent--update-progress "pi-coding-agent-ui"
+                  (aggregate &optional running-label))
+(declare-function pi-coding-agent--progress-reset "pi-coding-agent-ui")
+(declare-function pi-coding-agent--progress-finish "pi-coding-agent-ui" (&optional outcome))
+(declare-function pi-coding-agent--progress-resume "pi-coding-agent-ui")
+
 (defun pi-coding-agent--thinking-live-stub ()
   "Return the stable folded live-thinking stub."
-  (pi-coding-agent--activity-row-text
-   pi-coding-agent--activity-live-cue
-   'thinking
-   (propertize "working"
-               'font-lock-face
-               'pi-coding-agent-activity-running)
-   'pi-coding-agent-activity-running))
+  (if (pi-coding-agent--segmented-progress-p)
+      (pi-coding-agent--activity-row-text
+       "▸" 'thinking
+       (propertize "思考记录" 'font-lock-face 'pi-coding-agent-activity-summary))
+    (pi-coding-agent--activity-row-text
+     pi-coding-agent--activity-live-cue
+     'thinking
+     (propertize "working"
+                 'font-lock-face
+                 'pi-coding-agent-activity-running)
+     'pi-coding-agent-activity-running)))
 
 (defun pi-coding-agent--thinking-hidden-stub (normalized)
   "Return the collapsed completed-thinking stub for NORMALIZED.
@@ -1836,7 +1864,10 @@ which asks upfront before any buffers are touched."
     (when-let* ((chat-buf (process-get process 'pi-coding-agent-chat-buffer)))
       (when (buffer-live-p chat-buf)
         (with-current-buffer chat-buf
-          (pi-coding-agent--handle-display-event event))))))
+          ;; Transition processes may finish guarded RPC callbacks, but only
+          ;; the associated live process owns transcript and progress events.
+          (when (eq process pi-coding-agent--process)
+            (pi-coding-agent--handle-display-event event)))))))
 
 (defun pi-coding-agent--make-process-exit-handler (process)
   "Create a frontend cleanup handler for PROCESS exit."
@@ -1884,13 +1915,32 @@ which asks upfront before any buffers are touched."
     ;; Reset so next assistant message shows its header
     (setq pi-coding-agent--assistant-header-shown nil)))
 
+(defun pi-coding-agent--activity-execution-current-p (event)
+  "Return whether execution EVENT is new semantic work in the current turn.
+An old owner or an already running/completed start cannot publish phase.
+Completed duplicate ends may refine their original record, but not live state."
+  (let* ((id (plist-get event :toolCallId))
+         (owner (pi-coding-agent--activity-record-for-tool id))
+         (tool (and owner (pi-coding-agent--activity-tool owner id)))
+         (status (plist-get tool :status)))
+    (and (or (null owner)
+             (equal (pi-coding-agent--activity-record-turn-id owner)
+                    pi-coding-agent--current-activity-turn))
+         (if (equal (plist-get event :type) "tool_execution_start")
+             (not (memq status '(running succeeded failed)))
+           (not (memq status '(succeeded failed)))))))
+
 (defun pi-coding-agent--handle-display-event (event)
   "Handle EVENT for display purposes.
 Updates buffer-local state and renders display updates."
   ;; Update state first (now buffer-local)
-  (pi-coding-agent--update-state-from-event event)
-  (when (or (member (plist-get event :type)
-                    '("tool_execution_start" "tool_execution_update" "tool_execution_end"))
+  (when (or (not (member (plist-get event :type)
+                        '("tool_execution_start" "tool_execution_update" "tool_execution_end")))
+            (pi-coding-agent--activity-execution-current-p event))
+    (pi-coding-agent--update-state-from-event event))
+  (when (or (and (member (plist-get event :type)
+                         '("tool_execution_start" "tool_execution_update" "tool_execution_end"))
+                (pi-coding-agent--activity-execution-current-p event))
             (and (equal (plist-get event :type) "message_update")
                  (member (plist-get (plist-get event :assistantMessageEvent) :type)
                          '("text_delta" "thinking_delta" "toolcall_start"
@@ -1920,6 +1970,10 @@ Updates buffer-local state and renders display updates."
                  (display-text (when content
                                  (pi-coding-agent--extract-user-message-display content)))
                  (local-msg pi-coding-agent--local-user-message))
+            ;; Consume submitted request timing even for slash-expanded user
+            ;; echoes; steering switches progress only at its canonical turn.
+            (when display-text
+              (pi-coding-agent--progress-accept-user text local-msg))
             ;; Clear local tracking
             (setq pi-coding-agent--local-user-message nil)
             ;; Display if: no local message, OR pi's message differs (expanded template)
@@ -1938,6 +1992,7 @@ Updates buffer-local state and renders display updates."
          (_
           ;; Assistant message - show header if needed, reset markers
           (pi-coding-agent--reading-message-start)
+          (pi-coding-agent--activity-reset-canonical-cursor)
           (pi-coding-agent--reset-assistant-markdown-state)
           (setq pi-coding-agent--streaming-table-candidate nil)
           (unless pi-coding-agent--assistant-header-shown
@@ -1953,8 +2008,17 @@ Updates buffer-local state and renders display updates."
           (pi-coding-agent--finish-assistant-text)
           (pi-coding-agent--reset-assistant-markdown-state))
          ("text_delta"
-          (pi-coding-agent--set-activity-phase "replying")
-          (pi-coding-agent--display-message-delta (plist-get msg-event :delta)))
+          (let* ((message (plist-get event :message))
+                 (index (plist-get msg-event :contentIndex))
+                 (blocks (pi-coding-agent--content-block-list
+                          (plist-get message :content)))
+                 (canonical-p (and (integerp index) (>= index 0)
+                                   (equal (plist-get (nth index blocks) :type) "text"))))
+            (when (and canonical-p (pi-coding-agent--segmented-progress-p))
+              (pi-coding-agent--activity-reconcile-canonical message index))
+            (pi-coding-agent--set-activity-phase "replying")
+            (pi-coding-agent--display-message-delta
+             (plist-get msg-event :delta) canonical-p)))
          ("text_end"
           ;; Text block ended — finalize any active table that may have
           ;; a trailing row without newline (backstop for streaming).
@@ -1982,6 +2046,7 @@ Updates buffer-local state and renders display updates."
          ("error"
           ;; Error during streaming (e.g., API error)
           (pi-coding-agent--finish-assistant-text)
+          (pi-coding-agent--progress-finish "error")
           (pi-coding-agent--display-error (plist-get msg-event :reason))))))
     ("message_end"
      (let* ((message (plist-get event :message))
@@ -1994,6 +2059,7 @@ Updates buffer-local state and renders display updates."
                 (pi-coding-agent--reading-current)) 'interrupted))
        ;; Display error if message ended with error (e.g., API error)
        (when (equal (plist-get message :stopReason) "error")
+         (pi-coding-agent--progress-finish "error")
          (pi-coding-agent--display-error (plist-get message :errorMessage)))
        ;; Text arrives incrementally, while native image blocks are complete
        ;; only on message_end.
@@ -2014,8 +2080,9 @@ Updates buffer-local state and renders display updates."
          (pi-coding-agent--refresh-header)))
      (pi-coding-agent--render-complete-message))
     ("tool_execution_start"
-     (pi-coding-agent--finish-assistant-text)
-     (pi-coding-agent--set-activity-phase "running")
+     (when (pi-coding-agent--activity-execution-current-p event)
+       (pi-coding-agent--finish-assistant-text)
+       (pi-coding-agent--set-activity-phase "running"))
      (let* ((tool-call-id (plist-get event :toolCallId))
             (args (plist-get event :args))
             (block (pi-coding-agent--tool-block-get tool-call-id)))
@@ -2024,7 +2091,10 @@ Updates buffer-local state and renders display updates."
          (puthash tool-call-id args pi-coding-agent--tool-args-cache))
        (if (pi-coding-agent--tool-activity-grouped-mode-p)
            (pi-coding-agent--activity-start-tool
-            tool-call-id (plist-get event :toolName) args t)
+            tool-call-id (plist-get event :toolName) args t nil event)
+         (when (pi-coding-agent--segmented-progress-p)
+           (pi-coding-agent--activity-start-tool
+            tool-call-id (plist-get event :toolName) args t nil event))
          ;; Reuse the keyed preview block when it already exists.
          (unless block
            (setq block (pi-coding-agent--display-tool-start
@@ -2037,15 +2107,20 @@ Updates buffer-local state and renders display updates."
          (pi-coding-agent--tool-block-sync-path-metadata
           block (pi-coding-agent--tool-arg-path args)))))
     ("tool_execution_end"
-     (pi-coding-agent--set-activity-phase "thinking")
+     (when (pi-coding-agent--activity-execution-current-p event)
+       (pi-coding-agent--set-activity-phase "thinking"))
      (let* ((tool-call-id (plist-get event :toolCallId))
             (tool-name (plist-get event :toolName))
             (result (plist-get event :result))
             (block (pi-coding-agent--tool-block-get tool-call-id))
             ;; Retrieve cached args since tool_execution_end doesn't include args
-            (args (when (and tool-call-id pi-coding-agent--tool-args-cache)
-                    (prog1 (gethash tool-call-id pi-coding-agent--tool-args-cache)
-                      (remhash tool-call-id pi-coding-agent--tool-args-cache)))))
+            (args (or (when (and tool-call-id pi-coding-agent--tool-args-cache)
+                        (prog1 (gethash tool-call-id pi-coding-agent--tool-args-cache)
+                          (remhash tool-call-id pi-coding-agent--tool-args-cache)))
+                      (plist-get
+                       (plist-get (pi-coding-agent--resolve-tool-detail-pair
+                                   tool-call-id) :tool-call)
+                       :arguments))))
        (when (and tool-call-id pi-coding-agent--transient-tool-pairs)
          (puthash
           tool-call-id
@@ -2065,7 +2140,11 @@ Updates buffer-local state and renders display updates."
             (plist-get result :content)
             (plist-get result :details)
             (plist-get event :isError)
-            t)
+            t event)
+         (when (pi-coding-agent--segmented-progress-p)
+           (pi-coding-agent--activity-finish-tool
+            tool-call-id tool-name args (plist-get result :content)
+            (plist-get result :details) (plist-get event :isError) t event))
          (pi-coding-agent--display-tool-end tool-name
                                             args
                                             (plist-get result :content)
@@ -2106,11 +2185,13 @@ Updates buffer-local state and renders display updates."
        (pi-coding-agent--cool-completed-tool-blocks-outside-hot-tail))
      (pi-coding-agent--schedule-parser-reconciliation))
     ("auto_retry_start"
+     (pi-coding-agent--progress-resume)
      (pi-coding-agent--cancel-followup-drain-timer)
      (pi-coding-agent--display-retry-start event))
     ("auto_retry_end"
      (pi-coding-agent--display-retry-end event)
      (unless (eq (plist-get event :success) t)
+       (pi-coding-agent--progress-finish "error")
        (pi-coding-agent--set-activity-phase "idle")
        (pi-coding-agent--restore-followup-queue-to-input)))
     ("extension_error"
@@ -3084,13 +3165,18 @@ streaming state changed."
                                             (plist-get (plist-get entry :tool-call) :id))
                                           entries))))
     (if (pi-coding-agent--tool-activity-grouped-mode-p)
-        (dolist (entry entries)
-          (let ((tool-call (plist-get entry :tool-call)))
-            (pi-coding-agent--activity-start-tool
-             (plist-get tool-call :id)
-             (plist-get tool-call :name)
-             (plist-get tool-call :arguments)
-             t)))
+        (if (pi-coding-agent--segmented-progress-p)
+            (pi-coding-agent--activity-reconcile-canonical
+             message event-content-index)
+          (dolist (entry entries)
+            (let ((tool-call (plist-get entry :tool-call)))
+              (pi-coding-agent--activity-start-tool
+               (plist-get tool-call :id)
+               (plist-get tool-call :name)
+               (plist-get tool-call :arguments)
+               t))))
+      (when (pi-coding-agent--segmented-progress-p)
+        (pi-coding-agent--activity-reconcile-canonical message event-content-index))
       (pi-coding-agent--prune-stale-toolcall-previews tool-call-ids)
       (dolist (entry entries)
         (pi-coding-agent--reconcile-toolcall-preview-block
@@ -3477,8 +3563,14 @@ if none exists, render the result at point without a live overlay."
 (cl-defstruct (pi-coding-agent--activity-record
                (:constructor pi-coding-agent--make-activity-record))
   turn-id
+  segment-ordinal
+  segments
+  current-segment
+  (tool-segments (make-hash-table :test 'equal))
+  (canonical-index 0)
   start-marker
   end-marker
+  rendered-text
   history-dirty
   expanded
   live
@@ -3486,6 +3578,11 @@ if none exists, render the result at point without a live overlay."
   tools
   calls
   running
+  (started 0)
+  (completed 0)
+  (bash 0)
+  (mcp 0)
+  (other 0)
   failed
   file-counts
   added
@@ -3562,7 +3659,95 @@ The former `hidden' value is a compatibility alias for `grouped'."
              (hash-table-p pi-coding-agent--tool-activity-index))
     (when-let* ((turn-id
                  (gethash tool-call-id pi-coding-agent--tool-activity-index)))
-      (pi-coding-agent--activity-record-for-turn turn-id))))
+      (let ((turn (pi-coding-agent--activity-record-for-turn turn-id)))
+        (or (gethash tool-call-id
+                     (pi-coding-agent--activity-record-tool-segments turn))
+            turn)))))
+
+(defun pi-coding-agent--activity-projections (turn)
+  "Return TURN's projected records, without changing its identity."
+  (or (pi-coding-agent--activity-record-segments turn) (list turn)))
+
+(defun pi-coding-agent--activity-own-tool (turn tool-call-id)
+  "Return the projection owning TOOL-CALL-ID, allocating in TURN if needed."
+  (if (not (and (pi-coding-agent--segmented-progress-p)
+                (pi-coding-agent--tool-activity-grouped-mode-p)))
+      turn
+    (or (gethash tool-call-id (pi-coding-agent--activity-record-tool-segments turn))
+        (let ((segment
+               (or (pi-coding-agent--activity-record-current-segment turn)
+                   (let ((new (pi-coding-agent--make-activity-record
+                               :turn-id (pi-coding-agent--activity-record-turn-id turn)
+                               :segment-ordinal
+                               (1+ (length (pi-coding-agent--activity-record-segments turn)))
+                               :calls 0 :failed 0 :added 0 :removed 0
+                               :test-passed 0 :test-failed 0
+                               :file-counts (make-hash-table :test 'equal))))
+                     (setf (pi-coding-agent--activity-record-segments turn)
+                           (append (pi-coding-agent--activity-record-segments turn)
+                                   (list new))
+                           (pi-coding-agent--activity-record-current-segment turn) new)
+                     new))))
+          (puthash tool-call-id segment
+                   (pi-coding-agent--activity-record-tool-segments turn))
+          segment))))
+
+(defun pi-coding-agent--activity-publish-progress (turn)
+  "Publish authoritative TURN counts for a live semantic event."
+  (when (and (pi-coding-agent--segmented-progress-p)
+             (equal (pi-coding-agent--activity-record-turn-id turn)
+                    pi-coding-agent--current-activity-turn)
+             (not (pi-coding-agent--history-postprocessing-deferred-p)))
+    (let* ((aggregate (pi-coding-agent--activity-aggregates turn))
+           (running (plist-get aggregate :running)))
+      (pi-coding-agent--update-progress
+       aggregate (and (= (length running) 1) (car running))))))
+
+(defun pi-coding-agent--activity-text-boundary (text &optional live)
+  "Close the current tool segment for nonblank canonical TEXT.
+LIVE requests an event-sampled progress update; history only flushes its row."
+  (when (and (pi-coding-agent--segmented-progress-p)
+             (stringp text) (string-match-p "[^[:space:]]" text)
+             pi-coding-agent--current-activity-turn)
+    (when-let* ((turn (pi-coding-agent--activity-record-for-turn
+                      pi-coding-agent--current-activity-turn))
+                (segment (pi-coding-agent--activity-record-current-segment turn)))
+      (pi-coding-agent--activity-flush-history-record segment)
+      (setf (pi-coding-agent--activity-record-current-segment turn) nil)
+      (when live (pi-coding-agent--activity-publish-progress turn)))))
+
+(defun pi-coding-agent--activity-reset-canonical-cursor ()
+  "Reset the current message's canonical cursor, not its tool segment."
+  (when pi-coding-agent--current-activity-turn
+    (when-let* ((turn (pi-coding-agent--activity-record-for-turn
+                      pi-coding-agent--current-activity-turn)))
+      (setf (pi-coding-agent--activity-record-canonical-index turn) 0))))
+
+(defun pi-coding-agent--activity-reconcile-canonical (message &optional index)
+  "Assign new blocks in canonical MESSAGE through INDEX in source order.
+The existing preview reconciliation cursor avoids revisiting earlier text
+boundaries; repeated tool snapshots only refine pending call metadata."
+  (let* ((turn (pi-coding-agent--activity-record-for-turn
+                (pi-coding-agent--activity-current-turn) t))
+         (content (pi-coding-agent--content-block-list (plist-get message :content)))
+         (limit (min (length content) (if (integerp index) (1+ index) (length content))))
+         (cursor (pi-coding-agent--activity-record-canonical-index turn)))
+    (cl-loop for block in content for ordinal from 0 below limit do
+             (pcase (plist-get block :type)
+               ("text" (when (or (>= ordinal cursor)
+                                 (and (= ordinal (1- cursor))
+                                      (equal ordinal index)))
+                         ;; Revisit only the newest text block: whitespace
+                         ;; may acquire its first nonblank delta later.
+                         (pi-coding-agent--activity-text-boundary
+                          (plist-get block :text) t)))
+               ("toolCall"
+                (when (or (>= ordinal cursor) (equal ordinal index))
+                  (pi-coding-agent--activity-start-tool
+                   (plist-get block :id) (plist-get block :name)
+                   (plist-get block :arguments) t t block)))))
+    (setf (pi-coding-agent--activity-record-canonical-index turn)
+          (max cursor limit))))
 
 (defun pi-coding-agent--activity-tool (record tool-call-id)
   "Return TOOL-CALL-ID's lightweight record in activity RECORD."
@@ -3600,6 +3785,12 @@ The former `hidden' value is a compatibility alias for `grouped'."
       (puthash tool-call-id
                (pi-coding-agent--activity-record-turn-id record)
                pi-coding-agent--tool-activity-index))
+    ;; Turn records stay authoritative.  Segments share these same light plists.
+    (unless (pi-coding-agent--activity-record-segment-ordinal record)
+      (when-let* ((segment
+                   (gethash tool-call-id
+                            (pi-coding-agent--activity-record-tool-segments record))))
+        (pi-coding-agent--activity-put-tool segment tool)))
     tool))
 
 (defun pi-coding-agent--activity-adjust-file-count (record path delta &optional read)
@@ -3615,6 +3806,14 @@ The former `hidden' value is a compatibility alias for `grouped'."
 (defun pi-coding-agent--activity-adjust-aggregate (record tool delta)
   "Apply TOOL's aggregate contribution to RECORD using DELTA."
   (let ((tool-call-id (plist-get tool :tool-call-id)))
+    (unless (eq (plist-get tool :status) 'pending)
+      (cl-incf (pi-coding-agent--activity-record-started record) delta))
+    (when (memq (plist-get tool :status) '(succeeded failed))
+      (cl-incf (pi-coding-agent--activity-record-completed record) delta))
+    (pcase (plist-get tool :classification)
+      ('bash (cl-incf (pi-coding-agent--activity-record-bash record) delta))
+      ('mcp (cl-incf (pi-coding-agent--activity-record-mcp record) delta))
+      ('other (cl-incf (pi-coding-agent--activity-record-other record) delta)))
     (pcase (plist-get tool :status)
       ('running
        (if (> delta 0)
@@ -3667,11 +3866,31 @@ The former `hidden' value is a compatibility alias for `grouped'."
            (string-match-p "\\`\\(?:fail\\|failed\\|error\\)\\'" value))
       'failed))))
 
+(defun pi-coding-agent--activity-explicit-mcp-p (metadata)
+  "Return non-nil for explicit MCP type in direct METADATA."
+  (or (member (pi-coding-agent--tool-arg-get metadata :toolType) '("mcp" mcp))
+      (member (pi-coding-agent--tool-arg-get metadata :tool-type) '("mcp" mcp))
+      (eq (pi-coding-agent--tool-arg-get metadata :isMcp) t)))
+
+(defun pi-coding-agent--activity-classification (name metadata)
+  "Classify NAME from explicit METADATA, never from an MCP name prefix."
+  (cond
+   ((equal name "bash") 'bash)
+   ((or (pi-coding-agent--activity-explicit-mcp-p metadata)
+        (seq-some
+         (lambda (key)
+           (pi-coding-agent--activity-explicit-mcp-p
+            (pi-coding-agent--tool-arg-get metadata key)))
+         '(:metadata :registration :tool))) 'mcp)
+   ((member name '("read" "edit" "write")) 'file)
+   (t 'other)))
+
 (defun pi-coding-agent--activity-completed-tool-record
-    (tool-call-id tool-name args content details is-error)
+    (tool-call-id tool-name args content details is-error &optional metadata)
   "Build one completed lightweight activity record for TOOL-CALL-ID.
 TOOL-NAME and ARGS describe the call.  Full CONTENT and DETAILS remain in
-canonical or transient pair storage; IS-ERROR records completion status."
+canonical or transient pair storage; IS-ERROR records completion status.
+METADATA supplies explicit tool classification."
   (let* ((summary-record
           (pi-coding-agent--tool-summary-record
            tool-call-id tool-name args content details is-error))
@@ -3693,6 +3912,8 @@ canonical or transient pair storage; IS-ERROR records completion status."
     (let ((record
            (append
             (list :status (if (eq is-error t) 'failed 'succeeded)
+                  :classification (pi-coding-agent--activity-classification
+                                   tool-name metadata)
                   :path (plist-get path-metadata :path)
                   :raw-path (plist-get path-metadata :raw-path)
                   :path-error (plist-get path-metadata :path-error)
@@ -3706,8 +3927,9 @@ canonical or transient pair storage; IS-ERROR records completion status."
                  (pi-coding-agent--tool-activity-target-label record)))))
 
 (defun pi-coding-agent--activity-running-tool-record
-    (tool-call-id tool-name args)
-  "Build one running record for TOOL-CALL-ID, TOOL-NAME, and ARGS."
+    (tool-call-id tool-name args &optional metadata)
+  "Build one running record for TOOL-CALL-ID, TOOL-NAME, and ARGS.
+METADATA supplies explicit tool classification."
   (let* ((path-metadata
           (pi-coding-agent--tool-render-path-metadata
            (pi-coding-agent--tool-arg-path args)))
@@ -3716,6 +3938,8 @@ canonical or transient pair storage; IS-ERROR records completion status."
          (record (list :tool-call-id tool-call-id
                        :tool-name tool-name
                        :status 'running
+                       :classification (pi-coding-agent--activity-classification
+                                        tool-name metadata)
                        :path path
                        :raw-path (plist-get path-metadata :raw-path)
                        :path-error (plist-get path-metadata :path-error)
@@ -3734,6 +3958,11 @@ canonical or transient pair storage; IS-ERROR records completion status."
    :calls (pi-coding-agent--activity-record-calls record)
    :running (mapcar #'cdr
                     (pi-coding-agent--activity-record-running record))
+   :started (pi-coding-agent--activity-record-started record)
+   :completed (pi-coding-agent--activity-record-completed record)
+   :bash (pi-coding-agent--activity-record-bash record)
+   :mcp (pi-coding-agent--activity-record-mcp record)
+   :other (pi-coding-agent--activity-record-other record)
    :failed (pi-coding-agent--activity-record-failed record)
    :files
    (hash-table-count (pi-coding-agent--activity-record-file-counts record))
@@ -3751,6 +3980,10 @@ canonical or transient pair storage; IS-ERROR records completion status."
          (failed (plist-get aggregate :failed))
          (files (plist-get aggregate :files))
          (reads (plist-get aggregate :read))
+         (segmented (pi-coding-agent--segmented-progress-p))
+         (bash (plist-get aggregate :bash))
+         (mcp (plist-get aggregate :mcp))
+         (other (plist-get aggregate :other))
          (added (plist-get aggregate :added))
          (removed (plist-get aggregate :removed))
          (tests (plist-get aggregate :test-status))
@@ -3780,6 +4013,12 @@ canonical or transient pair storage; IS-ERROR records completion status."
                             'font-lock-face 'pi-coding-agent-activity-removed)
                 counts))
         (push (concat "ops " (string-join (nreverse counts) " ")) parts)))
+    (when (and segmented (> bash 0))
+      (push (propertize (format "%d command%s" bash (if (= bash 1) "" "s"))
+                        'font-lock-face 'pi-coding-agent-activity-summary) parts))
+    (when (and segmented (> mcp 0))
+      (push (propertize (format "MCP %d" mcp)
+                        'font-lock-face 'pi-coding-agent-activity-summary) parts))
     (when (> reads 0)
       (push (propertize (format "read %d" reads)
                         'font-lock-face 'pi-coding-agent-activity-summary) parts))
@@ -3788,11 +4027,14 @@ canonical or transient pair storage; IS-ERROR records completion status."
        (push (propertize "tests passed"
                          'font-lock-face 'success)
              parts)))
-    (when running
+    (when (and running (not segmented))
       (push (propertize
              (format "running %s" (car running))
              'font-lock-face 'pi-coding-agent-activity-running)
             parts))
+    (when (and segmented (> other 0))
+      (push (propertize (format "%d other" other)
+                        'font-lock-face 'pi-coding-agent-activity-summary) parts))
     (push (propertize (format "%d call%s" calls (if (= calls 1) "" "s"))
                       'font-lock-face 'pi-coding-agent-activity-summary)
           parts)
@@ -3808,21 +4050,23 @@ canonical or transient pair storage; IS-ERROR records completion status."
 
 (defun pi-coding-agent--activity-group-text (record)
   "Return the one-line group text for activity RECORD."
-  (let* ((cue (cond
+  (let* ((legacy-live (and (pi-coding-agent--activity-record-live record)
+                           (not (pi-coding-agent--segmented-progress-p))))
+         (cue (cond
                ((pi-coding-agent--activity-record-expanded record) "▾")
-               ((pi-coding-agent--activity-record-live record)
+               (legacy-live
                 pi-coding-agent--activity-live-cue)
                (t "▸")))
          (cue-face
           (cond
-           ((pi-coding-agent--activity-record-live record)
+           (legacy-live
             'pi-coding-agent-activity-running)
            ((or (> (pi-coding-agent--activity-record-failed record) 0)
                 (> (pi-coding-agent--activity-record-test-failed record) 0))
             'pi-coding-agent-activity-failed)
            (t 'pi-coding-agent-activity-label)))
          (parts
-          (if (pi-coding-agent--activity-record-live record)
+          (if legacy-live
               (list (propertize "working"
                                 'font-lock-face
                                 'pi-coding-agent-activity-running))
@@ -3856,7 +4100,7 @@ canonical or transient pair storage; IS-ERROR records completion status."
     (when (and (or (> (pi-coding-agent--activity-record-failed record) 0)
                    (> (pi-coding-agent--activity-record-test-failed record) 0))
                (not content)
-               (not (pi-coding-agent--activity-record-live record)))
+               (not legacy-live))
       (setq result (if (>= budget 6) "failed" "!")))
     (propertize (truncate-string-to-width result budget nil nil "…")
                 'help-echo (string-join parts " · "))))
@@ -3923,11 +4167,12 @@ canonical or transient pair storage; IS-ERROR records completion status."
      text (pi-coding-agent--activity-line-budget) nil nil "…")))
 
 (defun pi-coding-agent--activity-propertize-region
-    (start end turn-id &optional tool-call-id kind)
-  "Attach TURN-ID and optional TOOL-CALL-ID and KIND to START..END."
+    (start end turn-id &optional tool-call-id kind segment)
+  "Attach TURN-ID, TOOL-CALL-ID, KIND and SEGMENT to START..END."
   (add-text-properties
    start end
    `(pi-coding-agent-activity-turn ,turn-id
+     pi-coding-agent-activity-segment ,segment
      pi-coding-agent-activity-kind ,kind
      pi-coding-agent-activity-tool-call-id ,tool-call-id)))
 
@@ -3982,7 +4227,7 @@ each source line."
        start (point)
        (pi-coding-agent--activity-record-turn-id record)
        (plist-get tool :tool-call-id)
-       'detail)
+       'detail (pi-coding-agent--activity-record-segment-ordinal record))
       (pi-coding-agent--activity-propertize-detail-lines
        start (point) tool 4))))
 
@@ -4011,7 +4256,9 @@ each source line."
                 end-marker))
         (let ((group-start (point))
               (turn-id (pi-coding-agent--activity-record-turn-id record)))
-          (insert (pi-coding-agent--activity-group-text record) "\n")
+          (let ((text (pi-coding-agent--activity-group-text record)))
+            (setf (pi-coding-agent--activity-record-rendered-text record) text)
+            (insert text "\n"))
           (make-text-button
            group-start (point)
            :type 'pi-coding-agent-activity-button
@@ -4020,9 +4267,14 @@ each source line."
            'help-echo "TAB/RET/click: toggle tools"
            'pi-coding-agent-tool-toggle t
            'pi-coding-agent-activity-group t
-           'pi-coding-agent-activity-turn turn-id)
+           'pi-coding-agent-activity-turn turn-id
+           'pi-coding-agent-activity-segment
+           (pi-coding-agent--activity-record-segment-ordinal record)
+           'help-echo (concat (get-text-property group-start 'help-echo)
+                              "\nTAB/RET/click: toggle tools"))
           (pi-coding-agent--activity-propertize-region
-           group-start (point) turn-id nil 'group)
+           group-start (point) turn-id nil 'group
+           (pi-coding-agent--activity-record-segment-ordinal record))
           (when (pi-coding-agent--activity-record-expanded record)
             (dolist (tool (pi-coding-agent--activity-record-tools record))
               (let ((tool-start (point))
@@ -4040,9 +4292,12 @@ each source line."
                  'pi-coding-agent-tool-toggle t
                  'pi-coding-agent-activity-tool t
                  'pi-coding-agent-activity-turn turn-id
+                 'pi-coding-agent-activity-segment
+                 (pi-coding-agent--activity-record-segment-ordinal record)
                  'pi-coding-agent-activity-tool-call-id tool-call-id)
                 (pi-coding-agent--activity-propertize-region
-                 tool-start (point) turn-id tool-call-id 'tool)
+                 tool-start (point) turn-id tool-call-id 'tool
+                 (pi-coding-agent--activity-record-segment-ordinal record))
                 (when (equal
                        tool-call-id
                        (pi-coding-agent--activity-record-detail-tool-call-id
@@ -4064,7 +4319,11 @@ each source line."
   "Render RECORD when its current live projection needs visible refresh.
 Folded live groups remain byte-for-byte stable after their first display.
 Expanded groups continue to refresh their per-tool rows."
-  (when (or (pi-coding-agent--activity-record-expanded record)
+  (when (or (and (pi-coding-agent--segmented-progress-p)
+                 (not (equal-including-properties
+                       (pi-coding-agent--activity-group-text record)
+                       (pi-coding-agent--activity-record-rendered-text record))))
+            (pi-coding-agent--activity-record-expanded record)
             (not (pi-coding-agent--activity-record-rendered-p record)))
     (pi-coding-agent--activity-render-record record)))
 
@@ -4088,77 +4347,102 @@ Expanded groups continue to refresh their per-tool rows."
              (and pi-coding-agent--current-activity-turn
                   (pi-coding-agent--activity-record-for-turn
                    pi-coding-agent--current-activity-turn)))))
-    (when (and record
-               (pi-coding-agent--activity-record-history-dirty record))
-      (setf (pi-coding-agent--activity-record-history-dirty record) nil)
-      (pi-coding-agent--activity-render-record record))))
+    (when record
+      (dolist (projection (pi-coding-agent--activity-projections record))
+        (when (pi-coding-agent--activity-record-history-dirty projection)
+          (setf (pi-coding-agent--activity-record-history-dirty projection) nil)
+          (pi-coding-agent--activity-render-record projection))))))
 
-(defun pi-coding-agent--activity-start-tool
-    (tool-call-id tool-name args &optional live)
-  "Add or update grouped TOOL-CALL-ID with TOOL-NAME and ARGS.
-When LIVE is non-nil, keep a folded projection stable until agent end."
-  (when (pi-coding-agent--tool-activity-grouped-mode-p)
-    (pi-coding-agent--reading-current)
-    (let* ((turn-id (pi-coding-agent--activity-current-turn))
-           (record (pi-coding-agent--activity-record-for-turn turn-id t))
-           (was-live (pi-coding-agent--activity-record-live record)))
-      (when live
-        (setf (pi-coding-agent--activity-record-live record) t))
-      (pi-coding-agent--activity-put-tool
-       record
-       (pi-coding-agent--activity-running-tool-record
-        tool-call-id tool-name args))
+(defun pi-coding-agent--activity-update-tool (turn record tool live)
+  "Replace TOOL in authoritative TURN and projected RECORD for LIVE event."
+  (let ((old (pi-coding-agent--activity-tool turn (plist-get tool :tool-call-id)))
+        (before (and live (pi-coding-agent--activity-aggregates turn)))
+        (was-live (pi-coding-agent--activity-record-live record)))
+    (when (and (eq (plist-get old :classification) 'mcp)
+               (eq (plist-get tool :classification) 'other))
+      (setq tool (plist-put tool :classification 'mcp)))
+    (when live
+      (setf (pi-coding-agent--activity-record-live turn) t
+            (pi-coding-agent--activity-record-live record) t))
+    (unless (equal old tool)
+      (pi-coding-agent--activity-put-tool turn tool)
       (cond
+       ((not (pi-coding-agent--tool-activity-grouped-mode-p)) nil)
        ((and (not live) (pi-coding-agent--history-postprocessing-deferred-p))
         (pi-coding-agent--activity-stage-history-record record))
        (live
         (if (and (not was-live)
+                 (not (pi-coding-agent--segmented-progress-p))
                  (pi-coding-agent--activity-record-rendered-p record))
             (pi-coding-agent--activity-render-record record)
           (pi-coding-agent--activity-render-live-update record)))
-       (t
-        (pi-coding-agent--activity-render-record record)))
-      record)))
+       (t (pi-coding-agent--activity-render-record record)))
+      (when (and live (not (equal before (pi-coding-agent--activity-aggregates turn))))
+        (pi-coding-agent--activity-publish-progress turn)))
+    record))
+
+(defun pi-coding-agent--activity-start-tool
+    (tool-call-id tool-name args &optional live pending metadata)
+  "Register TOOL-CALL-ID, TOOL-NAME and ARGS before or at execution start.
+PENDING marks canonical preview, not execution.  METADATA supplies explicit
+classification.  LIVE uses event-driven rendering, stable in legacy mode."
+  (when (or (pi-coding-agent--tool-activity-grouped-mode-p)
+            (pi-coding-agent--segmented-progress-p))
+    (pi-coding-agent--reading-current)
+    (let* ((owner (pi-coding-agent--activity-record-for-tool tool-call-id))
+           (turn (pi-coding-agent--activity-record-for-turn
+                  (if owner (pi-coding-agent--activity-record-turn-id owner)
+                    (pi-coding-agent--activity-current-turn)) t))
+           (record (pi-coding-agent--activity-own-tool turn tool-call-id))
+           (old (pi-coding-agent--activity-tool turn tool-call-id))
+           (tool (pi-coding-agent--activity-running-tool-record
+                  tool-call-id tool-name args metadata)))
+      (when pending
+        (setq tool (plist-put tool :status 'pending)
+              tool (plist-put tool :summary "pending"))
+        (when (and tool-call-id pi-coding-agent--tool-args-cache)
+          (puthash tool-call-id args pi-coding-agent--tool-args-cache)))
+      (if (or (memq (plist-get old :status) '(succeeded failed))
+              (and pending (eq (plist-get old :status) 'running)))
+          record
+        (pi-coding-agent--activity-update-tool turn record tool live)))))
 
 (defun pi-coding-agent--activity-finish-tool
-    (tool-call-id tool-name args content details is-error &optional live)
-  "Complete TOOL-CALL-ID with TOOL-NAME, ARGS, CONTENT, and DETAILS.
-IS-ERROR non-nil records a failed completion.  When LIVE is non-nil,
-keep a folded projection stable until agent end."
+    (tool-call-id tool-name args content details is-error &optional live metadata)
+  "Complete TOOL-CALL-ID in its original segment and authoritative turn.
+TOOL-NAME, ARGS, CONTENT, DETAILS and IS-ERROR supply structured evidence.
+LIVE requests semantic refresh; METADATA supplies explicit classification."
   (pi-coding-agent--reading-current)
-  (let* ((record
-          (or (pi-coding-agent--activity-record-for-tool tool-call-id)
-              (pi-coding-agent--activity-record-for-turn
-               (pi-coding-agent--activity-current-turn) t)))
-         (tool
-          (pi-coding-agent--activity-completed-tool-record
-           tool-call-id tool-name args content details is-error)))
-    (when live
-      (setf (pi-coding-agent--activity-record-live record) t))
-    (pi-coding-agent--activity-put-tool record tool)
-    (cond
-     ((and (not live) (pi-coding-agent--history-postprocessing-deferred-p))
-      (pi-coding-agent--activity-stage-history-record record))
-     (live
-      (pi-coding-agent--activity-render-live-update record))
-     (t
-      (pi-coding-agent--activity-render-record record)))
-    record))
+  (let* ((owner (pi-coding-agent--activity-record-for-tool tool-call-id))
+         (turn (pi-coding-agent--activity-record-for-turn
+                (if owner (pi-coding-agent--activity-record-turn-id owner)
+                  (pi-coding-agent--activity-current-turn)) t))
+         (record (pi-coding-agent--activity-own-tool turn tool-call-id))
+         (tool (pi-coding-agent--activity-completed-tool-record
+                tool-call-id tool-name args content details is-error metadata)))
+    (pi-coding-agent--activity-update-tool turn record tool live)))
 
 (defun pi-coding-agent--activity-finalize-live-turn ()
   "Finalize the current live activity group with one local rewrite."
-  (when (and (pi-coding-agent--tool-activity-grouped-mode-p)
+  (when (and (or (pi-coding-agent--tool-activity-grouped-mode-p)
+                 (pi-coding-agent--segmented-progress-p))
              pi-coding-agent--current-activity-turn)
     (when-let* ((record
                  (pi-coding-agent--activity-record-for-turn
                   pi-coding-agent--current-activity-turn)))
       (when (pi-coding-agent--activity-record-live record)
         (setf (pi-coding-agent--activity-record-live record) nil)
-        (pi-coding-agent--activity-render-record record)))))
+        (dolist (projection (pi-coding-agent--activity-projections record))
+          (setf (pi-coding-agent--activity-record-live projection) nil)
+          (when (pi-coding-agent--tool-activity-grouped-mode-p)
+            (if (pi-coding-agent--segmented-progress-p)
+                (pi-coding-agent--activity-render-live-update projection)
+              (pi-coding-agent--activity-render-record projection))))))))
 
 (defun pi-coding-agent--activity-interrupt-live-turn ()
   "Settle running tools in the current live turn after process exit."
-  (when (and (pi-coding-agent--tool-activity-grouped-mode-p)
+  (when (and (or (pi-coding-agent--tool-activity-grouped-mode-p)
+                 (pi-coding-agent--segmented-progress-p))
              pi-coding-agent--current-activity-turn)
     (when-let* ((record
                  (pi-coding-agent--activity-record-for-turn
@@ -4172,7 +4456,11 @@ keep a folded projection stable until agent end."
                   settled (plist-put settled :summary "interrupted"))
             (pi-coding-agent--activity-put-tool record settled))))
       (setf (pi-coding-agent--activity-record-live record) nil)
-      (pi-coding-agent--activity-render-record record))))
+      (dolist (projection (pi-coding-agent--activity-projections record))
+        (setf (pi-coding-agent--activity-record-live projection) nil)
+        (when (pi-coding-agent--tool-activity-grouped-mode-p)
+          (pi-coding-agent--activity-render-record projection)))
+      (pi-coding-agent--activity-publish-progress record))))
 
 (defun pi-coding-agent--activity-record-at-point ()
   "Return the grouped activity record at point."
@@ -4181,7 +4469,12 @@ keep a folded projection stable until agent end."
              (and (> (point) (point-min))
                   (get-text-property
                    (1- (point)) 'pi-coding-agent-activity-turn)))))
-    (and turn-id (pi-coding-agent--activity-record-for-turn turn-id))))
+    (and turn-id
+         (pi-coding-agent--activity-record-for-projection
+          turn-id (or (get-text-property (point) 'pi-coding-agent-activity-segment)
+                      (and (> (point) (point-min))
+                           (get-text-property (1- (point))
+                                              'pi-coding-agent-activity-segment)))))))
 
 (defun pi-coding-agent--activity-tool-at-point (record)
   "Return activity tool from RECORD at point."
@@ -4208,11 +4501,21 @@ keep a folded projection stable until agent end."
   (setf (pi-coding-agent--activity-record-expanded record) t
         (pi-coding-agent--activity-record-detail-tool-call-id record) nil))
 
+(defun pi-coding-agent--activity-record-for-projection (turn-id segment)
+  "Return TURN-ID's exact SEGMENT projection, or its legacy turn record."
+  (when-let* ((turn (pi-coding-agent--activity-record-for-turn turn-id)))
+    (if segment
+        (seq-find (lambda (record)
+                    (equal segment (pi-coding-agent--activity-record-segment-ordinal record)))
+                  (pi-coding-agent--activity-record-segments turn))
+      turn)))
+
 (defun pi-coding-agent--activity-toggle-group-button (button)
   "Toggle the activity group owned by BUTTON."
   (when-let* ((record
-               (pi-coding-agent--activity-record-for-turn
-                (button-get button 'pi-coding-agent-activity-turn))))
+               (pi-coding-agent--activity-record-for-projection
+                (button-get button 'pi-coding-agent-activity-turn)
+                (button-get button 'pi-coding-agent-activity-segment))))
     (pi-coding-agent--activity-toggle-group record)))
 
 (defun pi-coding-agent--activity-toggle-tool-detail (record tool)
@@ -4251,8 +4554,9 @@ keep a folded projection stable until agent end."
 (defun pi-coding-agent--activity-tool-button-action (button)
   "Run the primary action for grouped activity BUTTON."
   (when-let* ((record
-               (pi-coding-agent--activity-record-for-turn
-                (button-get button 'pi-coding-agent-activity-turn)))
+               (pi-coding-agent--activity-record-for-projection
+                (button-get button 'pi-coding-agent-activity-turn)
+                (button-get button 'pi-coding-agent-activity-segment)))
               (tool
                (pi-coding-agent--activity-tool
                 record
@@ -4279,11 +4583,12 @@ keep a folded projection stable until agent end."
   (when (hash-table-p pi-coding-agent--activity-table)
     (maphash
      (lambda (_turn-id record)
-       (dolist (marker
-                (list (pi-coding-agent--activity-record-start-marker record)
-                      (pi-coding-agent--activity-record-end-marker record)))
-         (when (markerp marker)
-           (set-marker marker nil))))
+       (dolist (projection (cons record (pi-coding-agent--activity-record-segments record)))
+         (dolist (marker
+                  (list (pi-coding-agent--activity-record-start-marker projection)
+                        (pi-coding-agent--activity-record-end-marker projection)))
+           (when (markerp marker)
+             (set-marker marker nil)))))
      pi-coding-agent--activity-table)
     (clrhash pi-coding-agent--activity-table))
   (when (hash-table-p pi-coding-agent--tool-activity-index)
@@ -4291,6 +4596,17 @@ keep a folded projection stable until agent end."
   (setq pi-coding-agent--activity-turn-counter 0
         pi-coding-agent--current-activity-turn nil
         pi-coding-agent--history-activity-initializations 0))
+
+(defvar pi-coding-agent--activity-button-map
+  (let ((map (make-sparse-keymap)))
+    (set-keymap-parent map button-map)
+    (define-key map (kbd "TAB") #'pi-coding-agent-toggle-tool-section)
+    (define-key map (kbd "<tab>") #'pi-coding-agent-toggle-tool-section)
+    map)
+  "Activity button map with local TAB expansion and inherited RET action.")
+
+(button-type-put 'pi-coding-agent-activity-button
+                 'keymap pi-coding-agent--activity-button-map)
 
 ;;;; Tool Activity Visibility (legacy summary support)
 
@@ -7976,8 +8292,17 @@ and :arguments.  RESULT is the matching toolResult message, or nil."
              tool-call-id tool-name args
              (plist-get result :content)
              (plist-get result :details)
-             (plist-get result :isError))
-          (pi-coding-agent--activity-start-tool tool-call-id tool-name args))
+             (plist-get result :isError) nil tool-call)
+          (pi-coding-agent--activity-start-tool
+           tool-call-id tool-name args nil
+           (pi-coding-agent--segmented-progress-p) tool-call))
+      (when (pi-coding-agent--segmented-progress-p)
+        (if result
+            (pi-coding-agent--activity-finish-tool
+             tool-call-id tool-name args (plist-get result :content)
+             (plist-get result :details) (plist-get result :isError) nil tool-call)
+          (pi-coding-agent--activity-start-tool
+           tool-call-id tool-name args nil t tool-call)))
       (pi-coding-agent--display-tool-start tool-name args tool-call-id)
       (if result
           (pi-coding-agent--display-tool-end
@@ -7997,6 +8322,8 @@ RESULTS maps toolCallId strings to matching toolResult messages."
     (pi-coding-agent--reading-message-start)
     (cl-labels ((flush-text ()
                   (when pending-text
+                    (pi-coding-agent--activity-text-boundary
+                     (string-join (reverse pending-text) ""))
                     (pi-coding-agent--reading-text
                      (string-join (reverse pending-text) ""))
                     (pi-coding-agent--render-history-text
@@ -8005,6 +8332,7 @@ RESULTS maps toolCallId strings to matching toolResult messages."
       (cond
        ((stringp content)
         (unless (string-empty-p content)
+          (pi-coding-agent--activity-text-boundary content)
           (pi-coding-agent--reading-text content)
           (pi-coding-agent--render-history-text content)))
        ((vectorp content)
@@ -8123,6 +8451,7 @@ Tool calls are rendered with headers, output, overlays, and toggles."
 (defun pi-coding-agent--prepare-session-history-display (messages)
   "Prepare the current chat buffer to display canonical MESSAGES."
   (pi-coding-agent--cancel-parser-reconciliation)
+  (pi-coding-agent--progress-reset)
   (pi-coding-agent--set-canonical-messages messages)
   (let ((inhibit-read-only t))
     (pi-coding-agent--clear-render-artifacts)
@@ -8134,6 +8463,12 @@ Tool calls are rendered with headers, output, overlays, and toggles."
 (defun pi-coding-agent--finish-session-history-display ()
   "Finalize a complete history replay in the current chat buffer."
   (pi-coding-agent--activity-flush-history-record)
+  (when (pi-coding-agent--segmented-progress-p)
+    (when-let* ((turn (and pi-coding-agent--current-activity-turn
+                          (pi-coding-agent--activity-record-for-turn
+                           pi-coding-agent--current-activity-turn))))
+      (pi-coding-agent--update-progress
+       (pi-coding-agent--activity-aggregates turn))))
   (pi-coding-agent--reading-finish)
   (goto-char (point-max))
   (unless (bolp)
@@ -8354,8 +8689,11 @@ an existing history-load generation; otherwise this function creates one."
   (when (and chat-buf (buffer-live-p chat-buf))
     (with-current-buffer chat-buf
       (pi-coding-agent--cancel-history-replay chat-buf)
+      (pi-coding-agent--progress-reset)
       (let* ((generation (or generation
                              (pi-coding-agent--invalidate-history-loads)))
+             (progress-display pi-coding-agent--output-progress-display)
+             (tool-display pi-coding-agent--tool-activity-display)
              (stable-viewport
               pi-coding-agent-history-replay-stable-viewport)
              (render-buffer
@@ -8376,7 +8714,9 @@ an existing history-load generation; otherwise this function creates one."
                :completion completion)))
         (when stable-viewport
           (with-current-buffer render-buffer
-            (pi-coding-agent-chat-mode)))
+            (pi-coding-agent-chat-mode)
+            (setq-local pi-coding-agent--output-progress-display progress-display
+                        pi-coding-agent--tool-activity-display tool-display)))
         (with-current-buffer render-buffer
           (let ((inhibit-read-only t))
             (pi-coding-agent--prepare-session-history-display messages)))
